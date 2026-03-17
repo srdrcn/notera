@@ -1,0 +1,3 @@
+
+reflex==0.8.27
+playwright>=1.40,<2
