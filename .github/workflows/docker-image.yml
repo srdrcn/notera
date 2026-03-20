@@ -10,13 +10,15 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: docker-image-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: chosenwar/notera
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/notera
 
 jobs:
   build-and-push:
@@ -29,17 +31,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: chosenwar
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short

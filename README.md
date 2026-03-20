@@ -186,8 +186,9 @@ Not:
 - Bu yüzden Docker build süresi ve image boyutu belirgin şekilde artar.
 - İsterseniz bunu kapatmak için `docker build --build-arg PRELOAD_WHISPERX_MODELS=0 -t notera .` kullanabilirsiniz.
 - Hugging Face erişimi token gerektirirse `docker build --build-arg HF_TOKEN=... -t notera .` kullanabilirsiniz.
-- GitHub Actions workflow'u [docker-image.yml](.github/workflows/docker-image.yml) ile `chosenwar/notera` image'ını `main`, `v*` tag push'ları ve manuel tetikleme için build edip Docker Hub'a gönderir.
-- Workflow için repo secret olarak en az `DOCKERHUB_TOKEN` tanımlanmalıdır. Model preload erişimi gerekiyorsa opsiyonel `HF_TOKEN` de eklenebilir.
+- GitHub Actions workflow'u [docker-image.yml](.github/workflows/docker-image.yml) ile image'ı `ghcr.io/<github-owner>/notera` adresine `main`, `v*` tag push'ları ve manuel tetikleme için build edip GHCR'a gönderir.
+- Workflow publish için ekstra Docker kullanıcı/parolası istemez; GitHub Actions içindeki yerleşik `GITHUB_TOKEN` kullanılır. Model preload erişimi gerekiyorsa opsiyonel `HF_TOKEN` secret'ı eklenebilir.
+- Anonim `docker pull` istiyorsanız ilk publish'ten sonra GitHub Packages içindeki container package görünürlüğünü bir kez `public` yapmanız gerekir.
 
 ## Hibrit transcript akışı
 
