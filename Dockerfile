@@ -23,38 +23,15 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY app/requirements.txt /tmp/requirements.txt
+COPY scripts/preload_hf_models.py /tmp/preload_hf_models.py
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r /tmp/requirements.txt \
     && python -m playwright install --with-deps chromium
 
 RUN if [ "$PRELOAD_WHISPERX_MODELS" = "1" ]; then \
-        PRELOAD_WHISPERX_MODELS="$PRELOAD_WHISPERX_MODELS" \
-        WHISPERX_MODEL_REPO="$WHISPERX_MODEL_REPO" \
-        WHISPERX_ALIGN_MODEL_REPO="$WHISPERX_ALIGN_MODEL_REPO" \
-        WHISPERX_VAD_MODEL_REPO="$WHISPERX_VAD_MODEL_REPO" \
-        HF_TOKEN="$HF_TOKEN" \
-        python - <<'PY'; \
-import os
-from huggingface_hub import snapshot_download
-
-repos = [
-    os.environ["WHISPERX_MODEL_REPO"],
-    os.environ["WHISPERX_ALIGN_MODEL_REPO"],
-    os.environ["WHISPERX_VAD_MODEL_REPO"],
-]
-token = os.environ.get("HF_TOKEN") or None
-cache_dir = os.environ["HF_HOME"]
-
-for repo_id in repos:
-    print(f"Preloading Hugging Face model cache: {repo_id}", flush=True)
-    snapshot_download(
-        repo_id=repo_id,
-        cache_dir=cache_dir,
-        token=token,
-    )
-PY \
-    ; fi
+        python /tmp/preload_hf_models.py; \
+    fi
 
 COPY . /srv/notera
 
