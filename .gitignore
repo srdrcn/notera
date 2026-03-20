@@ -28,6 +28,8 @@ pip-wheel-metadata/
 .states/
 app/.states/
 app/.web/
+app/alembic.ini
+app/alembic/
 app/assets/external/
 app/assets/live_meeting_frames/
 app/assets/meeting_audio/

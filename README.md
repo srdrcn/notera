@@ -1,237 +1,213 @@
 # Notera
 
-Notera, Microsoft Teams toplantıları için canlı caption toplama, ses kaydı alma, WhisperX ile doğrulama yapma ve review kuyruğu üzerinden final transcript üretme odaklı bir uygulamadır.
+Notera, Microsoft Teams toplantılarını bot ile izleyip canlı caption toplamak, mümkünse ses kaydı almak, toplantı bittikten sonra WhisperX ile ikinci bir transcript üretmek ve final metni review akışıyla netleştirmek için hazırlanmış bir uygulamadır.
 
-Repo iki ana parçadan oluşur:
+Uygulama iki ana parçadan oluşur:
 
-- `app/`: Reflex tabanlı web arayüzü, state yönetimi ve SQLite veritabanı
-- `bot/`: Playwright ile Teams toplantısına katılan bot, ses yakalama akışı ve toplantı sonrası WhisperX worker
+- `app/`: Reflex tabanlı web uygulaması, kullanıcı oturumu, dashboard, transcript ekranı ve SQLite veritabanı
+- `bot/`: Playwright ile Teams toplantısına katılan bot, canlı caption toplama, ses kaydı ve toplantı sonrası postprocess worker
 
-## Neler var
+## Ne Yapar
 
-- Dashboard üzerinden toplantı oluşturma ve oturumları takip etme
-- Teams live caption event’lerini ham haliyle saklama
-- Mümkünse Teams sesini `webm` olarak kaydetme ve `wav`a çevirme
-- Canonical Teams transcript üretme
-- WhisperX ile tüm ses dosyasını yeniden transcript etme
-- Teams transcript ile WhisperX transcript’i hizalayıp final transcript oluşturma
-- Şüpheli farkları review kuyruğuna bırakma
-- TXT / CSV export
-- Bot önizleme görseli ve kısa review ses klipleri
+- Teams toplantı linki üzerinden bot oturumu başlatır
+- Canlı caption event’lerini ham haliyle saklar
+- Uzak ses track’i alınabiliyorsa master ses kaydı üretir
+- Ham caption akışından canonical Teams transcript çıkarır
+- Ses kaydı varsa WhisperX ile ikinci transcript üretir
+- Teams ve WhisperX çıktısını hizalayıp final transcript oluşturur
+- Düşük güvenli farkları review akışına bırakır
+- Final transcript’i `TXT` ve `CSV` olarak dışa aktarır
 
-## Mimari
+## Kullanıcı Akışı
 
-Akış kabaca şu şekilde çalışır:
+Bir kullanıcı uygulamayı şu sırayla kullanır:
 
-1. Kullanıcı dashboard üzerinden toplantı oluşturur.
-2. Web uygulaması bot sürecini alt süreç olarak başlatır.
-3. Bot Teams toplantısına girer, caption event’lerini kaydeder.
-4. Ses kaydı açıksa bot WebRTC ses track’lerini toplamaya çalışır.
-5. Toplantı tamamlanınca `bot/postprocess_worker.py` çalışır.
-6. Worker caption event’lerinden canonical Teams transcript üretir.
-7. Worker ses kaydı varsa WhisperX ile transcript çıkarır ve hizalama yapar.
-8. Güvenli düzeltmeler otomatik uygulanır, kararsız olanlar review kuyruğuna düşer.
-9. Transcript sayfasında kullanıcı review kartları üzerinden `Uygula` / `Koru` kararı verir.
+1. Giriş ekranında e-posta ile kayıt olur veya giriş yapar.
+2. Dashboard üzerinden toplantı adı, Teams linki ve isteğe bağlı ses kaydı tercihiyle yeni toplantı oluşturur.
+3. Uygulama ilgili toplantı için bot sürecini başlatır.
+4. Bot toplantıya katılır, caption toplamaya başlar ve uygunsa ses kaydı alır.
+5. Toplantı tamamlandığında postprocess worker otomatik devreye girer.
+6. Transcript ekranında final metin, review önerileri, meeting ses kaydı ve bot önizleme görüntüleri görülebilir.
+7. Gerekirse review kararları verilir, duplicate transcript satırları birleştirilir ve çıktı dışa aktarılır.
 
-## Önemli dosyalar
+## Sistem Nasıl Çalışır
 
-- `app/app/app.py`
-  UI bileşenleri ve sayfa yerleşimleri
-- `app/app/state.py`
-  Dashboard ve transcript sayfası state mantığı
-- `app/app/models.py`
-  SQLModel tabloları
-- `app/app/meeting_runtime.py`
-  runtime schema bootstrap, artifact yolları ve yardımcı fonksiyonlar
-- `bot/bot.py`
-  Teams bot süreci, Playwright akışı, caption ve ses kaydı
-- `bot/postprocess_worker.py`
-  canonical transcript, WhisperX, hizalama ve review üretimi
-- `app/assets/notera.css`
-  güncel UI stil dosyası
+### 1. Canlı caption toplama
 
-## Veritabanı ve schema
+Bot Teams arayüzündeki caption yüzeyini izler ve her caption event’i için şu verileri saklar:
 
-Ana veritabanı:
+- konuşmacı adı
+- caption metni
+- gözlemlenme zamanı
+- slot index
+- revision numarası
 
-- `app/reflex.db`
+Bu ham kayıtlar `teamscaptionevent` tablosunda tutulur.
 
-Bu proje runtime schema bootstrap yaklaşımıyla çalışır.
+### 2. Ses kaydı
 
-- `ensure_runtime_schema(...)` eksik kolonları ekler
-- yeni tabloları `CREATE TABLE IF NOT EXISTS` ile oluşturur
-- app tarafında ve bot başlarken çağrılır
+Toplantı oluştururken ses kaydı açıksa bot uzak ses track’lerini yakalamaya çalışır. Başarılı olursa:
 
-Pratik sonuç:
+- parça parça chunk toplar
+- master ses dosyasını üretir
+- 16 kHz mono PCM kopyası oluşturur
 
-- mevcut kodla sıfırdan ayağa kalkarken ek migration adımı gerekmez
-- `meeting`, `transcript` gibi ana tablolar Reflex / SQLModel tarafından oluşur
-- review / audio / caption event alanları runtime sırasında tamamlanır
+Ses yakalama başarısız olsa bile caption toplama akışı devam eder.
 
-## Veri modeli özeti
+### 3. Canonical Teams transcript
+
+Toplantı bittikten sonra worker ham caption event’lerinden daha temiz bir Teams transcript çıkarır. Bu aşamada:
+
+- kısa ve gürültülü tekrarlar ayıklanır
+- aynı slot içindeki revizyonlar birleştirilir
+- rotasyon yapan parçalı caption akışı normalize edilir
+
+### 4. WhisperX transcript
+
+Ses kaydı varsa worker aynı ses dosyasını WhisperX ile yeniden transcript eder.
+
+Mevcut varsayılanlar:
+
+- model: `large-v3`
+- compute type: `int8`
+- varsayılan dil: `tr`
+- `WHISPERX_FORCE_LANGUAGE=1` ile dil zorlaması açık
+
+Docker image varsayılan olarak açık erişimli ASR ve Turkish alignment modellerini preload eder. Bu projedeki pyannote VAD, ekstra `pyannote/segmentation` repo preload’u istemez; WhisperX paketindeki gömülü asset’i kullanır.
+
+### 5. Alignment ve final transcript
+
+Worker canonical Teams transcript ile WhisperX segmentlerini hizalar. Bu hizalama sonucunda:
+
+- güvenli eşleşmeler otomatik uygulanır
+- kararsız eşleşmeler `transcriptreviewitem` olarak review kuyruğuna bırakılır
+- final transcript satırları `transcript` tablosuna yazılır
+
+### 6. Review
+
+Transcript ekranında review gereken satırlar vurgulu görünür. Kullanıcı:
+
+- `Uygula` ile WhisperX önerisini final transcript’e yazabilir
+- `Koru` ile mevcut Teams caption’ını koruyabilir
+- tüm review önerilerini toplu uygulayabilir
+- review sonrası kalan duplicate transcript satırlarını tek aksiyonla birleştirebilir
+
+## Veri Modeli
 
 Öne çıkan tablolar:
 
-- `meeting`
-  toplantı kaydı, bot durumu, ses ve postprocess durumu
-- `teamscaptionevent`
-  Teams’ten gelen ham caption event’leri
-- `transcript`
-  final transcript satırları
-- `meetingaudioasset`
-  master ses dosyası ve türevleri
-- `transcriptreviewitem`
-  kullanıcı kararı bekleyen düzeltme önerileri
+- `user`: e-posta bazlı kullanıcı kaydı
+- `meeting`: toplantı meta verisi, bot durumu, ses ve postprocess durumları
+- `teamscaptionevent`: ham canlı caption kayıtları
+- `meetingaudioasset`: master ses kaydı ve türevleri
+- `transcript`: final transcript satırları
+- `transcriptreviewitem`: review gerektiren öneriler
 
-## Artifact dizinleri
+Şema runtime sırasında bootstrap edilir. Uygulama sıfırdan ayağa kalktığında gerekli tablolar ve eksik kolonlar otomatik oluşturulur; ayrıca migration komutu gerekmez.
 
-Önemli runtime çıktıları:
+## Kalıcı Dosyalar
 
+Toplantı sırasında ve sonrasında şu artefact’lar üretilir:
+
+- `app/reflex.db`
 - `bot/meeting_audio/meeting_<id>/master.webm`
 - `bot/meeting_audio/meeting_<id>/master_16k_mono.wav`
 - `bot/meeting_audio/meeting_<id>/teams_canonical.json`
 - `bot/meeting_audio/meeting_<id>/whisperx_result.json`
 - `bot/meeting_audio/meeting_<id>/alignment_map.json`
 - `app/assets/meeting_audio/`
-  UI üzerinden oynatılabilen meeting ses dosyaları
 - `app/assets/review_audio_clips/`
-  review kartlarındaki kısa ses klipleri
 - `app/assets/live_meeting_frames/`
-  canlı bot önizleme görselleri
 
-Bu dizinler `.gitignore` içinde dışlanmıştır.
+Bu dosyalar uygulamanın çalışma verisidir; prod kullanımda volume ile kalıcı tutulmaları gerekir.
 
-## Hibrit transcript akışı
+## Prod Kurulum
 
-### 1. Teams caption toplama
+Önerilen dağıtım modeli Docker image kullanmaktır.
 
-Bot toplantı sırasında canlı caption event’lerini toplar.
+### Image
 
-Saklanan bilgiler:
+Docker Hub image adı:
 
-- `speaker_name`
-- caption text
-- gözlemlenme zamanı
-- slot index
-- revision no
+- `chosenwar/notera:latest`
 
-Bu veriler daha sonra canonical transcript üretmek için kullanılır.
+Image hem `linux/amd64` hem `linux/arm64` için yayınlanır; Intel/AMD Linux host'larda ve Apple Silicon tabanlı Docker kurulumlarında aynı tag kullanılabilir.
 
-### 2. Ses kaydı
+### Gerekli Portlar
 
-Toplantı oluştururken ses kaydı açık veya kapalı olabilir.
+- `3000`: web arayüzü
+- `8000`: Reflex backend API
 
-Ses kaydı açıksa:
+### Önerilen Kalıcı Dizin Yapısı
 
-- bot audio track’leri toplamaya çalışır
-- chunk’ları birleştirir
-- master dosyayı `webm` olarak saklar
-- postprocess sırasında `wav` türevi üretilir
+Host üzerinde şu dizinleri oluşturun:
 
-Ses kaydı alınamazsa:
+```bash
+mkdir -p docker-data/app-assets/live_meeting_frames
+mkdir -p docker-data/app-assets/meeting_audio
+mkdir -p docker-data/app-assets/review_audio_clips
+mkdir -p docker-data/bot/meeting_audio
+mkdir -p docker-data/bot/runtime_cache
+touch docker-data/reflex.db
+```
 
-- toplantı yine transcript toplamaya devam eder
-- `audio_status=failed` olur
-- transcript akışı durmaz
+### Çalıştırma
 
-### 3. Canonical Teams transcript
+```bash
+docker run -d \
+  --name notera \
+  -p 3000:3000 \
+  -p 8000:8000 \
+  -e API_URL=http://localhost:8000 \
+  -v "$(pwd)/docker-data/reflex.db:/srv/notera/app/reflex.db" \
+  -v "$(pwd)/docker-data/app-assets/live_meeting_frames:/srv/notera/app/assets/live_meeting_frames" \
+  -v "$(pwd)/docker-data/app-assets/meeting_audio:/srv/notera/app/assets/meeting_audio" \
+  -v "$(pwd)/docker-data/app-assets/review_audio_clips:/srv/notera/app/assets/review_audio_clips" \
+  -v "$(pwd)/docker-data/bot/meeting_audio:/srv/notera/bot/meeting_audio" \
+  -v "$(pwd)/docker-data/bot/runtime_cache:/srv/notera/bot/runtime_cache" \
+  chosenwar/notera:latest
+```
 
-Worker, ham caption event’lerinden daha temiz bir Teams transcript çıkarır.
+Ardından arayüz:
 
-Bu aşamada:
+- `http://localhost:3000`
 
-- kısa ve gürültülü tekrarlar temizlenir
-- aynı slot içindeki rephrase’ler birleştirilir
-- rotasyon yapan caption parçaları normalize edilir
+### Reverse Proxy Notu
 
-Çıktı:
+Frontend ile backend farklı alan adı veya proxy arkasında sunuluyorsa `API_URL` veya `REFLEX_API_URL` doğru backend adresine göre verilmelidir.
 
-- `teams_canonical.json`
+## Uygulamada İlk Kullanım
 
-### 4. WhisperX transcript
+1. Uygulamayı açın.
+2. E-posta adresiyle kayıt olun.
+3. Dashboard’da yeni toplantı oluşturun.
+4. Teams link’ini girin.
+5. Ses kaydı gerekiyorsa açık bırakın.
+6. Botun toplantıya katılmasını bekleyin.
+7. Toplantı tamamlanınca transcript ekranından çıktıları ve review akışını yönetin.
 
-Ses kaydı varsa worker tüm dosyayı WhisperX ile transcript eder.
+## Sınırlamalar ve Operasyonel Notlar
 
-Mevcut davranış:
+- Kimlik doğrulama şu an yalnızca e-posta tabanlı hafif bir akıştır; parola, rol yönetimi veya SSO yoktur.
+- Veritabanı SQLite’tır; tek node / düşük-orta ölçekli kullanım için uygundur.
+- Her canlı toplantı ayrı bot süreci açar; yoğun eşzamanlı kullanımda CPU ve RAM yükünü asıl bot + WhisperX tarafı belirler.
+- WhisperX CPU üzerinde çalıştığı için uzun kayıtlar ve eşzamanlı postprocess yükü pahalıdır.
+- Speaker kaynağı her zaman Teams caption tarafıdır; WhisperX diarization kullanılmaz.
+- Review reddedildiğinde `teams_text` korunur, review uygulandığında `transcript.text` güncellenir.
+- Ses yakalama Teams arayüzü ve tarayıcı davranışına bağlıdır; bazı toplantılarda caption varken audio capture başarısız olabilir.
 
-- varsayılan dil `tr`
-- `WHISPERX_FORCE_LANGUAGE=1` ise dil auto-detect’e bırakılmaz
-- model cache’te varsa local cache-only modda yüklenir
+## Repo Yapısı
 
-Bu özellikle kısa / gürültülü kayıtlarda İngilizceye yanlış kaymayı azaltmak için eklendi.
+Uygulamanın ana dosyaları:
 
-### 5. Alignment
+- `app/app/app.py`: sayfa bileşenleri ve UI yerleşimleri
+- `app/app/state.py`: dashboard, transcript ekranı ve aksiyon state mantığı
+- `app/app/models.py`: SQLModel tabloları
+- `app/app/meeting_runtime.py`: runtime schema bootstrap ve artifact path helper’ları
+- `bot/bot.py`: Teams bot süreci
+- `bot/postprocess_worker.py`: canonical transcript, WhisperX, alignment ve review üretimi
+- `app/assets/notera.css`: arayüz stilleri
 
-Teams canonical ile WhisperX token akışları global olarak hizalanır.
+## Özet
 
-Çıktı:
-
-- `alignment_map.json`
-
-Bu dosya review teşhisinde çok önemlidir:
-
-- hangi utterance kaç token eşleşti
-- coverage ne oldu
-- Whisper önerisi hangi segmentlerden geldi
-
-### 6. Final transcript ve review
-
-Worker her canonical utterance için:
-
-- Teams text
-- Whisper suggestion
-- coverage
-- confidence
-- whisper segment count
-
-bilgilerini değerlendirir.
-
-Karar mantığı:
-
-- çok güvenli ise auto-apply
-- yeterince kapsıyorsa pending review
-- çok düşük coverage ise Teams text korunur
-
-Ek not:
-
-- çok segmentli veya düşük güvenli suggestion’lar artık `Kelime` diye gösterilmez
-- bu tip örnekler `Cümle` review olarak sınıflandırılır
-- review kartındaki Whisper önerisi artık ham Whisper segment metnini korur
-
-## Export
-
-Transcript sayfasından:
-
-- `TXT`
-- `CSV`
-
-çıktısı alınabilir.
-
-State tarafındaki ilgili aksiyonlar:
-
-- `TranscriptPageState.download_txt`
-- `TranscriptPageState.download_csv`
-
-## Çalışma mantığı notları
-
-- Speaker kaynağı her zaman Teams tarafıdır.
-- WhisperX speaker diarization kullanılmaz.
-- Review uygulanırsa `transcript.text` suggestion ile güncellenir.
-- `teams_text` alanı her zaman referans olarak saklanır.
-- Review reddedilirse mevcut transcript korunur.
-
-## Hızlı özet
-
-Bu proje artık sadece live caption toplayan bir bot değil:
-
-- Teams caption event’lerini saklıyor
-- ses kaydı alıyor
-- WhisperX ile ikinci transcript üretiyor
-- ikisini hizalıyor
-- review kuyruğu üzerinden kullanıcıya kontrollü düzeltme akışı sunuyor
-
-Yeni yapının omurgası:
-
-- `meeting_runtime.py`
-- `postprocess_worker.py`
-- transcript/review UI ve state katmanı
+Notera bir “caption viewer” değil; toplantıyı izleyen, ham caption ve ses verisini toplayan, toplantı sonrası ikinci transcript üreten, bu iki kaynağı birleştirip review akışıyla final metni netleştiren bir operasyon uygulamasıdır.
