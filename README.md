@@ -56,7 +56,7 @@ Ana veritabanı:
 
 - `app/reflex.db`
 
-Bu proje şu anda migration-first değil, runtime bootstrap yaklaşımıyla çalışır.
+Bu proje runtime schema bootstrap yaklaşımıyla çalışır.
 
 - `ensure_runtime_schema(...)` eksik kolonları ekler
 - yeni tabloları `CREATE TABLE IF NOT EXISTS` ile oluşturur
@@ -64,7 +64,7 @@ Bu proje şu anda migration-first değil, runtime bootstrap yaklaşımıyla çal
 
 Pratik sonuç:
 
-- mevcut kodla sıfırdan ayağa kalkmak için `alembic` zorunlu değildir
+- mevcut kodla sıfırdan ayağa kalkarken ek migration adımı gerekmez
 - `meeting`, `transcript` gibi ana tablolar Reflex / SQLModel tarafından oluşur
 - review / audio / caption event alanları runtime sırasında tamamlanır
 
