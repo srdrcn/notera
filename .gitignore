@@ -30,6 +30,8 @@ app/.states/
 app/.web/
 app/assets/external/
 app/assets/live_meeting_frames/
+app/assets/meeting_audio/
+app/assets/review_audio_clips/
 app/reflex.db
 app/app/reflex.db
 *.db
@@ -39,6 +41,8 @@ bot/*.log
 bot/*.png
 bot/*.html
 bot/stop_*.flag
+bot/meeting_audio/
+bot/runtime_cache/
 
 # Build / export artifacts
 frontend.zip
