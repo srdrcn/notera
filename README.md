@@ -180,6 +180,12 @@ Not:
 
 - Browser üzerinden erişilen backend adresi farklıysa `API_URL` buna göre verilmelidir.
 - Docker içinde de `app/` ve `bot/` aynı dosya sistemi altında kalmalıdır.
+- Docker image `ffmpeg` ile build edilir; container içinde ayrıca sistem kurulumu gerekmez.
+- Docker image WhisperX runtime için gerekli cache dizinlerini de hazır oluşturur.
+- Varsayılan build, WhisperX ASR modeli, Turkish alignment modeli ve pyannote VAD modelini image içindeki Hugging Face cache'e indirir.
+- Bu yüzden Docker build süresi ve image boyutu belirgin şekilde artar.
+- İsterseniz bunu kapatmak için `docker build --build-arg PRELOAD_WHISPERX_MODELS=0 -t notera .` kullanabilirsiniz.
+- Hugging Face erişimi token gerektirirse `docker build --build-arg HF_TOKEN=... -t notera .` kullanabilirsiniz.
 
 ## Hibrit transcript akışı
 
@@ -341,6 +347,8 @@ Güncel akışta:
 ### `ffmpeg` bulunamadı
 
 Sistemde `ffmpeg` kurulu olmalıdır.
+
+Docker image kullanıyorsanız `ffmpeg` image içine dahil edilir; bu uyarı yerel kurulum için geçerlidir.
 
 ### `huggingface.co` erişim hatası
 

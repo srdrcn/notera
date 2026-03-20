@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import json
 import logging
@@ -54,6 +55,7 @@ ASR_MODEL_DEFAULT = "large-v3"
 TURKISH_ALIGNMENT_MODEL = "cahya/wav2vec2-base-turkish"
 POSTPROCESS_VERSION = "whisperx_global_v1"
 TOKEN_RE = re.compile(r"[\wçğıöşüÇĞİÖŞÜ@.\-/']+")
+PROGRESS_RE = re.compile(r"Progress:\s*([0-9]+(?:\.[0-9]+)?)%")
 DEFAULT_SPOKEN_LANGUAGE = os.getenv("WHISPERX_LANGUAGE", "tr").strip().lower() or "tr"
 FORCE_SPOKEN_LANGUAGE = os.getenv("WHISPERX_FORCE_LANGUAGE", "1").strip().lower() not in {
     "0",
@@ -98,20 +100,87 @@ def db_connection() -> sqlite3.Connection:
     return conn
 
 
-def update_meeting_postprocess_status(meeting_id: int, status: str, error: str | None = None):
+def update_meeting_postprocess_status(
+    meeting_id: int,
+    status: str,
+    error: str | None = None,
+    progress_pct: int | None = None,
+    progress_note: str | None = None,
+):
     conn = db_connection()
     try:
         conn.execute(
             """
             UPDATE meeting
-            SET postprocess_status = ?, postprocess_error = ?
+            SET postprocess_status = ?,
+                postprocess_error = ?,
+                postprocess_progress_pct = ?,
+                postprocess_progress_note = ?
             WHERE id = ?
             """,
-            (status, error, meeting_id),
+            (status, error, progress_pct, progress_note, meeting_id),
         )
         conn.commit()
     finally:
         conn.close()
+
+
+def update_meeting_postprocess_progress(
+    meeting_id: int,
+    progress_pct: int | None,
+    progress_note: str | None = None,
+):
+    conn = db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE meeting
+            SET postprocess_progress_pct = ?,
+                postprocess_progress_note = COALESCE(?, postprocess_progress_note)
+            WHERE id = ?
+            """,
+            (progress_pct, progress_note, meeting_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def capture_progress_prints(meeting_id: int, stage_note: str, *modules):
+    original_print = print
+    module_states: list[tuple[object, bool, object | None]] = []
+    last_pct: int | None = None
+
+    def tracked_print(*args, **kwargs):
+        nonlocal last_pct
+        sep = kwargs.get("sep", " ")
+        text = sep.join(str(arg) for arg in args)
+        match = PROGRESS_RE.search(text)
+        if match:
+            progress_pct = max(0, min(int(round(float(match.group(1)))), 100))
+            if progress_pct != last_pct:
+                last_pct = progress_pct
+                update_meeting_postprocess_progress(
+                    meeting_id,
+                    progress_pct,
+                    stage_note,
+                )
+        return original_print(*args, **kwargs)
+
+    for module in modules:
+        had_print = "print" in vars(module)
+        previous_print = vars(module).get("print")
+        module_states.append((module, had_print, previous_print))
+        setattr(module, "print", tracked_print)
+    try:
+        yield
+    finally:
+        for module, had_print, previous_print in module_states:
+            if had_print:
+                setattr(module, "print", previous_print)
+            else:
+                delattr(module, "print")
 
 
 def fetch_meeting(meeting_id: int) -> sqlite3.Row | None:
@@ -249,10 +318,12 @@ def persist_json(path: Path, payload):
         json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
 
 
-def load_whisperx_result(audio_path: Path) -> dict:
+def load_whisperx_result(audio_path: Path, meeting_id: int) -> dict:
     configure_runtime_environment()
     try:
         import whisperx
+        import whisperx.alignment as whisperx_alignment
+        import whisperx.asr as whisperx_asr
     except Exception as exc:
         raise RuntimeError(
             "WhisperX import edilemedi. "
@@ -300,11 +371,25 @@ def load_whisperx_result(audio_path: Path) -> dict:
             ) from exc
         raise
 
-    result = model.transcribe(
-        str(audio_path),
-        batch_size=batch_size,
-        language=requested_language,
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_TRANSCRIBING,
+        None,
+        0,
+        "WhisperX transcript çıkarıyor",
     )
+    with capture_progress_prints(
+        meeting_id,
+        "WhisperX transcript çıkarıyor",
+        whisperx_asr,
+    ):
+        result = model.transcribe(
+            str(audio_path),
+            batch_size=batch_size,
+            language=requested_language,
+            print_progress=True,
+            combined_progress=True,
+        )
     language_code = (result.get("language") or requested_language or "").lower()
     if requested_language:
         result["language"] = language_code
@@ -314,19 +399,40 @@ def load_whisperx_result(audio_path: Path) -> dict:
     align_model_name = TURKISH_ALIGNMENT_MODEL if language_code.startswith("tr") else None
     align_cache_only = bool(align_model_name and huggingface_model_cached(align_model_name))
     try:
+        update_meeting_postprocess_status(
+            meeting_id,
+            POSTPROCESS_STATUS_ALIGNING,
+            None,
+            None,
+            "Hizalama modeli yükleniyor",
+        )
         align_model, metadata = whisperx.load_align_model(
             language_code=language_code,
             device="cpu",
             model_name=align_model_name,
             model_cache_only=align_cache_only,
         )
-        aligned_result = whisperx.align(
-            result["segments"],
-            align_model,
-            metadata,
-            str(audio_path),
-            device="cpu",
+        update_meeting_postprocess_status(
+            meeting_id,
+            POSTPROCESS_STATUS_ALIGNING,
+            None,
+            50,
+            "Transcriptler hizalanıyor",
         )
+        with capture_progress_prints(
+            meeting_id,
+            "Transcriptler hizalanıyor",
+            whisperx_alignment,
+        ):
+            aligned_result = whisperx.align(
+                result["segments"],
+                align_model,
+                metadata,
+                str(audio_path),
+                device="cpu",
+                print_progress=True,
+                combined_progress=True,
+            )
         aligned_result["language"] = language_code
         aligned_result["_alignment_model"] = align_model_name or metadata.get("language")
         result = aligned_result
@@ -1231,7 +1337,13 @@ def process_meeting(meeting_id: int):
     if dependency_error:
         raise RuntimeError(dependency_error)
 
-    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_CANONICALIZING, None)
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_CANONICALIZING,
+        None,
+        None,
+        "Teams transcript temizleniyor",
+    )
     caption_events = fetch_caption_events(meeting_id)
     if not caption_events:
         caption_events = build_events_from_legacy_transcripts(fetch_legacy_transcripts(meeting_id))
@@ -1244,18 +1356,30 @@ def process_meeting(meeting_id: int):
     source_audio_path: Path | None = None
 
     if audio_ready and asset is not None:
-        update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_TRANSCRIBING, None)
+        update_meeting_postprocess_status(
+            meeting_id,
+            POSTPROCESS_STATUS_TRANSCRIBING,
+            None,
+            None,
+            "WhisperX modeli yükleniyor",
+        )
         master_audio_path = Path(asset["master_audio_path"])
         pcm_audio_path = Path(asset["pcm_audio_path"]) if asset["pcm_audio_path"] else None
         if not pcm_audio_path or not pcm_audio_path.exists():
             pcm_audio_path = convert_audio_to_pcm(master_audio_path, meeting_id)
         update_audio_asset_paths(asset["id"], str(pcm_audio_path), POSTPROCESS_VERSION)
         source_audio_path = pcm_audio_path
-        whisper_result = load_whisperx_result(pcm_audio_path)
+        whisper_result = load_whisperx_result(pcm_audio_path, meeting_id)
         persist_json(get_whisperx_result_path(meeting_id), whisper_result)
         whisper_tokens, whisper_segments = build_whisper_tokens(whisper_result)
 
-    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_ALIGNING, None)
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_ALIGNING,
+        None,
+        None,
+        "Teams ve WhisperX transcriptleri eşleniyor" if audio_ready else None,
+    )
     teams_tokens = build_teams_tokens(canonical_rows)
     for index, token in enumerate(teams_tokens):
         token["global_index"] = index
@@ -1286,12 +1410,18 @@ def process_meeting(meeting_id: int):
     }
     persist_json(get_alignment_map_path(meeting_id), alignment_payload)
 
-    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_REBUILDING, None)
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_REBUILDING,
+        None,
+        None,
+        "Final transcript hazırlanıyor",
+    )
     clear_previous_outputs(meeting_id)
     pending_reviews = persist_final_outputs(meeting_id, final_rows, source_audio_path)
     if pending_reviews:
-        update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_REVIEW_READY, None)
-    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_COMPLETED, None)
+        update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_REVIEW_READY, None, None, None)
+    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_COMPLETED, None, None, None)
 
 
 def main():
@@ -1300,13 +1430,13 @@ def main():
 
     meeting_id = int(sys.argv[1])
     ensure_runtime_schema(get_db_path())
-    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_QUEUED, None)
+    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_QUEUED, None, None, None)
     try:
         process_meeting(meeting_id)
         logger.info("Post-process completed for meeting %s", meeting_id)
     except Exception as exc:
         logger.exception("Post-process failed for meeting %s", meeting_id)
-        update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_FAILED, str(exc))
+        update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_FAILED, str(exc), None, None)
         raise
 
 

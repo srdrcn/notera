@@ -354,13 +354,15 @@ html, body {
 }
 
 .nt-btn-primary {
-  background: linear-gradient(135deg, var(--nt-primary), var(--nt-teal)) !important;
+  background: linear-gradient(135deg, #16305c, #21457d) !important;
   color: #fff !important;
-  box-shadow: 0 2px 8px var(--nt-primary-glow), inset 0 1px 0 rgba(255,255,255,0.15) !important;
+  border-color: rgba(53, 91, 152, 0.55) !important;
+  box-shadow: 0 2px 10px rgba(22, 48, 92, 0.28), inset 0 1px 0 rgba(255,255,255,0.12) !important;
 }
 
 .nt-btn-primary:hover {
-  box-shadow: 0 4px 20px var(--nt-primary-glow), inset 0 1px 0 rgba(255,255,255,0.2) !important;
+  background: linear-gradient(135deg, #1a3767, #28518f) !important;
+  box-shadow: 0 6px 18px rgba(22, 48, 92, 0.34), inset 0 1px 0 rgba(255,255,255,0.16) !important;
   transform: translateY(-1px) !important;
 }
 
@@ -764,6 +766,15 @@ html, body {
   align-items: center;
 }
 
+.nt-review-helper {
+  font-size: 0.8125rem;
+  color: var(--nt-text-3);
+}
+
+.nt-review-helper.is-muted {
+  color: var(--nt-text-3);
+}
+
 .nt-stream-body {
   flex: 1;
   overflow-y: auto;
@@ -783,6 +794,31 @@ html, body {
 
 .nt-stream-item:last-child {
   border-bottom: none;
+}
+
+.nt-stream-item-trigger {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  margin: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.nt-stream-item-trigger:focus-visible {
+  outline: none;
+}
+
+.nt-stream-item.is-review-pending {
+  border-radius: var(--nt-radius-sm);
+}
+
+.nt-stream-item.is-merge-candidate {
+  border-radius: var(--nt-radius-sm);
 }
 
 /* Speaker badge */
@@ -837,12 +873,58 @@ html, body {
   background: var(--nt-surface-2);
   border: 1px solid var(--nt-border);
   margin-top: 0.375rem;
+  transition: all 0.2s var(--nt-transition);
+}
+
+.nt-stream-bubble.is-review-pending {
+  background: color-mix(in srgb, var(--nt-primary-soft) 78%, var(--nt-surface-2));
+  border-color: color-mix(in srgb, var(--nt-primary) 30%, var(--nt-border));
+  box-shadow: inset 3px 0 0 var(--nt-primary);
+}
+
+.nt-stream-bubble.is-merge-candidate {
+  background: color-mix(in srgb, var(--nt-primary-soft) 52%, var(--nt-surface-2));
+  border-color: color-mix(in srgb, var(--nt-primary) 22%, var(--nt-border));
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--nt-primary) 78%, #0e1f3b);
+}
+
+.nt-stream-item-trigger:hover .nt-stream-bubble.is-review-pending,
+.nt-stream-item-trigger:focus-visible .nt-stream-bubble.is-review-pending {
+  background: color-mix(in srgb, var(--nt-primary-soft) 92%, var(--nt-surface-2));
+  border-color: var(--nt-primary);
+  box-shadow: inset 3px 0 0 var(--nt-primary), 0 6px 18px -14px var(--nt-primary-glow);
+}
+
+.nt-stream-item-trigger:focus-visible .nt-stream-item.is-review-pending {
+  box-shadow: 0 0 0 3px var(--nt-primary-soft);
 }
 
 .nt-stream-text {
   font-size: 0.9375rem;
   line-height: 1.6;
   color: var(--nt-text-1);
+}
+
+/* ───── Inline Review ───── */
+.nt-inline-review-popover {
+  width: min(30rem, calc(100vw - 2rem));
+  padding: 1rem !important;
+  border-radius: var(--nt-radius-md) !important;
+  background: var(--nt-bg-elevated) !important;
+  border: 1px solid var(--nt-border-hover) !important;
+  box-shadow: var(--nt-shadow-lg) !important;
+}
+
+.nt-chip.is-review {
+  background: var(--nt-primary-soft);
+  color: var(--nt-primary);
+  border-color: color-mix(in srgb, var(--nt-primary) 24%, transparent);
+}
+
+.nt-chip.is-merge-candidate {
+  background: color-mix(in srgb, var(--nt-primary-soft) 68%, var(--nt-surface-1));
+  color: color-mix(in srgb, var(--nt-primary) 86%, #11284d);
+  border-color: color-mix(in srgb, var(--nt-primary) 20%, transparent);
 }
 
 /* ───── Review Cards ───── */
@@ -931,6 +1013,27 @@ html, body {
   font-size: 0.8125rem;
   color: var(--nt-text-3);
   line-height: 1.4;
+}
+
+.nt-progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: var(--nt-radius-full);
+  background: var(--nt-surface-2);
+  overflow: hidden;
+  border: 1px solid var(--nt-border);
+}
+
+.nt-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #16305c, #2453e6);
+  transition: width 0.25s ease;
+}
+
+.nt-progress-caption {
+  font-size: 0.75rem;
+  color: var(--nt-text-3);
 }
 
 /* ───── Empty States ───── */

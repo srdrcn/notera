@@ -224,6 +224,8 @@ def ensure_runtime_schema(db_path: Path | None = None):
             ("audio_error", "ALTER TABLE meeting ADD COLUMN audio_error TEXT"),
             ("postprocess_status", f"ALTER TABLE meeting ADD COLUMN postprocess_status TEXT NOT NULL DEFAULT '{POSTPROCESS_STATUS_PENDING}'"),
             ("postprocess_error", "ALTER TABLE meeting ADD COLUMN postprocess_error TEXT"),
+            ("postprocess_progress_pct", "ALTER TABLE meeting ADD COLUMN postprocess_progress_pct INTEGER"),
+            ("postprocess_progress_note", "ALTER TABLE meeting ADD COLUMN postprocess_progress_note TEXT"),
             ("joined_at", "ALTER TABLE meeting ADD COLUMN joined_at DATETIME"),
             ("ended_at", "ALTER TABLE meeting ADD COLUMN ended_at DATETIME"),
         ]

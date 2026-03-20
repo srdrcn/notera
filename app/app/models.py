@@ -23,6 +23,8 @@ class Meeting(rx.Model, table=True):
     audio_error: Optional[str] = None
     postprocess_status: str = "pending"
     postprocess_error: Optional[str] = None
+    postprocess_progress_pct: Optional[int] = None
+    postprocess_progress_note: Optional[str] = None
     joined_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)

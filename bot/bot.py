@@ -517,20 +517,18 @@ def probe_audio_duration_ms(audio_path):
 
 def trigger_postprocess_worker(meeting_id):
     worker_path = REPO_ROOT / "bot" / "postprocess_worker.py"
-    log_path = REPO_ROOT / "bot" / "postprocess.log"
     try:
         update_meeting_fields(
             meeting_id,
             postprocess_status=POSTPROCESS_STATUS_QUEUED,
             postprocess_error=None,
+            postprocess_progress_pct=None,
+            postprocess_progress_note=None,
         )
-        with open(log_path, "a", encoding="utf-8") as log_file:
-            subprocess.Popen(
-                [sys.executable, str(worker_path), str(meeting_id)],
-                stdout=log_file,
-                stderr=log_file,
-                start_new_session=True,
-            )
+        subprocess.Popen(
+            [sys.executable, "-u", str(worker_path), str(meeting_id)],
+            start_new_session=True,
+        )
         logger.info("Started post-process worker for meeting %s", meeting_id)
     except Exception as e:
         logger.error("Failed starting post-process worker for meeting %s: %s", meeting_id, e)
@@ -538,6 +536,8 @@ def trigger_postprocess_worker(meeting_id):
             meeting_id,
             postprocess_status="failed",
             postprocess_error=str(e),
+            postprocess_progress_pct=None,
+            postprocess_progress_note=None,
         )
 
 

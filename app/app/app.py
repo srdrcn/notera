@@ -6,7 +6,6 @@ from .models import Meeting
 from .state import (
     DashboardState,
     IndexState,
-    ReviewItemEntry,
     State,
     TranscriptEntry,
     TranscriptPageState,
@@ -233,6 +232,26 @@ def summary_chip(
             width="100%",
         ),
         class_name="nt-summary-chip",
+    )
+
+
+def postprocess_progress_extra() -> rx.Component:
+    return rx.cond(
+        TranscriptPageState.has_postprocess_progress,
+        rx.vstack(
+            rx.box(
+                rx.box(
+                    class_name="nt-progress-fill",
+                    width=TranscriptPageState.postprocess_progress_width,
+                ),
+                class_name="nt-progress-track",
+                width="100%",
+            ),
+            rx.text("Canlı ilerleme", class_name="nt-progress-caption"),
+            spacing="2",
+            width="100%",
+            align_items="start",
+        ),
     )
 
 
@@ -698,7 +717,34 @@ def speaker_badge(entry: TranscriptEntry) -> rx.Component:
     )
 
 
-def transcript_item(entry: TranscriptEntry) -> rx.Component:
+def transcript_metadata(entry: TranscriptEntry) -> rx.Component:
+    return rx.cond(
+        entry.has_pending_review | entry.has_duplicate_merge_candidate | entry.auto_corrected,
+        rx.hstack(
+            rx.cond(
+                entry.has_pending_review,
+                inline_chip("Review bekliyor", class_name="nt-chip is-review"),
+            ),
+            rx.cond(
+                entry.has_duplicate_merge_candidate,
+                inline_chip("Duplicate adayı", class_name="nt-chip is-merge-candidate"),
+            ),
+            rx.cond(
+                entry.auto_corrected,
+                inline_chip("Auto düzeltildi", class_name="nt-chip is-success"),
+            ),
+            spacing="2",
+            align="center",
+            wrap="wrap",
+        ),
+    )
+
+
+def transcript_row(
+    entry: TranscriptEntry,
+    item_class_name: str = "nt-stream-item",
+    bubble_class_name: str = "nt-stream-bubble",
+) -> rx.Component:
     return rx.hstack(
         rx.vstack(
             speaker_badge(entry),
@@ -708,20 +754,24 @@ def transcript_item(entry: TranscriptEntry) -> rx.Component:
             class_name="nt-timeline-col",
         ),
         rx.vstack(
-            rx.hstack(
-                rx.text(entry.speaker, class_name="nt-stream-speaker"),
-                rx.spacer(),
-                rx.cond(
-                    entry.auto_corrected,
-                    inline_chip("Auto düzeltildi", class_name="nt-chip is-success"),
+            rx.flex(
+                rx.hstack(
+                    rx.text(entry.speaker, class_name="nt-stream-speaker"),
+                    transcript_metadata(entry),
+                    spacing="2",
+                    align="center",
+                    wrap="wrap",
                 ),
                 rx.text(entry.timestamp, class_name="nt-stream-time"),
+                direction=rx.breakpoints(initial="column", sm="row"),
+                justify="between",
+                align=rx.breakpoints(initial="start", sm="center"),
+                gap="0.5rem",
                 width="100%",
-                align="center",
             ),
             rx.box(
                 rx.text(entry.text, class_name="nt-stream-text"),
-                class_name="nt-stream-bubble",
+                class_name=bubble_class_name,
             ),
             spacing="1",
             align_items="start",
@@ -730,110 +780,225 @@ def transcript_item(entry: TranscriptEntry) -> rx.Component:
         spacing="3",
         align="start",
         width="100%",
-        class_name="nt-stream-item",
+        class_name=item_class_name,
+    )
+
+
+def transcript_review_popover(entry: TranscriptEntry) -> rx.Component:
+    return rx.vstack(
+        rx.flex(
+            rx.vstack(
+                rx.text(entry.speaker, class_name="nt-stream-speaker"),
+                rx.text(entry.timestamp, class_name="nt-stream-time"),
+                spacing="0",
+                align_items="start",
+            ),
+            rx.hstack(
+                inline_chip(review_granularity_copy(entry.review_granularity)),
+                inline_chip(entry.review_confidence_label, class_name="nt-chip is-success"),
+                spacing="2",
+                align="center",
+                wrap="wrap",
+            ),
+            direction=rx.breakpoints(initial="column", sm="row"),
+            justify="between",
+            align=rx.breakpoints(initial="start", sm="center"),
+            gap="0.75rem",
+            width="100%",
+        ),
+        rx.vstack(
+            rx.text("Mevcut caption", class_name="nt-label"),
+            rx.text(entry.review_current_text, class_name="nt-review-text is-current"),
+            spacing="1",
+            align_items="start",
+            width="100%",
+        ),
+        rx.vstack(
+            rx.text("WhisperX metni", class_name="nt-label"),
+            rx.text(entry.review_suggested_text, class_name="nt-review-text is-suggested"),
+            rx.text(
+                "Uygula derseniz bu metin final transcript'e yazılır.",
+                class_name="nt-kpi-copy",
+            ),
+            spacing="1",
+            align_items="start",
+            width="100%",
+        ),
+        rx.vstack(
+            rx.text("Kısa ses klibi", class_name="nt-label"),
+            rx.cond(
+                entry.review_has_audio_clip,
+                rx.audio(
+                    src=entry.review_audio_clip_src,
+                    controls=True,
+                    width="100%",
+                    class_name="nt-audio-player",
+                ),
+                rx.text(
+                    "Ses klibi üretilemedi; metin önerisini yine de karar verebilirsiniz.",
+                    class_name="nt-kpi-copy",
+                ),
+            ),
+            spacing="2",
+            align_items="start",
+            width="100%",
+        ),
+        rx.hstack(
+            rx.button(
+                "Uygula",
+                on_click=lambda: TranscriptPageState.apply_review_item(entry.review_item_id),
+                class_name="nt-btn nt-btn-primary nt-btn-sm",
+            ),
+            rx.button(
+                "Koru",
+                on_click=lambda: TranscriptPageState.keep_review_item(entry.review_item_id),
+                class_name="nt-btn nt-btn-secondary nt-btn-sm",
+            ),
+            spacing="3",
+            width="100%",
+            justify="end",
+        ),
+        spacing="4",
+        width="100%",
+        align_items="start",
+    )
+
+
+def reviewable_transcript_item(entry: TranscriptEntry) -> rx.Component:
+    return rx.popover.root(
+        rx.popover.trigger(
+            transcript_row(
+                entry,
+                item_class_name="nt-stream-item is-review-pending",
+                bubble_class_name="nt-stream-bubble is-review-pending",
+            ),
+            class_name="nt-stream-item-trigger",
+        ),
+        rx.popover.content(
+            transcript_review_popover(entry),
+            side="top",
+            align="start",
+            side_offset=12,
+            collision_padding=16,
+            class_name="nt-inline-review-popover",
+        ),
+    )
+
+
+def merge_candidate_transcript_item(entry: TranscriptEntry) -> rx.Component:
+    return transcript_row(
+        entry,
+        item_class_name="nt-stream-item is-merge-candidate",
+        bubble_class_name="nt-stream-bubble is-merge-candidate",
+    )
+
+
+def transcript_item(entry: TranscriptEntry) -> rx.Component:
+    return rx.cond(
+        entry.has_pending_review,
+        reviewable_transcript_item(entry),
+        rx.cond(
+            entry.has_duplicate_merge_candidate,
+            merge_candidate_transcript_item(entry),
+            transcript_row(entry),
+        ),
     )
 
 
 def transcript_toolbar() -> rx.Component:
-    return rx.hstack(
-        rx.heading("Transcript", class_name="nt-section-title"),
-        width="auto",
-        align="center",
-        class_name="nt-stream-header",
-    )
-
-
-def review_toolbar() -> rx.Component:
-    return rx.hstack(
-        rx.heading("Review Kuyruğu", class_name="nt-section-title"),
-        rx.spacer(),
-        inline_chip(
-            rx.hstack(
-                rx.text(TranscriptPageState.pending_review_count, font_size="0.75rem"),
-                rx.text("bekliyor", font_size="0.75rem"),
-                spacing="1",
-                align="center",
-            ),
-        ),
-        width="100%",
-        align="center",
-        class_name="nt-stream-header",
-    )
-
-
-def review_item_card(item: ReviewItemEntry) -> rx.Component:
-    return rx.box(
+    return rx.flex(
         rx.vstack(
-            rx.hstack(
-                rx.vstack(
-                    rx.text(item.speaker, class_name="nt-stream-speaker"),
-                    rx.text(item.timestamp, class_name="nt-stream-time"),
-                    spacing="0",
-                    align_items="start",
-                ),
-                rx.spacer(),
-                inline_chip(review_granularity_copy(item.granularity)),
-                inline_chip(item.confidence_label, class_name="nt-chip is-success"),
-                width="100%",
-                align="start",
-            ),
-            rx.vstack(
-                rx.text("Mevcut caption", class_name="nt-label"),
-                rx.text(item.current_text, class_name="nt-review-text is-current"),
-                spacing="1",
-                align_items="start",
-                width="100%",
-            ),
-            rx.vstack(
-                rx.text("WhisperX metni", class_name="nt-label"),
-                rx.text(item.suggested_text, class_name="nt-review-text is-suggested"),
+            rx.heading("Transcript", class_name="nt-section-title"),
+            rx.cond(
+                TranscriptPageState.pending_review_count > 0,
                 rx.text(
-                    "Uygula derseniz bu metin final transcript'e yazılır.",
-                    class_name="nt-kpi-copy",
+                    "Vurgulu satırlara tıklayarak review yapabilirsiniz.",
+                    class_name="nt-review-helper",
                 ),
-                spacing="1",
-                align_items="start",
-                width="100%",
-            ),
-            rx.vstack(
-                rx.text("Kısa ses klibi", class_name="nt-label"),
                 rx.cond(
-                    item.has_audio_clip,
-                    rx.audio(
-                        src=item.audio_clip_src,
-                        controls=True,
-                        width="100%",
-                        class_name="nt-audio-player",
+                    TranscriptPageState.can_merge_duplicate_transcripts,
+                    rx.text(
+                        "Vurgulu satırlar duplicate merge adayı.",
+                        class_name="nt-review-helper",
                     ),
                     rx.text(
-                        "Ses klibi üretilemedi; metin önerisini yine de karar verebilirsiniz.",
-                        class_name="nt-kpi-copy",
+                        "Bekleyen review yok.",
+                        class_name="nt-review-helper is-muted",
+                    ),
+                ),
+            ),
+            spacing="1",
+            align_items="start",
+        ),
+        rx.cond(
+            (TranscriptPageState.pending_review_count > 0)
+            | TranscriptPageState.can_merge_duplicate_transcripts,
+            rx.hstack(
+                rx.cond(
+                    TranscriptPageState.pending_review_count > 0,
+                    rx.box(
+                        rx.hstack(
+                            rx.text(TranscriptPageState.pending_review_count, font_size="0.75rem"),
+                            rx.text("bekliyor", font_size="0.75rem"),
+                            spacing="1",
+                            align="center",
+                        ),
+                        class_name="nt-chip is-review",
+                    ),
+                ),
+                rx.cond(
+                    TranscriptPageState.pending_review_count > 0,
+                    rx.button(
+                        rx.icon(tag="check", size=14),
+                        rx.cond(
+                            TranscriptPageState.is_applying_all_reviews,
+                            "Uygulanıyor",
+                            "Tümünü Uygula",
+                        ),
+                        on_click=TranscriptPageState.apply_all_review_items,
+                        loading=TranscriptPageState.is_applying_all_reviews,
+                        class_name="nt-btn nt-btn-secondary nt-btn-sm",
+                    ),
+                ),
+                rx.cond(
+                    TranscriptPageState.can_merge_duplicate_transcripts,
+                    rx.box(
+                        rx.hstack(
+                            rx.text(
+                                TranscriptPageState.duplicate_merge_candidate_count,
+                                font_size="0.75rem",
+                            ),
+                            rx.text("duplicate adayı", font_size="0.75rem"),
+                            spacing="1",
+                            align="center",
+                        ),
+                        class_name="nt-chip is-merge-candidate",
+                    ),
+                ),
+                rx.cond(
+                    TranscriptPageState.can_merge_duplicate_transcripts,
+                    rx.button(
+                        rx.cond(
+                            TranscriptPageState.is_merging_duplicates,
+                            "Birleştiriliyor",
+                            "Duplicate kayıtları birleştir",
+                        ),
+                        on_click=TranscriptPageState.merge_duplicate_transcripts,
+                        loading=TranscriptPageState.is_merging_duplicates,
+                        class_name="nt-btn nt-btn-secondary nt-btn-sm",
                     ),
                 ),
                 spacing="2",
-                align_items="start",
-                width="100%",
+                align="center",
+                wrap="wrap",
             ),
-            rx.hstack(
-                rx.button(
-                    "Uygula",
-                    on_click=lambda: TranscriptPageState.apply_review_item(item.id),
-                    class_name="nt-btn nt-btn-primary nt-btn-sm",
-                ),
-                rx.button(
-                    "Koru",
-                    on_click=lambda: TranscriptPageState.keep_review_item(item.id),
-                    class_name="nt-btn nt-btn-secondary nt-btn-sm",
-                ),
-                spacing="3",
-                width="100%",
-                justify="end",
-            ),
-            spacing="4",
-            width="100%",
-            align_items="start",
         ),
-        class_name="nt-review-card",
+        direction=rx.breakpoints(initial="column", sm="row"),
+        gap="0.75rem",
+        width="100%",
+        justify="between",
+        align=rx.breakpoints(initial="start", sm="center"),
+        class_name="nt-stream-header",
     )
 
 
@@ -981,8 +1146,9 @@ def transcripts_page() -> rx.Component:
                             ),
                             summary_chip(
                                 "WhisperX",
-                                TranscriptPageState.postprocess_status_label,
-                                TranscriptPageState.postprocess_status_detail,
+                                TranscriptPageState.postprocess_summary_value,
+                                TranscriptPageState.postprocess_summary_detail,
+                                extra=postprocess_progress_extra(),
                             ),
                             summary_chip(
                                 "Review",
@@ -1047,71 +1213,43 @@ def transcripts_page() -> rx.Component:
                     class_name="nt-transcript-header",
                     width="100%",
                 ),
-                # Two-column: Transcript + Review
-                rx.grid(
-                    rx.box(
-                        transcript_toolbar(),
-                        rx.cond(
-                            TranscriptPageState.has_transcripts,
-                            rx.auto_scroll(
-                                rx.box(
-                                    rx.vstack(
-                                        rx.foreach(
-                                            TranscriptPageState.transcripts,
-                                            transcript_item,
-                                        ),
-                                        spacing="0",
-                                        width="100%",
-                                    ),
-                                    class_name="nt-stream-track",
-                                ),
-                                class_name="nt-stream-body",
-                            ),
-                            rx.cond(
-                                (TranscriptPageState.meeting_status == "active")
-                                | (TranscriptPageState.meeting_status == "joining"),
-                                rx.vstack(
-                                    skeleton_loader(),
-                                    skeleton_loader(),
-                                    skeleton_loader(),
-                                    spacing="4",
-                                    width="100%",
-                                    padding="2rem 1.25rem",
-                                ),
-                                empty_state(
-                                    "message-square",
-                                    "Henüz transkript yakalanmadı",
-                                    "Toplantı başladığında konuşmalar burada gerçek zamanlı akacak.",
-                                ),
-                            ),
-                        ),
-                        class_name="nt-stream-shell",
-                    ),
-                    rx.box(
-                        review_toolbar(),
-                        rx.cond(
-                            TranscriptPageState.has_review_items,
+                rx.box(
+                    transcript_toolbar(),
+                    rx.cond(
+                        TranscriptPageState.has_transcripts,
+                        rx.auto_scroll(
                             rx.box(
                                 rx.vstack(
                                     rx.foreach(
-                                        TranscriptPageState.review_items,
-                                        review_item_card,
+                                        TranscriptPageState.transcripts,
+                                        transcript_item,
                                     ),
-                                    spacing="3",
+                                    spacing="0",
                                     width="100%",
                                 ),
-                                class_name="nt-review-list",
+                                class_name="nt-stream-track",
+                            ),
+                            class_name="nt-stream-body",
+                        ),
+                        rx.cond(
+                            (TranscriptPageState.meeting_status == "active")
+                            | (TranscriptPageState.meeting_status == "joining"),
+                            rx.vstack(
+                                skeleton_loader(),
+                                skeleton_loader(),
+                                skeleton_loader(),
+                                spacing="4",
+                                width="100%",
+                                padding="2rem 1.25rem",
                             ),
                             empty_state(
-                                "shield-check",
-                                "Bekleyen review yok",
-                                "Kararsız kelime ve cümle farkları oluştuğunda burada ses klibiyle birlikte karar vereceksiniz.",
+                                "message-square",
+                                "Henüz transkript yakalanmadı",
+                                "Toplantı başladığında konuşmalar burada gerçek zamanlı akacak.",
                             ),
                         ),
-                        class_name="nt-review-shell",
                     ),
-                    columns=rx.breakpoints(initial="1", xl="2"),
-                    spacing="4",
+                    class_name="nt-stream-shell",
                     width="100%",
                 ),
                 spacing="5",
