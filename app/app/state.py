@@ -3,24 +3,54 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+import re
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime
+from difflib import SequenceMatcher
 from typing import List, Optional
 
 import reflex as rx
 from pydantic import BaseModel
 from sqlmodel import select
 
-from .models import Meeting, Transcript, User
+from .meeting_runtime import (
+    AUDIO_STATUS_DISABLED,
+    AUDIO_STATUS_FAILED,
+    AUDIO_STATUS_PENDING,
+    AUDIO_STATUS_READY,
+    AUDIO_STATUS_RECORDING,
+    POSTPROCESS_STATUS_ALIGNING,
+    POSTPROCESS_STATUS_CANONICALIZING,
+    POSTPROCESS_STATUS_COMPLETED,
+    POSTPROCESS_STATUS_FAILED,
+    POSTPROCESS_STATUS_PENDING,
+    POSTPROCESS_STATUS_QUEUED,
+    POSTPROCESS_STATUS_REBUILDING,
+    POSTPROCESS_STATUS_REVIEW_READY,
+    POSTPROCESS_STATUS_RUNNING,
+    POSTPROCESS_STATUS_TRANSCRIBING,
+    REVIEW_STATUS_ACCEPTED,
+    REVIEW_STATUS_PENDING,
+    REVIEW_STATUS_REJECTED,
+    TRANSCRIPT_STATUS_ACCEPTED,
+    TRANSCRIPT_STATUS_PENDING_REVIEW,
+    TRANSCRIPT_STATUS_REJECTED,
+    cleanup_meeting_artifacts,
+    ensure_runtime_schema,
+    get_db_path,
+    get_meeting_pcm_audio_path,
+    get_public_meeting_audio_src,
+    get_review_clip_src,
+    sync_public_meeting_audio,
+)
+from .models import Meeting, MeetingAudioAsset, TeamsCaptionEvent, Transcript, TranscriptReviewItem, User
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("State")
-
 
 def _format_relative_time(value: Optional[datetime]) -> str:
     """Return a compact human-readable relative time label."""
@@ -54,6 +84,277 @@ def _meeting_status_label(status: str) -> str:
     }.get(status, "Beklemede")
 
 
+def _audio_status_label(status: str) -> str:
+    return {
+        AUDIO_STATUS_DISABLED: "Ses kapalı",
+        AUDIO_STATUS_PENDING: "Ses hazırlanıyor",
+        AUDIO_STATUS_RECORDING: "Ses kaydediliyor",
+        AUDIO_STATUS_READY: "Ses hazır",
+        AUDIO_STATUS_FAILED: "Ses kaydı alınamadı",
+    }.get(status, "Ses durumu bilinmiyor")
+
+
+def _postprocess_status_label(status: str) -> str:
+    return {
+        POSTPROCESS_STATUS_PENDING: "Doğrulama bekliyor",
+        POSTPROCESS_STATUS_QUEUED: "Doğrulama sırada",
+        POSTPROCESS_STATUS_RUNNING: "WhisperX işleniyor",
+        POSTPROCESS_STATUS_TRANSCRIBING: "WhisperX transcript çıkarıyor",
+        POSTPROCESS_STATUS_CANONICALIZING: "Teams transcript temizleniyor",
+        POSTPROCESS_STATUS_ALIGNING: "Transcriptler hizalanıyor",
+        POSTPROCESS_STATUS_REBUILDING: "Final transcript hazırlanıyor",
+        POSTPROCESS_STATUS_REVIEW_READY: "Review kararları hazır",
+        POSTPROCESS_STATUS_COMPLETED: "Doğrulama tamamlandı",
+        POSTPROCESS_STATUS_FAILED: "Doğrulama başarısız",
+    }.get(status, "Doğrulama durumu bilinmiyor")
+
+
+def _normalize_transcript_text(value: str | None) -> str:
+    return " ".join((value or "").strip().split())
+
+
+def _transcript_tokens(value: str | None) -> list[str]:
+    return re.findall(r"[\wçğıöşüÇĞİÖŞÜ'-]+", _normalize_transcript_text(value).casefold())
+
+
+def _common_prefix_token_count(left_tokens: list[str], right_tokens: list[str]) -> int:
+    count = 0
+    for left_token, right_token in zip(left_tokens, right_tokens):
+        if left_token != right_token:
+            break
+        count += 1
+    return count
+
+
+def _transcript_token_match(left_token: str, right_token: str) -> bool:
+    if left_token == right_token:
+        return True
+    shorter_length = min(len(left_token), len(right_token))
+    if shorter_length >= 2 and (left_token.startswith(right_token) or right_token.startswith(left_token)):
+        return True
+    if shorter_length >= 4 and SequenceMatcher(None, left_token, right_token).ratio() >= 0.82:
+        return True
+    return False
+
+
+def _fuzzy_common_prefix_token_count(left_tokens: list[str], right_tokens: list[str]) -> int:
+    count = 0
+    for left_token, right_token in zip(left_tokens, right_tokens):
+        if not _transcript_token_match(left_token, right_token):
+            break
+        count += 1
+    return count
+
+
+def _transcript_base_text(transcript: Transcript) -> str:
+    return _normalize_transcript_text(getattr(transcript, "teams_text", None) or transcript.text)
+
+
+def _transcript_revision_score(text: str | None) -> int:
+    normalized = _normalize_transcript_text(text)
+    if not normalized:
+        return -9999
+    score = len(normalized)
+    if normalized.endswith((".", "!", "?", "…")):
+        score += 24
+    score += normalized.count(".") * 4
+    score += normalized.count("?") * 4
+    score += normalized.count("!") * 4
+    tokens = _transcript_tokens(normalized)
+    if tokens and len(tokens[-1]) <= 2:
+        score -= 8
+    return score
+
+
+def _choose_preferred_transcript_text(existing_text: str | None, new_text: str | None) -> str:
+    old_text = _normalize_transcript_text(existing_text)
+    new_value = _normalize_transcript_text(new_text)
+    if not old_text:
+        return new_value
+    if not new_value:
+        return old_text
+
+    old_tokens = _transcript_tokens(old_text)
+    new_tokens = _transcript_tokens(new_value)
+    shared_prefix = _common_prefix_token_count(old_tokens, new_tokens)
+    shorter_length = min(len(old_tokens), len(new_tokens))
+
+    if shorter_length and shared_prefix >= min(4, shorter_length) and shared_prefix / max(shorter_length, 1) >= 0.75:
+        if len(new_tokens) > len(old_tokens):
+            return new_value
+        if len(new_tokens) < len(old_tokens):
+            if _transcript_revision_score(new_value) >= _transcript_revision_score(old_text):
+                return new_value
+            return old_text
+
+    if _transcript_revision_score(new_value) > _transcript_revision_score(old_text):
+        return new_value
+    return old_text
+
+
+def _compatible_transcript_speakers(existing_speaker: str | None, new_speaker: str | None) -> bool:
+    existing_value = _normalize_transcript_text(existing_speaker).casefold()
+    new_value = _normalize_transcript_text(new_speaker).casefold()
+    if not existing_value or existing_value == "unknown":
+        return True
+    if not new_value or new_value == "unknown":
+        return True
+    return existing_value == new_value
+
+
+def _transcript_texts_should_merge(existing_text: str | None, new_text: str | None) -> bool:
+    old_text = _normalize_transcript_text(existing_text)
+    new_value = _normalize_transcript_text(new_text)
+    if not old_text or not new_value:
+        return False
+
+    old_fold = old_text.casefold()
+    new_fold = new_value.casefold()
+    if old_fold == new_fold:
+        return True
+
+    punctuation = ".,!?;:…"
+    if new_fold.rstrip(punctuation) == old_fold.rstrip(punctuation):
+        return True
+
+    old_tokens = _transcript_tokens(old_text)
+    new_tokens = _transcript_tokens(new_value)
+    if old_tokens and new_tokens:
+        shared_prefix = _fuzzy_common_prefix_token_count(old_tokens, new_tokens)
+        shorter_length = min(len(old_tokens), len(new_tokens))
+        if shared_prefix >= min(3, shorter_length) and shared_prefix / max(shorter_length, 1) >= 0.6:
+            return True
+
+    return (
+        SequenceMatcher(None, old_fold, new_fold).ratio() >= 0.82
+        and abs(len(new_fold) - len(old_fold)) <= 96
+    )
+
+
+def _transcript_sort_time(transcript: Transcript) -> datetime | None:
+    return transcript.caption_finalized_at or transcript.timestamp or transcript.caption_started_at
+
+
+def _transcript_merge_time(transcript: Transcript) -> datetime | None:
+    return transcript.caption_started_at or transcript.timestamp or transcript.caption_finalized_at
+
+
+def _collapse_rotating_duplicate_transcripts(
+    transcripts: list[Transcript],
+    rotation_window_seconds: int = 20,
+) -> list[Transcript]:
+    filtered: list[Transcript] = []
+    last_index_by_key: dict[tuple[str, str], int] = {}
+
+    for raw_index, transcript in enumerate(transcripts):
+        text_key = _normalize_transcript_text(transcript.text)
+        speaker_key = _normalize_transcript_text(transcript.speaker).casefold()
+        content_key = (speaker_key, text_key.casefold())
+        current_time = _transcript_sort_time(transcript)
+
+        previous_index = last_index_by_key.get(content_key)
+        should_skip = False
+        if previous_index is not None and current_time is not None:
+            previous_transcript = transcripts[previous_index]
+            previous_time = _transcript_sort_time(previous_transcript)
+            if previous_time is not None:
+                delta_seconds = (current_time - previous_time).total_seconds()
+                distinct_between = {
+                    (
+                        _normalize_transcript_text(item.speaker).casefold(),
+                        _normalize_transcript_text(item.text).casefold(),
+                    )
+                    for item in transcripts[previous_index + 1 : raw_index]
+                    if _normalize_transcript_text(item.text)
+                }
+                distinct_between.discard(content_key)
+                if 0 <= delta_seconds <= rotation_window_seconds and len(distinct_between) >= 1:
+                    should_skip = True
+
+        last_index_by_key[content_key] = raw_index
+        if not should_skip:
+            filtered.append(transcript)
+
+    collapsed: list[Transcript] = []
+    for transcript in filtered:
+        current_text = _transcript_base_text(transcript)
+        if not collapsed:
+            collapsed.append(transcript)
+            continue
+
+        previous_transcript = collapsed[-1]
+        previous_time = _transcript_merge_time(previous_transcript)
+        current_time = _transcript_merge_time(transcript)
+        if previous_time is not None and current_time is not None:
+            delta_seconds = (current_time - previous_time).total_seconds()
+            if (
+                0 <= delta_seconds <= 8
+                and _compatible_transcript_speakers(previous_transcript.speaker, transcript.speaker)
+                and _transcript_texts_should_merge(
+                    _transcript_base_text(previous_transcript),
+                    current_text,
+                )
+            ):
+                collapsed[-1] = transcript
+                continue
+
+        collapsed.append(transcript)
+
+    return collapsed
+
+
+def _collapse_live_caption_events(events: list[TeamsCaptionEvent]) -> list["TranscriptEntry"]:
+    collapsed: list[dict] = []
+
+    for event in events:
+        text = _normalize_transcript_text(event.text)
+        if len(text) < 2:
+            continue
+        speaker = _normalize_transcript_text(event.speaker_name) or "Unknown"
+        observed_at = event.observed_at or datetime.utcnow()
+
+        if collapsed:
+            previous = collapsed[-1]
+            delta_seconds = (
+                (observed_at - previous["observed_at"]).total_seconds()
+                if previous["observed_at"] and observed_at
+                else 999
+            )
+            if (
+                0 <= delta_seconds <= 8
+                and _compatible_transcript_speakers(previous["speaker"], speaker)
+                and _transcript_texts_should_merge(previous["text"], text)
+            ):
+                previous["speaker"] = speaker if speaker.casefold() != "unknown" else previous["speaker"]
+                previous["text"] = _choose_preferred_transcript_text(previous["text"], text)
+                previous["observed_at"] = observed_at
+                previous["id"] = event.id
+                continue
+
+        collapsed.append(
+            {
+                "id": event.id,
+                "speaker": speaker,
+                "text": text,
+                "observed_at": observed_at,
+            }
+        )
+
+    return [
+        TranscriptEntry(
+            id=item["id"],
+            speaker=item["speaker"],
+            text=item["text"],
+            timestamp=item["observed_at"].strftime("%H:%M:%S") if item["observed_at"] else "",
+            initials="",
+            color="",
+            resolution_status="original",
+            auto_corrected=False,
+        )
+        for item in collapsed
+    ]
+
+
 def _is_process_running(pid: Optional[int]) -> bool:
     """Check whether a process id still exists."""
     if not pid:
@@ -73,11 +374,6 @@ def _is_process_running(pid: Optional[int]) -> bool:
 def _bot_stop_flag_path(meeting_id: int) -> Path:
     repo_root = Path(__file__).resolve().parents[2]
     return repo_root / "bot" / f"stop_{meeting_id}.flag"
-
-
-def _app_db_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "app" / "reflex.db"
 
 
 def _meeting_preview_dir() -> Path:
@@ -104,27 +400,8 @@ def _remove_meeting_preview(user_id: int, meeting_id: int):
     preview_path.unlink(missing_ok=True)
 
 
-def _ensure_meeting_schema():
-    """Remove legacy meeting columns from existing local SQLite databases."""
-    db_path = _app_db_path()
-    if not db_path.exists():
-        return
-
-    conn = sqlite3.connect(db_path)
-    try:
-        cursor = conn.cursor()
-        columns = {
-            row[1]
-            for row in cursor.execute("PRAGMA table_info(meeting)").fetchall()
-        }
-        if "caption_language" in columns:
-            cursor.execute("ALTER TABLE meeting DROP COLUMN caption_language")
-            conn.commit()
-            logger.info("Removed legacy meeting.caption_language column from SQLite database.")
-    except Exception:
-        logger.exception("Failed ensuring meeting schema compatibility.")
-    finally:
-        conn.close()
+def _ensure_runtime_schema():
+    ensure_runtime_schema(get_db_path())
 
 
 def _terminate_bot_process(pid: Optional[int], timeout_seconds: float = 6.0) -> bool:
@@ -246,6 +523,54 @@ def _stop_meeting_operation(meeting_id: int):
         session.commit()
         return True, toast_event
 
+
+def _delete_meeting_operation(meeting_id: int):
+    with rx.session() as session:
+        meeting = session.exec(
+            select(Meeting).where(Meeting.id == meeting_id)
+        ).first()
+        if not meeting:
+            return False
+
+        transcript_ids = [
+            transcript.id
+            for transcript in session.exec(
+                select(Transcript).where(Transcript.meeting_id == meeting_id)
+            ).all()
+        ]
+        if transcript_ids:
+            review_items = session.exec(
+                select(TranscriptReviewItem).where(
+                    TranscriptReviewItem.transcript_id.in_(transcript_ids)
+                )
+            ).all()
+            for review_item in review_items:
+                session.delete(review_item)
+
+        audio_assets = session.exec(
+            select(MeetingAudioAsset).where(MeetingAudioAsset.meeting_id == meeting_id)
+        ).all()
+        for audio_asset in audio_assets:
+            session.delete(audio_asset)
+
+        caption_events = session.exec(
+            select(TeamsCaptionEvent).where(TeamsCaptionEvent.meeting_id == meeting_id)
+        ).all()
+        for caption_event in caption_events:
+            session.delete(caption_event)
+
+        transcripts = session.exec(
+            select(Transcript).where(Transcript.meeting_id == meeting_id)
+        ).all()
+        for transcript in transcripts:
+            session.delete(transcript)
+
+        _remove_meeting_preview(meeting.user_id, meeting.id)
+        cleanup_meeting_artifacts(meeting_id)
+        session.delete(meeting)
+        session.commit()
+        return True
+
 class State(rx.State):
     """The app state."""
     user: Optional[User] = None
@@ -261,7 +586,7 @@ class State(rx.State):
     
     def cleanup(self):
         """Reconcile stale meetings without touching active bot processes."""
-        _ensure_meeting_schema()
+        _ensure_runtime_schema()
         with rx.session() as session:
             meetings = session.exec(select(Meeting)).all()
 
@@ -365,6 +690,7 @@ class DashboardState(State):
     meetings: List[Meeting] = []
     new_meeting_title: str = ""
     new_meeting_link: str = ""
+    new_meeting_audio_recording_enabled: bool = True
     transcript_entry_count: int = 0
     meetings_with_transcripts: int = 0
     latest_activity_label: str = "Henüz aktivite yok"
@@ -391,6 +717,9 @@ class DashboardState(State):
 
     def set_new_meeting_link(self, link: str):
         self.new_meeting_link = link
+
+    def set_new_meeting_audio_recording_enabled(self, value: bool):
+        self.new_meeting_audio_recording_enabled = bool(value)
 
     @rx.event(background=True)
     async def poll_meetings(self):
@@ -549,7 +878,6 @@ class DashboardState(State):
     def add_meeting(self):
         if not self.is_logged_in:
             return
-        _ensure_meeting_schema()
 
         toast_event = None
         should_reload = False
@@ -559,6 +887,13 @@ class DashboardState(State):
                 user_id=self.user.id,
                 title=self.new_meeting_title,
                 teams_link=self.new_meeting_link,
+                audio_recording_enabled=self.new_meeting_audio_recording_enabled,
+                audio_status=(
+                    AUDIO_STATUS_PENDING
+                    if self.new_meeting_audio_recording_enabled
+                    else AUDIO_STATUS_DISABLED
+                ),
+                postprocess_status=POSTPROCESS_STATUS_PENDING,
             )
             session.add(new_meeting)
             session.commit()
@@ -570,6 +905,7 @@ class DashboardState(State):
             if started:
                 self.new_meeting_title = ""
                 self.new_meeting_link = ""
+                self.new_meeting_audio_recording_enabled = True
             else:
                 session.delete(new_meeting)
                 session.commit()
@@ -638,37 +974,48 @@ class DashboardState(State):
 
     def delete_meeting(self, meeting_id: int):
         """Delete a meeting and its transcripts."""
-        with rx.session() as session:
-            meeting = session.exec(
-                select(Meeting).where(Meeting.id == meeting_id)
-            ).first()
-            if meeting:
-                _remove_meeting_preview(meeting.user_id, meeting.id)
-                transcripts = session.exec(
-                    select(Transcript).where(Transcript.meeting_id == meeting_id)
-                ).all()
-                for transcript in transcripts:
-                    session.delete(transcript)
-                
-                session.delete(meeting)
-                session.commit()
-                self.load_meetings()
+        if _delete_meeting_operation(meeting_id):
+            self.load_meetings()
 
 
 class TranscriptEntry(BaseModel):
     """A single transcript entry for the UI."""
+    id: int
     speaker: str
     text: str
     timestamp: str
     initials: str
     color: str
+    resolution_status: str
+    auto_corrected: bool
+
+
+class ReviewItemEntry(BaseModel):
+    """A review suggestion entry for the UI."""
+    id: int
+    transcript_id: int
+    speaker: str
+    timestamp: str
+    granularity: str
+    current_text: str
+    suggested_text: str
+    confidence_label: str
+    audio_clip_src: str
+    has_audio_clip: bool
 
 class TranscriptPageState(State):
     """State for the dedicated transcript page."""
     meeting_title: str = ""
     current_meeting_id: int = 0
     transcripts: List[TranscriptEntry] = []
+    review_items: List[ReviewItemEntry] = []
     meeting_status: str = "pending"
+    audio_status: str = AUDIO_STATUS_PENDING
+    audio_error: str = ""
+    postprocess_status: str = POSTPROCESS_STATUS_PENDING
+    postprocess_error: str = ""
+    master_audio_src: str = ""
+    master_audio_label: str = "Henüz ses kaydı yok"
     bot_preview_src: str = ""
     bot_preview_label: str = "Henüz canlı görüntü yok"
     live_updates_enabled: bool = False
@@ -706,19 +1053,158 @@ class TranscriptPageState(State):
     def can_stop_meeting(self) -> bool:
         return self.meeting_status in {"joining", "active"}
 
-    def _apply_transcript_snapshot(self, meeting: Meeting, db_transcripts: list[Transcript]):
+    @rx.var
+    def audio_status_label(self) -> str:
+        return _audio_status_label(self.audio_status)
+
+    @rx.var
+    def postprocess_status_label(self) -> str:
+        if self.audio_status == AUDIO_STATUS_DISABLED:
+            return "Audio kapalı"
+        if self.audio_status == AUDIO_STATUS_FAILED:
+            return "Teams-only transcript"
+        return _postprocess_status_label(self.postprocess_status)
+
+    @rx.var
+    def has_review_items(self) -> bool:
+        return bool(self.review_items)
+
+    @rx.var
+    def pending_review_count(self) -> int:
+        return len(self.review_items)
+
+    @rx.var
+    def has_master_audio(self) -> bool:
+        return bool(self.master_audio_src)
+
+    @rx.var
+    def has_audio_warning(self) -> bool:
+        return self.audio_status == AUDIO_STATUS_FAILED
+
+    @rx.var
+    def audio_status_detail(self) -> str:
+        if self.has_master_audio and self.master_audio_label:
+            return self.master_audio_label
+        if self.audio_status == AUDIO_STATUS_FAILED and self.audio_error:
+            return self.audio_error
+        return self.audio_status_label
+
+    @rx.var
+    def postprocess_status_detail(self) -> str:
+        if self.audio_status == AUDIO_STATUS_DISABLED:
+            return "Ses kaydı kapalı olduğu için final transcript yalnızca Teams caption temizliği ile üretildi."
+        if self.audio_status == AUDIO_STATUS_FAILED:
+            return "Ses alınamadığı için final transcript yalnızca Teams caption temizliği ile üretildi."
+        if self.postprocess_error:
+            return self.postprocess_error
+        return self.postprocess_status_label
+
+    def _apply_transcript_snapshot(
+        self,
+        meeting: Meeting,
+        db_caption_events: list[TeamsCaptionEvent],
+        db_transcripts: list[Transcript],
+        db_review_items: list[TranscriptReviewItem],
+        audio_asset: MeetingAudioAsset | None,
+    ):
+        visible_transcripts = _collapse_rotating_duplicate_transcripts(db_transcripts)
+        live_entries = _collapse_live_caption_events(db_caption_events)
+
         self.meeting_title = meeting.title
         self.meeting_status = meeting.status
-        self.transcripts = [
+        self.audio_status = meeting.audio_status
+        self.audio_error = meeting.audio_error or ""
+        self.postprocess_status = meeting.postprocess_status
+        self.postprocess_error = meeting.postprocess_error or ""
+        self.master_audio_src = ""
+        self.master_audio_label = "Henüz ses kaydı yok"
+        final_entries = [
             TranscriptEntry(
+                id=t.id,
                 speaker=t.speaker,
                 text=t.text,
-                timestamp=t.timestamp.strftime("%H:%M:%S") if t.timestamp else "",
+                timestamp=(
+                    (t.caption_finalized_at or t.timestamp).strftime("%H:%M:%S")
+                    if (t.caption_finalized_at or t.timestamp)
+                    else ""
+                ),
                 initials=self._get_initials(t.speaker),
                 color=self._get_color_scheme(meeting.id, t.speaker),
+                resolution_status=t.resolution_status,
+                auto_corrected=t.auto_corrected,
             )
-            for t in db_transcripts
+            for t in visible_transcripts
         ]
+        if meeting.status in {"joining", "active"} or not final_entries:
+            self.transcripts = [
+                TranscriptEntry(
+                    id=entry.id,
+                    speaker=entry.speaker,
+                    text=entry.text,
+                    timestamp=entry.timestamp,
+                    initials=self._get_initials(entry.speaker),
+                    color=self._get_color_scheme(meeting.id, entry.speaker),
+                    resolution_status=entry.resolution_status,
+                    auto_corrected=entry.auto_corrected,
+                )
+                for entry in live_entries
+            ]
+        else:
+            self.transcripts = final_entries
+
+        transcript_map = {transcript.id: transcript for transcript in db_transcripts}
+        self.review_items = [
+            ReviewItemEntry(
+                id=review_item.id,
+                transcript_id=review_item.transcript_id,
+                speaker=transcript_map[review_item.transcript_id].speaker,
+                timestamp=(
+                    (transcript_map[review_item.transcript_id].caption_finalized_at or transcript_map[review_item.transcript_id].timestamp).strftime("%H:%M:%S")
+                    if (transcript_map[review_item.transcript_id].caption_finalized_at or transcript_map[review_item.transcript_id].timestamp)
+                    else ""
+                ),
+                granularity=review_item.granularity,
+                current_text=review_item.current_text,
+                suggested_text=review_item.suggested_text,
+                confidence_label=f"%{int(round(review_item.confidence * 100))}",
+                audio_clip_src=(
+                    get_review_clip_src(review_item.audio_clip_path)
+                    if review_item.audio_clip_path
+                    else ""
+                ),
+                has_audio_clip=bool(review_item.audio_clip_path),
+            )
+            for review_item in db_review_items
+            if review_item.transcript_id in transcript_map
+        ]
+
+        if audio_asset and audio_asset.master_audio_path:
+            try:
+                preferred_audio_path = Path(audio_asset.master_audio_path)
+                pcm_audio_path = get_meeting_pcm_audio_path(meeting.id)
+                if pcm_audio_path.exists():
+                    preferred_audio_path = pcm_audio_path
+
+                public_audio_path = sync_public_meeting_audio(
+                    meeting.id,
+                    preferred_audio_path,
+                )
+                version = int(public_audio_path.stat().st_mtime)
+                self.master_audio_src = get_public_meeting_audio_src(public_audio_path.name, version)
+                self.master_audio_label = (
+                    "WAV oynatma kopyası"
+                    if preferred_audio_path.suffix.lower() == ".wav"
+                    else f"{audio_asset.format.upper()} master kayıt"
+                )
+            except FileNotFoundError:
+                self.master_audio_label = "Kayıt dosyası bulunamadı"
+            except Exception as exc:
+                logger.warning(
+                    "Could not sync public master audio for meeting %s: %s",
+                    meeting.id,
+                    exc,
+                )
+                self.master_audio_label = "Kayıt hazırlanamadı"
 
         preview_path = _meeting_preview_path(meeting.user_id, meeting.id)
         if preview_path.exists() and meeting.status in {"joining", "active"}:
@@ -738,6 +1224,7 @@ class TranscriptPageState(State):
         if not self.current_meeting_id:
             return False
 
+        _ensure_runtime_schema()
         with rx.session() as session:
             meeting = session.exec(
                 select(Meeting).where(Meeting.id == self.current_meeting_id)
@@ -750,13 +1237,38 @@ class TranscriptPageState(State):
                 )
                 return False
 
+            db_caption_events = session.exec(
+                select(TeamsCaptionEvent).where(
+                    TeamsCaptionEvent.meeting_id == self.current_meeting_id
+                ).order_by(TeamsCaptionEvent.sequence_no, TeamsCaptionEvent.id)
+            ).all()
             db_transcripts = session.exec(
                 select(Transcript).where(
                     Transcript.meeting_id == self.current_meeting_id
-                ).order_by(Transcript.timestamp)
+                ).order_by(Transcript.sequence_no, Transcript.timestamp, Transcript.id)
             ).all()
+            transcript_ids = [transcript.id for transcript in db_transcripts]
+            db_review_items = []
+            if transcript_ids:
+                db_review_items = session.exec(
+                    select(TranscriptReviewItem).where(
+                        TranscriptReviewItem.transcript_id.in_(transcript_ids),
+                        TranscriptReviewItem.status == REVIEW_STATUS_PENDING,
+                    ).order_by(TranscriptReviewItem.id)
+                ).all()
+            audio_asset = session.exec(
+                select(MeetingAudioAsset).where(
+                    MeetingAudioAsset.meeting_id == self.current_meeting_id
+                ).order_by(MeetingAudioAsset.id.desc())
+            ).first()
 
-            self._apply_transcript_snapshot(meeting, db_transcripts)
+            self._apply_transcript_snapshot(
+                meeting,
+                db_caption_events,
+                db_transcripts,
+                db_review_items,
+                audio_asset,
+            )
             return True
 
     def page_mount(self):
@@ -818,16 +1330,28 @@ class TranscriptPageState(State):
     def load_transcripts(self):
         """Load transcripts for the meeting from URL param."""
         self.cleanup()
-        
-        # Log current state for debugging
-        logger.info(f"Loading transcripts. is_logged_in: {self.is_logged_in}, params: {self.router.page.params}")
-        
+
+        router_url = self.router.url
+        url_path = router_url.path or ""
+        query_params = dict(router_url.query_parameters or {})
+        logger.info(
+            "Loading transcripts. is_logged_in: %s, path: %s, query: %s",
+            self.is_logged_in,
+            url_path,
+            query_params,
+        )
+
         login_redirect = self.check_login()
         if login_redirect:
             logger.warning("Redirecting to login: Not logged in")
             return login_redirect
-        
-        meeting_id_str = self.router.page.params.get("meeting_id")
+
+        meeting_id_str = query_params.get("meeting_id")
+        if not meeting_id_str:
+            path_parts = [part for part in url_path.split("/") if part]
+            if len(path_parts) >= 2 and path_parts[-2] == "transcripts":
+                meeting_id_str = path_parts[-1]
+
         if not meeting_id_str or meeting_id_str == "[meeting_id]":
             # Reflex occasionally shows the route template string before hydration
             logger.info(f"Param not hydrated yet (value: {meeting_id_str}), waiting...")
@@ -846,6 +1370,56 @@ class TranscriptPageState(State):
 
         if not self._refresh_current_meeting_transcripts():
             return rx.redirect("/dashboard")
+
+    def apply_review_item(self, review_item_id: int):
+        with rx.session() as session:
+            review_item = session.exec(
+                select(TranscriptReviewItem).where(TranscriptReviewItem.id == review_item_id)
+            ).first()
+            if not review_item:
+                return rx.toast.error("Düzeltme önerisi bulunamadı.", position="top-right")
+
+            transcript = session.exec(
+                select(Transcript).where(Transcript.id == review_item.transcript_id)
+            ).first()
+            if not transcript:
+                return rx.toast.error("Transcript satırı bulunamadı.", position="top-right")
+
+            transcript.text = review_item.suggested_text
+            transcript.resolution_status = TRANSCRIPT_STATUS_ACCEPTED
+            transcript.auto_corrected = False
+            review_item.status = REVIEW_STATUS_ACCEPTED
+            session.add(transcript)
+            session.add(review_item)
+            session.commit()
+
+        self._refresh_current_meeting_transcripts()
+        return rx.toast.success("Önerilen metin uygulandı.", position="top-right")
+
+    def keep_review_item(self, review_item_id: int):
+        with rx.session() as session:
+            review_item = session.exec(
+                select(TranscriptReviewItem).where(TranscriptReviewItem.id == review_item_id)
+            ).first()
+            if not review_item:
+                return rx.toast.error("Düzeltme önerisi bulunamadı.", position="top-right")
+
+            transcript = session.exec(
+                select(Transcript).where(Transcript.id == review_item.transcript_id)
+            ).first()
+            if not transcript:
+                return rx.toast.error("Transcript satırı bulunamadı.", position="top-right")
+
+            transcript.text = transcript.teams_text or transcript.text
+            transcript.resolution_status = TRANSCRIPT_STATUS_REJECTED
+            transcript.auto_corrected = False
+            review_item.status = REVIEW_STATUS_REJECTED
+            session.add(transcript)
+            session.add(review_item)
+            session.commit()
+
+        self._refresh_current_meeting_transcripts()
+        return rx.toast.info("Mevcut caption korundu.", position="top-right")
     
     def download_txt(self):
         """Download transcripts as a TXT file."""

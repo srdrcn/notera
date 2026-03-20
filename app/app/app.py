@@ -1,10 +1,16 @@
-from urllib.parse import urlparse
 from typing import Optional
 
 import reflex as rx
 
 from .models import Meeting
-from .state import DashboardState, IndexState, State, TranscriptEntry, TranscriptPageState
+from .state import (
+    DashboardState,
+    IndexState,
+    ReviewItemEntry,
+    State,
+    TranscriptEntry,
+    TranscriptPageState,
+)
 
 BRAND_NAME = "Notera"
 BRAND_SUBTITLE = "Canlı Toplantı Notları"
@@ -13,6 +19,8 @@ BRAND_DESCRIPTION = (
 )
 
 
+# ───── Helpers ─────
+
 def cx(*classes: str) -> str:
     return " ".join(filter(None, classes))
 
@@ -20,22 +28,22 @@ def cx(*classes: str) -> str:
 def status_badge_class(status) -> rx.Var:
     return rx.match(
         status,
-        ("pending", "ops-status-badge is-pending"),
-        ("joining", "ops-status-badge is-joining"),
-        ("active", "ops-status-badge is-active"),
-        ("completed", "ops-status-badge is-completed"),
-        "ops-status-badge is-pending",
+        ("pending", "nt-badge is-pending"),
+        ("joining", "nt-badge is-joining"),
+        ("active", "nt-badge is-active"),
+        ("completed", "nt-badge is-completed"),
+        "nt-badge is-pending",
     )
 
 
 def status_dot_class(status) -> rx.Var:
     return rx.match(
         status,
-        ("pending", "ops-status-dot is-pending"),
-        ("joining", "ops-status-dot is-joining"),
-        ("active", "ops-status-dot is-active"),
-        ("completed", "ops-status-dot is-completed"),
-        "ops-status-dot is-pending",
+        ("pending", "nt-badge-dot is-pending"),
+        ("joining", "nt-badge-dot is-joining"),
+        ("active", "nt-badge-dot is-active"),
+        ("completed", "nt-badge-dot is-completed"),
+        "nt-badge-dot is-pending",
     )
 
 
@@ -61,170 +69,88 @@ def status_detail(status) -> rx.Var:
     )
 
 
-def surface_card(*children, class_name: str = "") -> rx.Component:
-    return rx.box(*children, class_name=cx("ops-surface-card", class_name))
+def audio_status_copy(status) -> rx.Var:
+    return rx.match(
+        status,
+        ("disabled", "Ses kapalı"),
+        ("pending", "Ses hazırlanıyor"),
+        ("recording", "Ses kaydediliyor"),
+        ("ready", "Ses hazır"),
+        ("failed", "Ses kaydı alınamadı"),
+        "Ses durumu bilinmiyor",
+    )
 
+
+def audio_status_class(status) -> rx.Var:
+    return rx.match(
+        status,
+        ("disabled", "nt-chip is-muted"),
+        ("pending", "nt-chip"),
+        ("recording", "nt-chip is-success"),
+        ("ready", "nt-chip is-success"),
+        ("failed", "nt-chip is-danger"),
+        "nt-chip",
+    )
+
+
+def postprocess_status_copy(status) -> rx.Var:
+    return rx.match(
+        status,
+        ("pending", "Doğrulama bekliyor"),
+        ("queued", "Doğrulama sırada"),
+        ("running", "WhisperX işleniyor"),
+        ("transcribing", "WhisperX transcript çıkarıyor"),
+        ("canonicalizing", "Teams transcript temizleniyor"),
+        ("aligning", "Transcriptler hizalanıyor"),
+        ("rebuilding", "Final transcript hazırlanıyor"),
+        ("review_ready", "Review hazır"),
+        ("completed", "Doğrulama tamamlandı"),
+        ("failed", "Doğrulama başarısız"),
+        "Doğrulama bilinmiyor",
+    )
+
+
+def review_granularity_copy(granularity) -> rx.Var:
+    return rx.match(
+        granularity,
+        ("word", "Kelime"),
+        ("sentence", "Cümle"),
+        "Fark",
+    )
+
+
+# ───── Layout Primitives ─────
 
 def app_shell(*children, class_name: str = "", **kwargs) -> rx.Component:
     return rx.box(
-        rx.box(class_name="ops-grid-overlay"),
-        rx.box(class_name="ops-orb ops-orb-a"),
-        rx.box(class_name="ops-orb ops-orb-b"),
-        rx.box(class_name="ops-orb ops-orb-c"),
-        rx.box(*children, class_name=cx("ops-shell", class_name)),
-        class_name="ops-app",
+        rx.box(class_name="nt-glow-line"),
+        rx.box(class_name="nt-bg-gradient"),
+        rx.box(*children, class_name=cx("nt-shell", class_name)),
+        class_name="nt-app",
         **kwargs,
     )
 
 
+def card(*children, class_name: str = "") -> rx.Component:
+    return rx.box(
+        *children,
+        class_name=cx("nt-card nt-card-padded", class_name),
+    )
+
+
+# ───── Brand & Nav ─────
+
 def brand_lockup() -> rx.Component:
     return rx.hstack(
-        rx.center(
-            rx.image(
-                src="/brand-mark.svg",
-                alt=f"{BRAND_NAME} logosu",
-                class_name="ops-brand-logo",
-            ),
-            class_name="ops-brand-mark",
+        rx.image(
+            src="/brand-mark.svg",
+            alt=f"{BRAND_NAME} logosu",
+            class_name="nt-brand-logo",
         ),
-        rx.vstack(
-            rx.text(BRAND_NAME, class_name="ops-brand-name"),
-            rx.text(BRAND_SUBTITLE, class_name="ops-brand-subtitle"),
-            spacing="0",
-            align_items="start",
-        ),
-        spacing="3",
-        align="center",
-    )
-
-
-def status_badge(status: str) -> rx.Component:
-    return rx.hstack(
-        rx.box(class_name=status_dot_class(status)),
-        rx.text(status_copy(status), class_name="ops-status-text"),
+        rx.text(BRAND_NAME, class_name="nt-brand-name"),
         spacing="2",
         align="center",
-        class_name=status_badge_class(status),
-    )
-
-
-def section_heading(eyebrow: str, title: str, description: str) -> rx.Component:
-    return rx.vstack(
-        rx.text(eyebrow, class_name="ops-eyebrow"),
-        rx.heading(title, class_name="ops-section-title"),
-        rx.text(description, class_name="ops-section-copy"),
-        spacing="1",
-        align_items="start",
-    )
-
-
-def metric_card(icon: str, label: str, value, detail: str) -> rx.Component:
-    return surface_card(
-        rx.vstack(
-            rx.hstack(
-                rx.center(
-                    rx.icon(tag=icon, size=18),
-                    class_name="ops-metric-icon",
-                ),
-                rx.spacer(),
-                rx.text(label, class_name="ops-metric-label"),
-                width="100%",
-                align="center",
-            ),
-            rx.heading(value, class_name="ops-metric-value"),
-            rx.text(detail, class_name="ops-metric-detail"),
-            spacing="3",
-            align_items="start",
-            width="100%",
-        ),
-        class_name="ops-metric-card",
-    )
-
-
-def summary_chip(label: str, value, detail: str = "") -> rx.Component:
-    children = [
-        rx.text(label, class_name="ops-kpi-label"),
-        rx.text(value, class_name="ops-summary-value"),
-    ]
-    if detail:
-        children.append(rx.text(detail, class_name="ops-kpi-copy"))
-
-    return rx.box(
-        rx.vstack(
-            *children,
-            spacing="1",
-            align_items="start",
-            width="100%",
-        ),
-        class_name="ops-summary-chip",
-    )
-
-
-def info_bullet(icon: str, title: str, body: str) -> rx.Component:
-    return surface_card(
-        rx.hstack(
-            rx.center(
-                rx.icon(tag=icon, size=18),
-                class_name="ops-signal-icon",
-            ),
-            rx.vstack(
-                rx.text(title, class_name="ops-signal-title"),
-                rx.text(body, class_name="ops-signal-copy"),
-                spacing="1",
-                align_items="start",
-            ),
-            spacing="3",
-            align="start",
-            width="100%",
-        ),
-        class_name="ops-signal-card",
-    )
-
-
-def compact_signal_row(icon: str, title: str, detail: str) -> rx.Component:
-    return rx.hstack(
-        rx.center(
-            rx.icon(tag=icon, size=16),
-            class_name="ops-mini-icon",
-        ),
-        rx.vstack(
-            rx.text(title, class_name="ops-mini-title"),
-            rx.text(detail, class_name="ops-mini-copy"),
-            spacing="0",
-            align_items="start",
-        ),
-        spacing="3",
-        align="start",
-        width="100%",
-        class_name="ops-mini-row",
-    )
-
-
-def empty_state(
-    icon: str,
-    title: str,
-    description: str,
-    action: Optional[rx.Component] = None,
-) -> rx.Component:
-    content = [
-        rx.center(
-            rx.icon(tag=icon, size=30),
-            class_name="ops-empty-icon",
-        ),
-        rx.heading(title, class_name="ops-empty-title"),
-        rx.text(description, class_name="ops-empty-copy"),
-    ]
-    if action is not None:
-        content.append(action)
-
-    return surface_card(
-        rx.vstack(
-            *content,
-            spacing="4",
-            align="center",
-            class_name="ops-empty-stack",
-        ),
-        class_name="ops-empty-card",
+        class_name="nt-brand",
     )
 
 
@@ -236,9 +162,9 @@ def shell_nav() -> rx.Component:
             rx.menu.root(
                 rx.menu.trigger(
                     rx.button(
-                        rx.icon(tag="user", size=16),
-                        rx.text(State.logged_in_email, class_name="ops-menu-email"),
-                        class_name="ops-menu-trigger",
+                        rx.icon(tag="user", size=14),
+                        rx.text(State.logged_in_email, class_name="nt-menu-email"),
+                        class_name="nt-menu-trigger",
                     )
                 ),
                 rx.menu.content(
@@ -248,48 +174,269 @@ def shell_nav() -> rx.Component:
                         on_click=State.logout,
                         color_scheme="red",
                     ),
-                    class_name="ops-menu-content",
+                    class_name="nt-menu-content",
                     variant="soft",
-                    width="220px",
+                    width="200px",
                 ),
             ),
             width="100%",
             align="center",
         ),
-        class_name="ops-nav-shell",
+        class_name="nt-nav",
     )
 
+
+# ───── Status Indicators ─────
+
+def status_badge(status: str) -> rx.Component:
+    return rx.hstack(
+        rx.box(class_name=status_dot_class(status)),
+        rx.text(status_copy(status), font_size="0.6875rem", font_weight="600"),
+        spacing="2",
+        align="center",
+        class_name=status_badge_class(status),
+    )
+
+
+def inline_chip(text, class_name: str = "nt-chip") -> rx.Component:
+    return rx.box(
+        rx.text(text, font_size="0.75rem", font_weight="500"),
+        class_name=class_name,
+    )
+
+
+# ───── Summary / KPI ─────
+
+def summary_chip(
+    label: str,
+    value,
+    detail: str = "",
+    extra: Optional[rx.Component] = None,
+) -> rx.Component:
+    children = [
+        rx.text(label, class_name="nt-kpi-label"),
+        rx.text(value, class_name="nt-summary-value"),
+    ]
+    if isinstance(detail, str):
+        if detail:
+            children.append(rx.text(detail, class_name="nt-kpi-copy"))
+    else:
+        children.append(rx.text(detail, class_name="nt-kpi-copy"))
+    if extra is not None:
+        children.append(extra)
+
+    return rx.box(
+        rx.vstack(
+            *children,
+            spacing="1",
+            align_items="start",
+            width="100%",
+        ),
+        class_name="nt-summary-chip",
+    )
+
+
+def stat_card(label: str, value) -> rx.Component:
+    return rx.box(
+        rx.vstack(
+            rx.text(label, class_name="nt-stat-label"),
+            rx.heading(value, class_name="nt-stat-value"),
+            spacing="1",
+            align_items="start",
+            width="100%",
+        ),
+        class_name="nt-stat-card",
+    )
+
+
+# ───── Compact Signal Rows ─────
+
+def compact_signal_row(icon: str, title: str, detail: str) -> rx.Component:
+    return rx.hstack(
+        rx.center(
+            rx.icon(tag=icon, size=14),
+            class_name="nt-signal-icon",
+        ),
+        rx.vstack(
+            rx.text(title, class_name="nt-signal-title"),
+            rx.text(detail, class_name="nt-signal-desc"),
+            spacing="0",
+            align_items="start",
+        ),
+        spacing="3",
+        align="start",
+        width="100%",
+    )
+
+
+# ───── Empty & Loading States ─────
+
+def skeleton_loader() -> rx.Component:
+    return rx.vstack(
+        rx.box(width="55%", height="20px", class_name="nt-skeleton"),
+        rx.box(width="100%", height="14px", class_name="nt-skeleton"),
+        rx.box(width="80%", height="14px", class_name="nt-skeleton"),
+        spacing="3",
+        width="100%",
+        padding="0.75rem 0",
+    )
+
+
+def empty_state(
+    icon: str,
+    title: str,
+    description: str,
+    action: Optional[rx.Component] = None,
+) -> rx.Component:
+    content = [
+        rx.center(
+            rx.icon(tag=icon, size=28),
+            class_name="nt-empty-icon",
+        ),
+        rx.heading(title, class_name="nt-empty-title"),
+        rx.text(description, class_name="nt-empty-desc"),
+    ]
+    if action is not None:
+        content.append(action)
+
+    return rx.box(
+        rx.vstack(
+            *content,
+            spacing="4",
+            align="center",
+        ),
+        class_name="nt-empty",
+    )
+
+
+# ───── Auth Page ─────
+
+def auth_panel() -> rx.Component:
+    return rx.box(
+        rx.vstack(
+            brand_lockup(),
+            rx.vstack(
+                rx.heading("Hoş geldiniz", class_name="nt-auth-title"),
+                rx.text(
+                    "Toplantı transkriptlerinize erişmek için giriş yapın.",
+                    class_name="nt-auth-desc",
+                ),
+                spacing="2",
+                align_items="start",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("E-posta adresi", class_name="nt-label"),
+                rx.input(
+                    type="email",
+                    placeholder="ornek@kurum.com",
+                    on_change=State.set_email,
+                    class_name="nt-input",
+                    width="100%",
+                    auto_focus=True,
+                ),
+                spacing="1",
+                align_items="start",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.button(
+                    rx.icon(tag="log-in", size=16),
+                    "Giriş Yap",
+                    on_click=State.login,
+                    class_name="nt-btn nt-btn-primary nt-auth-btn",
+                ),
+                rx.button(
+                    "Kayıt Ol",
+                    on_click=State.register,
+                    class_name="nt-btn nt-btn-secondary nt-auth-btn",
+                ),
+                spacing="2",
+                width="100%",
+            ),
+            rx.cond(
+                State.error_message != "",
+                rx.box(
+                    rx.hstack(
+                        rx.icon(tag="circle-alert", size=15),
+                        rx.text(State.error_message, font_size="0.875rem"),
+                        spacing="2",
+                        align="center",
+                    ),
+                    class_name="nt-alert",
+                ),
+            ),
+            spacing="6",
+            align_items="start",
+            width="100%",
+        ),
+        class_name="nt-auth-card",
+    )
+
+
+def index() -> rx.Component:
+    return app_shell(
+        rx.center(
+            auth_panel(),
+            width="100%",
+        ),
+        on_mount=IndexState.on_load,
+        class_name="nt-auth-page",
+    )
+
+
+# ───── Meeting Setup Dialog ─────
 
 def meeting_setup_dialog(trigger: rx.Component) -> rx.Component:
     return rx.dialog.root(
         rx.dialog.trigger(trigger),
         rx.dialog.content(
             rx.vstack(
-                rx.text("Launch Console", class_name="ops-eyebrow"),
-                rx.heading("Yeni toplantı operasyonu aç", class_name="ops-dialog-title"),
-                rx.text(
-                    "Başlık ve Teams bağlantısını girin. Kaydı oluşturduğunuz anda bot toplantıya katılmak için otomatik başlar.",
-                    class_name="ops-dialog-copy",
-                ),
                 rx.vstack(
-                    rx.text("Toplantı adı", class_name="ops-field-label"),
-                    rx.input(
-                        placeholder="Örn: EMEA Weekly Ops Review",
-                        on_change=DashboardState.set_new_meeting_title,
-                        class_name="ops-input",
-                        width="100%",
+                    rx.text("Yeni operasyon", class_name="nt-eyebrow"),
+                    rx.heading("Toplantı oluştur", class_name="nt-dialog-title"),
+                    rx.text(
+                        "Başlık ve Teams bağlantısını girin. Bot toplantıya otomatik katılır.",
+                        class_name="nt-dialog-desc",
                     ),
-                    spacing="2",
+                    spacing="1",
                     align_items="start",
                     width="100%",
                 ),
                 rx.vstack(
-                    rx.text("Teams toplantı bağlantısı", class_name="ops-field-label"),
+                    rx.text("Toplantı adı", class_name="nt-label"),
+                    rx.input(
+                        placeholder="Örn: EMEA Weekly Ops Review",
+                        on_change=DashboardState.set_new_meeting_title,
+                        class_name="nt-input",
+                        width="100%",
+                    ),
+                    spacing="1",
+                    align_items="start",
+                    width="100%",
+                ),
+                rx.vstack(
+                    rx.text("Teams bağlantısı", class_name="nt-label"),
                     rx.input(
                         placeholder="https://teams.microsoft.com/...",
                         on_change=DashboardState.set_new_meeting_link,
-                        class_name="ops-input ops-input-link",
+                        class_name="nt-input nt-input-mono",
                         width="100%",
+                    ),
+                    spacing="1",
+                    align_items="start",
+                    width="100%",
+                ),
+                rx.vstack(
+                    rx.checkbox(
+                        "Ses kaydedilsin mi?",
+                        checked=DashboardState.new_meeting_audio_recording_enabled,
+                        on_change=DashboardState.set_new_meeting_audio_recording_enabled,
+                        class_name="nt-checkbox",
+                    ),
+                    rx.text(
+                        "Açık olduğunda bot Teams sesini kaydetmeyi dener.",
+                        class_name="nt-kpi-copy",
                     ),
                     spacing="2",
                     align_items="start",
@@ -299,12 +446,12 @@ def meeting_setup_dialog(trigger: rx.Component) -> rx.Component:
                     compact_signal_row(
                         "bot",
                         "Arka plan ajanı",
-                        "Toplantı eklendiği anda bağımsız süreç olarak katılmayı dener.",
+                        "Toplantıya bağımsız süreç olarak katılır.",
                     ),
                     compact_signal_row(
                         "messages-square",
                         "Transkript arşivi",
-                        "Toplantı bittikten sonra export edilebilir kayıtlar üretir.",
+                        "Toplantı sonrası export edilebilir kayıtlar üretir.",
                     ),
                     columns=rx.breakpoints(initial="1", md="2"),
                     spacing="3",
@@ -312,14 +459,14 @@ def meeting_setup_dialog(trigger: rx.Component) -> rx.Component:
                 ),
                 rx.hstack(
                     rx.dialog.close(
-                        rx.button("İptal", class_name="ops-secondary-btn ops-dialog-btn")
+                        rx.button("İptal", class_name="nt-btn nt-btn-secondary")
                     ),
                     rx.dialog.close(
                         rx.button(
-                            rx.icon(tag="sparkles", size=16),
+                            rx.icon(tag="sparkles", size=15),
                             "Oluştur ve Başlat",
                             on_click=DashboardState.add_meeting,
-                            class_name="ops-primary-btn ops-dialog-btn",
+                            class_name="nt-btn nt-btn-primary",
                         )
                     ),
                     spacing="3",
@@ -330,123 +477,58 @@ def meeting_setup_dialog(trigger: rx.Component) -> rx.Component:
                 width="100%",
                 align_items="start",
             ),
-            class_name="ops-dialog-panel",
+            class_name="nt-dialog",
         ),
     )
 
 
-def auth_panel() -> rx.Component:
-    return surface_card(
-        rx.vstack(
-            brand_lockup(),
-            rx.heading("Giriş yap", class_name="ops-panel-title"),
-            rx.vstack(
-                rx.text("E-posta adresi", class_name="ops-field-label"),
-                rx.input(
-                    type="email",
-                    placeholder="ornek@kurum.com",
-                    on_change=State.set_email,
-                    class_name="ops-input",
-                    width="100%",
-                    auto_focus=True,
-                ),
-                spacing="2",
-                align_items="start",
-                width="100%",
-            ),
-            rx.grid(
-                rx.button(
-                    rx.icon(tag="sparkles", size=16),
-                    "Giriş Yap",
-                    on_click=State.login,
-                    class_name="ops-primary-btn ops-auth-btn",
-                ),
-                rx.button(
-                    "Kayıt Ol",
-                    on_click=State.register,
-                    class_name="ops-secondary-btn ops-auth-btn",
-                ),
-                columns=rx.breakpoints(initial="1", sm="2"),
-                spacing="3",
-                width="100%",
-            ),
-            rx.cond(
-                State.error_message != "",
-                rx.box(
-                    rx.hstack(
-                        rx.icon(tag="info", size=16),
-                        rx.text(State.error_message, class_name="ops-alert-copy"),
-                        spacing="2",
-                        align="center",
-                    ),
-                    class_name="ops-inline-alert",
-                ),
-            ),
-            spacing="5",
-            align_items="start",
-            width="100%",
-        ),
-        class_name="ops-auth-card",
-    )
-
-
-def index() -> rx.Component:
-    return app_shell(
-        rx.container(
-            rx.center(
-                auth_panel(),
-                width="100%",
-            ),
-            width="100%",
-            class_name="ops-auth-container",
-        ),
-        on_mount=IndexState.on_load,
-        class_name="ops-auth-page",
-    )
-
+# ───── Dashboard ─────
 
 def dashboard_hero() -> rx.Component:
     hero_trigger = meeting_setup_dialog(
         rx.button(
-            rx.icon(tag="plus", size=18),
+            rx.icon(tag="plus", size=16),
             "Yeni Toplantı",
-            class_name="ops-primary-btn ops-hero-btn",
+            class_name="nt-btn nt-btn-primary",
         )
     )
 
-    return surface_card(
-        rx.vstack(
+    return rx.box(
+        rx.flex(
+            # Left: title + description + action
             rx.vstack(
-                rx.text("Dashboard", class_name="ops-eyebrow"),
-                rx.heading("Toplantılar", class_name="ops-page-title"),
+                rx.heading("Operasyon Merkezi", class_name="nt-page-title"),
                 rx.text(
-                    DashboardState.operations_summary,
-                    class_name="ops-panel-copy",
+                    "Toplantı botları, anlık transkriptler ve arşiv yönetimi.",
+                    class_name="nt-hero-copy",
                 ),
-                spacing="2",
+                rx.hstack(
+                    hero_trigger,
+                    rx.text(DashboardState.readiness_label, class_name="nt-live-pill"),
+                    spacing="3",
+                    align="center",
+                ),
+                spacing="3",
                 align_items="start",
-                width="100%",
+                justify="center",
+                flex="1 1 auto",
+                min_width="0",
             ),
-            rx.hstack(
-                summary_chip("Toplam", DashboardState.total_meetings),
-                summary_chip("Canlı", DashboardState.live_meeting_count),
-                summary_chip("Arşiv", DashboardState.transcript_entry_count),
-                spacing="2",
-                width="100%",
-                class_name="ops-summary-row",
+            # Right: compact stats
+            rx.box(
+                stat_card("Toplam", DashboardState.total_meetings),
+                stat_card("Canlı", DashboardState.live_meeting_count),
+                stat_card("Arşiv", DashboardState.transcript_entry_count),
+                class_name="nt-stats-row",
+                flex_shrink="0",
             ),
-            rx.hstack(
-                hero_trigger,
-                rx.spacer(),
-                rx.text(DashboardState.readiness_label, class_name="ops-live-pill"),
-                width="100%",
-                align="center",
-                class_name="ops-hero-actions",
-            ),
-            spacing="3",
+            direction=rx.breakpoints(initial="column", md="row"),
+            gap="1.25rem",
             width="100%",
+            align=rx.breakpoints(initial="start", md="center"),
         ),
-        class_name="ops-hero-card ops-dashboard-hero",
+        class_name="nt-hero",
+        width="100%",
     )
 
 
@@ -456,63 +538,102 @@ def meeting_card(meeting: Meeting) -> rx.Component:
         & (DashboardState.busy_meeting_id == meeting.id)
     )
 
-    return surface_card(
+    return card(
         rx.vstack(
+            # Top row: status + delete
             rx.hstack(
                 status_badge(meeting.status),
                 rx.spacer(),
                 rx.icon_button(
-                    rx.icon(tag="trash-2", size=15),
+                    rx.icon(tag="trash-2", size=14),
                     on_click=lambda: DashboardState.delete_meeting(meeting.id),
-                    class_name="ops-icon-btn",
+                    class_name="nt-btn nt-btn-ghost nt-btn-icon",
                     variant="ghost",
                 ),
                 width="100%",
                 align="center",
             ),
+            # Title & meta
             rx.vstack(
-                rx.heading(meeting.title, class_name="ops-card-title"),
-                rx.text(meeting.created_at, class_name="ops-card-host"),
-                rx.text(meeting.teams_link, class_name="ops-card-link"),
+                rx.heading(meeting.title, class_name="nt-meeting-title"),
+                rx.text(meeting.created_at, class_name="nt-meeting-meta"),
+                rx.text(meeting.teams_link, class_name="nt-meeting-meta"),
                 spacing="1",
                 width="100%",
                 align_items="start",
             ),
+            # Status detail
             rx.text(
                 status_detail(meeting.status),
-                class_name="ops-kpi-copy",
+                class_name="nt-kpi-copy",
                 width="100%",
             ),
-            rx.hstack(
-                rx.cond(
-                    (meeting.status == "joining") | (meeting.status == "active"),
-                        rx.button(
-                            rx.icon(tag="activity", size=16),
-                            rx.cond(
-                                is_leave_busy,
-                                "Kayıt Durduruluyor",
-                                "Kaydı Durdur",
-                            ),
-                        on_click=lambda: DashboardState.leave_meeting(meeting.id),
-                        loading=is_leave_busy,
-                        class_name="ops-danger-btn ops-action-btn",
+            # Audio & postprocess chips
+            rx.vstack(
+                rx.hstack(
+                    inline_chip(
+                        audio_status_copy(meeting.audio_status),
+                        class_name=audio_status_class(meeting.audio_status),
                     ),
+                    inline_chip(
+                        rx.cond(
+                            meeting.audio_status == "disabled",
+                            "Audio kapalı",
+                            rx.cond(
+                                meeting.audio_status == "failed",
+                                "Teams-only transcript",
+                                postprocess_status_copy(meeting.postprocess_status),
+                            ),
+                        ),
+                        class_name="nt-chip",
+                    ),
+                    spacing="2",
+                    width="100%",
+                    wrap="wrap",
                 ),
-                rx.button(
-                    rx.icon(tag="messages-square", size=16),
-                    "Transkript Hub",
-                    on_click=lambda: DashboardState.view_transcripts(meeting.id),
-                    class_name="ops-secondary-btn ops-action-btn",
+                rx.cond(
+                    meeting.audio_status == "failed",
+                    rx.text(
+                        meeting.audio_error,
+                        class_name="nt-inline-warning",
+                        width="100%",
+                    ),
                 ),
                 spacing="2",
                 width="100%",
-                class_name="ops-action-row",
+                align_items="start",
             ),
-            spacing="4",
+            # Actions
+            rx.hstack(
+                rx.cond(
+                    (meeting.status == "joining") | (meeting.status == "active"),
+                    rx.button(
+                        rx.icon(tag="square", size=14),
+                        rx.cond(
+                            is_leave_busy,
+                            "Durduruluyor",
+                            "Kaydı Durdur",
+                        ),
+                        on_click=lambda: DashboardState.leave_meeting(meeting.id),
+                        loading=is_leave_busy,
+                        class_name="nt-btn nt-btn-danger nt-btn-sm",
+                    ),
+                ),
+                rx.button(
+                    rx.icon(tag="messages-square", size=14),
+                    "Transkript",
+                    on_click=lambda: DashboardState.view_transcripts(meeting.id),
+                    class_name="nt-btn nt-btn-secondary nt-btn-sm",
+                ),
+                spacing="2",
+                width="100%",
+                class_name="nt-meeting-actions",
+            ),
+            spacing="3",
             width="100%",
             align_items="start",
         ),
-        class_name="ops-meeting-card ops-dashboard-meeting-card",
+        class_name="nt-meeting-card",
     )
 
 
@@ -520,71 +641,60 @@ def dashboard() -> rx.Component:
     empty_dialog = meeting_setup_dialog(
         rx.button(
             rx.icon(tag="plus", size=16),
-            "İlk Operasyonu Oluştur",
-            class_name="ops-primary-btn",
+            "İlk Toplantıyı Başlat",
+            class_name="nt-btn nt-btn-primary",
         )
     )
 
     return app_shell(
         shell_nav(),
         rx.container(
-            rx.box(
-                rx.box(
-                    dashboard_hero(),
-                    class_name="ops-dashboard-rail",
-                ),
-                surface_card(
-                    rx.vstack(
-                        rx.hstack(
-                            rx.heading("Toplantı listesi", class_name="ops-section-title"),
-                            width="100%",
-                            align="center",
-                            class_name="ops-section-row",
-                        ),
-                        rx.cond(
-                            DashboardState.total_meetings > 0,
-                            rx.grid(
-                                rx.foreach(DashboardState.meetings, meeting_card),
-                                columns=rx.breakpoints(initial="1", md="2"),
-                                spacing="4",
-                                width="100%",
-                                class_name="ops-dashboard-grid",
-                            ),
-                            empty_state(
-                                "calendar-days",
-                                "Henüz operasyon kuyruğu yok",
-                                "İlk toplantınızı eklediğinizde canlı katılım, transcript yakalama ve export akışları bu merkezde görünür olacak.",
-                                action=empty_dialog,
-                            ),
-                        ),
-                        spacing="4",
-                        width="100%",
-                        align_items="start",
-                        class_name="ops-dashboard-main",
+            rx.vstack(
+                dashboard_hero(),
+                rx.vstack(
+                    rx.heading(
+                        "Aktif ve Arşivlenmiş Oturumlar",
+                        class_name="nt-section-title",
                     ),
-                    class_name="ops-dashboard-main-panel",
+                    rx.cond(
+                        DashboardState.total_meetings > 0,
+                        rx.grid(
+                            rx.foreach(DashboardState.meetings, meeting_card),
+                            class_name="nt-grid",
+                        ),
+                        empty_state(
+                            "calendar-days",
+                            "Henüz operasyon kuyruğu yok",
+                            "İlk toplantınızı eklediğinizde canlı katılım, transcript yakalama ve export akışları burada görünecek.",
+                            action=empty_dialog,
+                        ),
+                    ),
+                    spacing="4",
+                    width="100%",
+                    align_items="start",
                 ),
+                spacing="6",
                 width="100%",
-                class_name="ops-dashboard-layout",
+                align_items="start",
             ),
             width="100%",
-            max_width="1520px",
-            class_name="ops-page-container",
+            max_width="1480px",
+            class_name="nt-container",
         ),
         on_mount=DashboardState.page_mount,
         on_unmount=DashboardState.stop_live_updates,
-        class_name="ops-dashboard-page",
     )
 
 
+# ───── Transcript Components ─────
+
 def speaker_badge(entry: TranscriptEntry) -> rx.Component:
     return rx.center(
-        rx.text(entry.initials, class_name="ops-speaker-initials"),
-        class_name="ops-speaker-badge",
+        rx.text(entry.initials, class_name="nt-speaker-initials"),
+        class_name="nt-speaker-badge",
         background=f"var(--{entry.color}-3)",
         color=f"var(--{entry.color}-11)",
         border=f"1px solid var(--{entry.color}-6)",
-        box_shadow=f"0 22px 40px -26px var(--{entry.color}-9)",
     )
 
 
@@ -592,22 +702,26 @@ def transcript_item(entry: TranscriptEntry) -> rx.Component:
     return rx.hstack(
         rx.vstack(
             speaker_badge(entry),
-            rx.box(class_name="ops-timeline-line"),
+            rx.box(class_name="nt-timeline-line"),
             spacing="0",
             align="center",
-            class_name="ops-timeline-column",
+            class_name="nt-timeline-col",
         ),
         rx.vstack(
             rx.hstack(
-                rx.text(entry.speaker, class_name="ops-stream-speaker"),
+                rx.text(entry.speaker, class_name="nt-stream-speaker"),
                 rx.spacer(),
-                rx.text(entry.timestamp, class_name="ops-stream-time"),
+                rx.cond(
+                    entry.auto_corrected,
+                    inline_chip("Auto düzeltildi", class_name="nt-chip is-success"),
+                ),
+                rx.text(entry.timestamp, class_name="nt-stream-time"),
                 width="100%",
                 align="center",
             ),
             rx.box(
-                rx.text(entry.text, class_name="ops-stream-text"),
-                class_name="ops-stream-bubble",
+                rx.text(entry.text, class_name="nt-stream-text"),
+                class_name="nt-stream-bubble",
             ),
             spacing="1",
             align_items="start",
@@ -616,26 +730,122 @@ def transcript_item(entry: TranscriptEntry) -> rx.Component:
         spacing="3",
         align="start",
         width="100%",
-        class_name="ops-stream-item",
+        class_name="nt-stream-item",
     )
 
 
 def transcript_toolbar() -> rx.Component:
     return rx.hstack(
-        rx.heading("Transcript", class_name="ops-section-title"),
+        rx.heading("Transcript", class_name="nt-section-title"),
         width="auto",
         align="center",
-        class_name="ops-stream-toolbar",
+        class_name="nt-stream-header",
     )
 
+
+def review_toolbar() -> rx.Component:
+    return rx.hstack(
+        rx.heading("Review Kuyruğu", class_name="nt-section-title"),
+        rx.spacer(),
+        inline_chip(
+            rx.hstack(
+                rx.text(TranscriptPageState.pending_review_count, font_size="0.75rem"),
+                rx.text("bekliyor", font_size="0.75rem"),
+                spacing="1",
+                align="center",
+            ),
+        ),
+        width="100%",
+        align="center",
+        class_name="nt-stream-header",
+    )
+
+
+def review_item_card(item: ReviewItemEntry) -> rx.Component:
+    return rx.box(
+        rx.vstack(
+            rx.hstack(
+                rx.vstack(
+                    rx.text(item.speaker, class_name="nt-stream-speaker"),
+                    rx.text(item.timestamp, class_name="nt-stream-time"),
+                    spacing="0",
+                    align_items="start",
+                ),
+                rx.spacer(),
+                inline_chip(review_granularity_copy(item.granularity)),
+                inline_chip(item.confidence_label, class_name="nt-chip is-success"),
+                width="100%",
+                align="start",
+            ),
+            rx.vstack(
+                rx.text("Mevcut caption", class_name="nt-label"),
+                rx.text(item.current_text, class_name="nt-review-text is-current"),
+                spacing="1",
+                align_items="start",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("WhisperX metni", class_name="nt-label"),
+                rx.text(item.suggested_text, class_name="nt-review-text is-suggested"),
+                rx.text(
+                    "Uygula derseniz bu metin final transcript'e yazılır.",
+                    class_name="nt-kpi-copy",
+                ),
+                spacing="1",
+                align_items="start",
+                width="100%",
+            ),
+            rx.vstack(
+                rx.text("Kısa ses klibi", class_name="nt-label"),
+                rx.cond(
+                    item.has_audio_clip,
+                    rx.audio(
+                        src=item.audio_clip_src,
+                        controls=True,
+                        width="100%",
+                        class_name="nt-audio-player",
+                    ),
+                    rx.text(
+                        "Ses klibi üretilemedi; metin önerisini yine de karar verebilirsiniz.",
+                        class_name="nt-kpi-copy",
+                    ),
+                ),
+                spacing="2",
+                align_items="start",
+                width="100%",
+            ),
+            rx.hstack(
+                rx.button(
+                    "Uygula",
+                    on_click=lambda: TranscriptPageState.apply_review_item(item.id),
+                    class_name="nt-btn nt-btn-primary nt-btn-sm",
+                ),
+                rx.button(
+                    "Koru",
+                    on_click=lambda: TranscriptPageState.keep_review_item(item.id),
+                    class_name="nt-btn nt-btn-secondary nt-btn-sm",
+                ),
+                spacing="3",
+                width="100%",
+                justify="end",
+            ),
+            spacing="4",
+            width="100%",
+            align_items="start",
+        ),
+        class_name="nt-review-card",
+    )
+
+
+# ───── Bot Preview ─────
 
 def bot_preview_content() -> rx.Component:
     return rx.vstack(
         rx.hstack(
             rx.vstack(
-                rx.text("Live Feed", class_name="ops-eyebrow"),
-                rx.heading("Bot Önizleme", class_name="ops-section-title"),
-                rx.text("Toplantı içinden son kare", class_name="ops-bot-preview-subtitle"),
+                rx.text("Live Feed", class_name="nt-eyebrow"),
+                rx.heading("Bot Önizleme", class_name="nt-section-title"),
+                rx.text("Toplantı içinden son kare", class_name="nt-caption"),
                 spacing="1",
                 align_items="start",
             ),
@@ -650,28 +860,28 @@ def bot_preview_content() -> rx.Component:
                 rx.image(
                     src=TranscriptPageState.bot_preview_src,
                     alt="Bot toplantı ekran görüntüsü",
-                    class_name="ops-bot-preview-image",
+                    class_name="nt-preview-image",
                 ),
-                class_name="ops-bot-preview-frame",
+                class_name="nt-preview-frame",
             ),
             rx.box(
                 rx.center(
-                    rx.icon(tag="monitor", size=28),
-                    class_name="ops-empty-icon",
+                    rx.icon(tag="monitor", size=24),
+                    class_name="nt-empty-icon",
                 ),
-                rx.heading("Henüz canlı kare yok", class_name="ops-empty-title"),
                 rx.text(
                     "Bot toplantıdayken alınan son görüntü burada belirecek.",
-                    class_name="ops-empty-copy",
+                    class_name="nt-preview-meta",
+                    text_align="center",
                 ),
-                class_name="ops-bot-preview-empty",
+                class_name="nt-preview-empty",
             ),
         ),
         rx.vstack(
-            rx.text("Son güncelleme", class_name="ops-bot-preview-meta-label"),
+            rx.text("Son güncelleme", class_name="nt-label"),
             rx.text(
                 TranscriptPageState.bot_preview_label,
-                class_name="ops-bot-preview-meta",
+                class_name="nt-preview-meta",
             ),
             spacing="1",
             align_items="start",
@@ -688,133 +898,246 @@ def bot_preview_dialog(trigger: rx.Component) -> rx.Component:
         rx.dialog.trigger(trigger),
         rx.dialog.content(
             bot_preview_content(),
-            class_name="ops-dialog-panel ops-bot-preview-dialog",
+            class_name="nt-dialog nt-preview-dialog",
         ),
     )
 
+
+# ───── Transcript Page ─────
 
 def transcripts_page() -> rx.Component:
     return app_shell(
         shell_nav(),
         rx.container(
             rx.vstack(
-                rx.heading(
-                    TranscriptPageState.meeting_title,
-                    class_name="ops-page-title ops-transcript-page-heading",
-                ),
-                surface_card(
+                # Header card
+                rx.box(
                     rx.vstack(
+                        rx.heading(
+                            TranscriptPageState.meeting_title,
+                            class_name="nt-transcript-page-title",
+                        ),
                         rx.flex(
                             rx.hstack(
                                 rx.button(
-                                    rx.icon(tag="chevron-left", size=16),
+                                    rx.icon(tag="chevron-left", size=14),
                                     "Panele Dön",
                                     on_click=rx.redirect("/dashboard"),
-                                    class_name="ops-secondary-btn ops-back-btn",
+                                    class_name="nt-btn nt-btn-secondary nt-btn-sm",
                                 ),
                                 spacing="3",
                                 align="center",
-                                class_name="ops-transcript-topbar-main",
                             ),
                             rx.hstack(
                                 rx.cond(
                                     TranscriptPageState.can_stop_meeting,
                                     rx.button(
-                                        rx.icon(tag="activity", size=16),
+                                        rx.icon(tag="square", size=14),
                                         rx.cond(
                                             TranscriptPageState.is_stopping_meeting,
-                                            "Kayıt Durduruluyor",
+                                            "Durduruluyor",
                                             "Kaydı Durdur",
                                         ),
                                         on_click=TranscriptPageState.leave_current_meeting,
                                         loading=TranscriptPageState.is_stopping_meeting,
-                                        class_name="ops-danger-btn ops-export-btn ops-stop-btn",
+                                        class_name="nt-btn nt-btn-danger nt-btn-sm",
                                     ),
                                 ),
                                 status_badge(TranscriptPageState.meeting_status),
                                 bot_preview_dialog(
                                     rx.button(
-                                        rx.icon(tag="monitor", size=16),
-                                        "Bot Önizleme",
-                                        class_name="ops-secondary-btn ops-export-btn",
+                                        rx.icon(tag="monitor", size=14),
+                                        "Bot",
+                                        class_name="nt-btn nt-btn-secondary nt-btn-sm",
                                     )
                                 ),
                                 rx.button(
-                                    rx.icon(tag="file-text", size=16),
+                                    rx.icon(tag="file-text", size=14),
                                     "TXT",
                                     on_click=TranscriptPageState.download_txt,
-                                    class_name="ops-secondary-btn ops-export-btn",
+                                    class_name="nt-btn nt-btn-secondary nt-btn-sm",
                                 ),
                                 rx.button(
-                                    rx.icon(tag="table", size=16),
+                                    rx.icon(tag="table", size=14),
                                     "CSV",
                                     on_click=TranscriptPageState.download_csv,
-                                    class_name="ops-secondary-btn ops-export-btn",
+                                    class_name="nt-btn nt-btn-secondary nt-btn-sm",
                                 ),
-                                spacing="3",
+                                spacing="2",
                                 align="center",
-                                class_name="ops-transcript-topbar-actions",
+                                wrap="wrap",
                             ),
                             direction=rx.breakpoints(initial="column", lg="row"),
-                            gap="1rem",
+                            gap="0.75rem",
                             width="100%",
                             justify="between",
                             align=rx.breakpoints(initial="start", lg="center"),
-                            class_name="ops-transcript-topbar",
                         ),
-                        spacing="3",
+                        rx.grid(
+                            summary_chip(
+                                "Ses",
+                                TranscriptPageState.audio_status_label,
+                                TranscriptPageState.audio_status_detail,
+                            ),
+                            summary_chip(
+                                "WhisperX",
+                                TranscriptPageState.postprocess_status_label,
+                                TranscriptPageState.postprocess_status_detail,
+                            ),
+                            summary_chip(
+                                "Review",
+                                TranscriptPageState.pending_review_count,
+                                "Bekleyen karar",
+                            ),
+                            columns=rx.breakpoints(initial="1", md="3"),
+                            spacing="3",
+                            width="100%",
+                        ),
+                        # Dedicated audio player area
+                        rx.cond(
+                            TranscriptPageState.has_master_audio,
+                            rx.box(
+                                rx.hstack(
+                                    rx.center(
+                                        rx.icon(tag="audio-lines", size=16),
+                                        class_name="nt-signal-icon",
+                                    ),
+                                    rx.vstack(
+                                        rx.text("Toplantı Ses Kaydı", class_name="nt-label"),
+                                        rx.text(
+                                            TranscriptPageState.master_audio_label,
+                                            class_name="nt-caption",
+                                        ),
+                                        spacing="0",
+                                        align_items="start",
+                                    ),
+                                    spacing="3",
+                                    align="center",
+                                    width="100%",
+                                ),
+                                rx.audio(
+                                    src=TranscriptPageState.master_audio_src,
+                                    controls=True,
+                                    width="100%",
+                                    class_name="nt-audio-player",
+                                ),
+                                class_name="nt-audio-section",
+                            ),
+                        ),
+                        rx.cond(
+                            TranscriptPageState.has_audio_warning,
+                            rx.box(
+                                rx.hstack(
+                                    rx.icon(tag="triangle-alert", size=14),
+                                    rx.text(
+                                        TranscriptPageState.audio_status_detail,
+                                        font_size="0.875rem",
+                                    ),
+                                    spacing="2",
+                                    align="center",
+                                ),
+                                class_name="nt-alert",
+                                width="100%",
+                            ),
+                        ),
+                        spacing="4",
                         width="100%",
                         align_items="start",
                     ),
-                    class_name="ops-hero-card ops-transcript-header-card",
+                    class_name="nt-transcript-header",
+                    width="100%",
                 ),
-                surface_card(
-                    transcript_toolbar(),
-                    rx.cond(
-                        TranscriptPageState.has_transcripts,
-                        rx.auto_scroll(
+                # Two-column: Transcript + Review
+                rx.grid(
+                    rx.box(
+                        transcript_toolbar(),
+                        rx.cond(
+                            TranscriptPageState.has_transcripts,
+                            rx.auto_scroll(
+                                rx.box(
+                                    rx.vstack(
+                                        rx.foreach(
+                                            TranscriptPageState.transcripts,
+                                            transcript_item,
+                                        ),
+                                        spacing="0",
+                                        width="100%",
+                                    ),
+                                    class_name="nt-stream-track",
+                                ),
+                                class_name="nt-stream-body",
+                            ),
+                            rx.cond(
+                                (TranscriptPageState.meeting_status == "active")
+                                | (TranscriptPageState.meeting_status == "joining"),
+                                rx.vstack(
+                                    skeleton_loader(),
+                                    skeleton_loader(),
+                                    skeleton_loader(),
+                                    spacing="4",
+                                    width="100%",
+                                    padding="2rem 1.25rem",
+                                ),
+                                empty_state(
+                                    "message-square",
+                                    "Henüz transkript yakalanmadı",
+                                    "Toplantı başladığında konuşmalar burada gerçek zamanlı akacak.",
+                                ),
+                            ),
+                        ),
+                        class_name="nt-stream-shell",
+                    ),
+                    rx.box(
+                        review_toolbar(),
+                        rx.cond(
+                            TranscriptPageState.has_review_items,
                             rx.box(
                                 rx.vstack(
-                                    rx.foreach(TranscriptPageState.transcripts, transcript_item),
-                                    spacing="0",
+                                    rx.foreach(
+                                        TranscriptPageState.review_items,
+                                        review_item_card,
+                                    ),
+                                    spacing="3",
                                     width="100%",
                                 ),
-                                class_name="ops-stream-track",
+                                class_name="nt-review-list",
                             ),
-                            class_name="ops-stream-body",
+                            empty_state(
+                                "shield-check",
+                                "Bekleyen review yok",
+                                "Kararsız kelime ve cümle farkları oluştuğunda burada ses klibiyle birlikte karar vereceksiniz.",
+                            ),
                         ),
-                        empty_state(
-                            "message-square",
-                            "Henüz transcript yakalanmadı",
-                            "Toplantı akışı başladığında konuşmacı satırları ve export edilebilir kayıtlar bu timeline içinde görünecek.",
-                        ),
+                        class_name="nt-review-shell",
                     ),
-                    class_name="ops-stream-shell ops-transcript-shell",
+                    columns=rx.breakpoints(initial="1", xl="2"),
+                    spacing="4",
+                    width="100%",
                 ),
-                spacing="6",
+                spacing="5",
                 width="100%",
                 align_items="start",
-                class_name="ops-transcript-stack",
             ),
             width="100%",
-            max_width="1520px",
-            class_name="ops-page-container ops-transcript-container",
+            max_width="1480px",
+            class_name="nt-container",
         ),
         on_mount=TranscriptPageState.page_mount,
         on_unmount=TranscriptPageState.stop_live_updates,
-        class_name="ops-transcript-page",
     )
 
+
+# ───── App Setup ─────
 
 app = rx.App(
     theme=rx.theme(
         appearance="inherit",
-        accent_color="blue",
+        accent_color="iris",
         has_background=True,
     ),
     stylesheets=[
-        "https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;700&display=swap",
-        "/premium.css",
+        "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap",
+        "/notera.css",
     ],
 )
 app.add_page(
