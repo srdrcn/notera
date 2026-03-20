@@ -1132,7 +1132,7 @@ def transcripts_page() -> rx.Component:
 app = rx.App(
     theme=rx.theme(
         appearance="inherit",
-        accent_color="iris",
+        accent_color="blue",
         has_background=True,
     ),
     stylesheets=[

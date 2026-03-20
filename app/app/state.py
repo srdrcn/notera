@@ -1022,7 +1022,7 @@ class TranscriptPageState(State):
     is_stopping_meeting: bool = False
     
     def _get_color_scheme(self, meeting_id: int, name: str):
-        colors = ["tomato", "red", "ruby", "crimson", "pink", "plum", "purple", "violet", "iris", "indigo", "blue", "cyan", "teal", "jade", "green", "grass", "orange", "amber"]
+        colors = ["tomato", "red", "ruby", "crimson", "blue", "cyan", "teal", "jade", "green", "grass", "orange", "amber"]
         seed = f"{meeting_id}:{name}".encode("utf-8")
         idx = hashlib.sha256(seed).digest()[0] % len(colors)
         return colors[idx]

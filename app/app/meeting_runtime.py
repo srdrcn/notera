@@ -3,6 +3,8 @@ import shutil
 import sqlite3
 from pathlib import Path
 
+from sqlmodel import create_engine
+
 
 AUDIO_STATUS_DISABLED = "disabled"
 AUDIO_STATUS_PENDING = "pending"
@@ -173,10 +175,43 @@ def _get_column_names(cursor: sqlite3.Cursor, table: str) -> set[str]:
     }
 
 
+def _get_column_default(cursor: sqlite3.Cursor, table: str, column: str) -> str | None:
+    for row in cursor.execute(f"PRAGMA table_info({table})").fetchall():
+        if row[1] == column:
+            return row[4]
+    return None
+
+
+def _rebuild_table(cursor: sqlite3.Cursor, table: str, create_sql: str, columns: list[str]):
+    backup_table = f"{table}__backup"
+    quoted_columns = ", ".join(columns)
+    cursor.execute(f"DROP TABLE IF EXISTS {backup_table}")
+    cursor.execute(f"ALTER TABLE {table} RENAME TO {backup_table}")
+    cursor.execute(create_sql)
+    cursor.execute(
+        f"""
+        INSERT INTO {table} ({quoted_columns})
+        SELECT {quoted_columns}
+        FROM {backup_table}
+        """
+    )
+    cursor.execute(f"DROP TABLE {backup_table}")
+
+
+def _ensure_base_tables(db_path: Path):
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Import models lazily so runtime workers can bootstrap the schema
+    # without depending on app-level import order.
+    from . import models  # noqa: F401
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    models.Meeting.metadata.create_all(engine)
+
+
 def ensure_runtime_schema(db_path: Path | None = None):
     target_db = Path(db_path or get_db_path())
-    if not target_db.exists():
-        return
+    _ensure_base_tables(target_db)
 
     conn = sqlite3.connect(target_db)
     try:
@@ -266,6 +301,47 @@ def ensure_runtime_schema(db_path: Path | None = None):
             )
             """
         )
+        review_item_created_at_default = _get_column_default(
+            cursor,
+            "transcriptreviewitem",
+            "created_at",
+        )
+        if not review_item_created_at_default or "CURRENT_TIMESTAMP" not in str(
+            review_item_created_at_default
+        ).upper():
+            _rebuild_table(
+                cursor,
+                "transcriptreviewitem",
+                """
+                CREATE TABLE transcriptreviewitem (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    transcript_id INTEGER NOT NULL,
+                    granularity TEXT NOT NULL,
+                    current_text TEXT NOT NULL,
+                    suggested_text TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    audio_clip_path TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    clip_start_ms INTEGER NOT NULL DEFAULT 0,
+                    clip_end_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(transcript_id) REFERENCES transcript (id)
+                )
+                """,
+                [
+                    "id",
+                    "transcript_id",
+                    "granularity",
+                    "current_text",
+                    "suggested_text",
+                    "confidence",
+                    "audio_clip_path",
+                    "status",
+                    "clip_start_ms",
+                    "clip_end_ms",
+                    "created_at",
+                ],
+            )
 
         cursor.execute(
             """

@@ -1,4 +1,5 @@
 import reflex as rx
+from sqlalchemy import text
 from sqlmodel import Field, SQLModel, Relationship
 from datetime import datetime
 from typing import List, Optional
@@ -89,6 +90,9 @@ class TranscriptReviewItem(rx.Model, table=True):
     status: str = "pending"
     clip_start_ms: int = 0
     clip_end_ms: int = 0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column_kwargs={"server_default": text("CURRENT_TIMESTAMP")},
+    )
 
     transcript: Optional[Transcript] = Relationship(back_populates="review_items")

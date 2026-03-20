@@ -1021,6 +1021,7 @@ def create_review_item(
     clip_start_ms: int,
     clip_end_ms: int,
 ) -> int:
+    created_at = datetime.utcnow().isoformat()
     cursor = conn.execute(
         """
         INSERT INTO transcriptreviewitem (
@@ -1031,8 +1032,9 @@ def create_review_item(
             confidence,
             status,
             clip_start_ms,
-            clip_end_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            clip_end_ms,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             transcript_id,
@@ -1043,6 +1045,7 @@ def create_review_item(
             REVIEW_STATUS_PENDING,
             clip_start_ms,
             clip_end_ms,
+            created_at,
         ),
     )
     return int(cursor.lastrowid)
