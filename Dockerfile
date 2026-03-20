@@ -1,10 +1,9 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
 ARG PRELOAD_WHISPERX_MODELS=1
 ARG WHISPERX_MODEL_REPO=Systran/faster-whisper-large-v3
 ARG WHISPERX_ALIGN_MODEL_REPO=cahya/wav2vec2-base-turkish
-ARG WHISPERX_VAD_MODEL_REPO=pyannote/segmentation
-ARG HF_TOKEN=""
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

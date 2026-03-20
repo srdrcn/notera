@@ -57,7 +57,5 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            HF_TOKEN=${{ secrets.HF_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

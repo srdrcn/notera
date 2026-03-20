@@ -182,12 +182,12 @@ Not:
 - Docker içinde de `app/` ve `bot/` aynı dosya sistemi altında kalmalıdır.
 - Docker image `ffmpeg` ile build edilir; container içinde ayrıca sistem kurulumu gerekmez.
 - Docker image WhisperX runtime için gerekli cache dizinlerini de hazır oluşturur.
-- Varsayılan build, WhisperX ASR modeli, Turkish alignment modeli ve pyannote VAD modelini image içindeki Hugging Face cache'e indirir.
+- Varsayılan build, açık erişimli WhisperX ASR modeli ile Turkish alignment modelini image içindeki Hugging Face cache'e indirir.
+- Bu projedeki WhisperX pyannote VAD'ı, ayrıca `pyannote/segmentation` repo preload'u istemez; paket içindeki `whisperx/assets/pytorch_model.bin` dosyasını kullanır.
 - Bu yüzden Docker build süresi ve image boyutu belirgin şekilde artar.
 - İsterseniz bunu kapatmak için `docker build --build-arg PRELOAD_WHISPERX_MODELS=0 -t notera .` kullanabilirsiniz.
-- Hugging Face erişimi token gerektirirse `docker build --build-arg HF_TOKEN=... -t notera .` kullanabilirsiniz.
 - GitHub Actions workflow'u [docker-image.yml](.github/workflows/docker-image.yml) ile image'ı `ghcr.io/<github-owner>/notera` adresine `main`, `v*` tag push'ları ve manuel tetikleme için build edip GHCR'a gönderir.
-- Workflow publish için ekstra Docker kullanıcı/parolası istemez; GitHub Actions içindeki yerleşik `GITHUB_TOKEN` kullanılır. Model preload erişimi gerekiyorsa opsiyonel `HF_TOKEN` secret'ı eklenebilir.
+- Workflow publish için ekstra Docker kullanıcı/parolası istemez; GitHub Actions içindeki yerleşik `GITHUB_TOKEN` kullanılır.
 - Anonim `docker pull` istiyorsanız ilk publish'ten sonra GitHub Packages içindeki container package görünürlüğünü bir kez `public` yapmanız gerekir.
 
 ## Hibrit transcript akışı
