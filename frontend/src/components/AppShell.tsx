@@ -6,6 +6,7 @@ type AppShellProps = PropsWithChildren<{
   title: string;
   subtitle?: string;
   aboveTitle?: ReactNode;
+  titleAction?: ReactNode;
   navSlot?: ReactNode;
   actions?: ReactNode;
 }>;
@@ -15,6 +16,7 @@ export function AppShell({
   title,
   subtitle,
   aboveTitle,
+  titleAction,
   navSlot,
   actions,
   children,
@@ -24,21 +26,26 @@ export function AppShell({
       <div className="nt-glow-line" />
       <div className="nt-bg-gradient" />
       <div className="nt-shell">
-        <header className="nt-nav">
-          <div className="nt-nav-inner">
-            <Link className="nt-brand" to="/dashboard">
+        <main className="nt-container nt-page">
+          <section className="nt-page-toolbar">
+            <Link className="nt-brand nt-page-brand" to="/dashboard">
               <img className="nt-brand-logo" src="/brand-mark.svg" alt="" />
               <span className="nt-brand-name">Notera</span>
             </Link>
-            <div className="nt-nav-slot">{navSlot}</div>
-          </div>
-        </header>
-        <main className="nt-container nt-page">
+            {aboveTitle || navSlot ? (
+              <div className="nt-page-toolbar-actions">
+                {aboveTitle ? <div>{aboveTitle}</div> : null}
+                {navSlot}
+              </div>
+            ) : null}
+          </section>
           <section className="nt-page-head">
             <div>
-              {aboveTitle ? <div className="nt-page-context">{aboveTitle}</div> : null}
               <p className="nt-page-kicker">Teams transcript operations</p>
-              <h1 className="nt-page-title">{title}</h1>
+              <div className="nt-page-title-row">
+                <h1 className="nt-page-title">{title}</h1>
+                {titleAction ? <div className="nt-page-title-action">{titleAction}</div> : null}
+              </div>
               {subtitle ? <p className="nt-page-subtitle">{subtitle}</p> : null}
             </div>
             {actions ? <div className="nt-page-actions">{actions}</div> : null}

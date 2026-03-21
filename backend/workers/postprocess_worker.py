@@ -443,11 +443,11 @@ def load_whisperx_result(audio_path: Path, meeting_id: int) -> dict:
         POSTPROCESS_STATUS_TRANSCRIBING,
         None,
         0,
-        "WhisperX transcript çıkarıyor",
+        "Transcript çıkarılıyor",
     )
     with capture_progress_prints(
         meeting_id,
-        "WhisperX transcript çıkarıyor",
+        "Transcript çıkarılıyor",
         whisperx_asr,
     ):
         result = model.transcribe(

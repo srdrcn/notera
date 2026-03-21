@@ -1,12 +1,12 @@
 # Notera
 
-Notera, Microsoft Teams toplantılarına bot ile katılıp canlı caption, ses kaydı ve canlı önizleme toplayan; toplantı sonrasında WhisperX ile transcript'i netleştirip review akışıyla düzenlemeyi sağlayan bir uygulamadır.
+Notera, Microsoft Teams toplantılarına bot ile katılıp canlı caption, ses kaydı ve canlı önizleme toplayan; toplantı sonrasında transcript'i netleştirip review akışıyla düzenlemeyi sağlayan bir uygulamadır.
 
 ## Ne Yapar?
 
 - Teams toplantı linki ile yeni toplantı kaydı başlatır
 - Botu toplantıya gönderir ve oturum boyunca caption, ses ve preview toplar
-- Toplantı bitince WhisperX post-process çalıştırır
+- Toplantı bitince transcript işleme aşaması çalışır
 - Transcript ekranında satır bazlı review akışı sunar
 - Review önerilerini uygular veya korur
 - Transcript'i `TXT` ve `CSV` olarak dışa aktarır

@@ -17,14 +17,17 @@ import {
 } from "./useMeetingSnapshot";
 
 
-function toneForStatus(status: string): "default" | "success" | "warning" | "danger" | "teal" {
+function toneForStatus(status: string): "default" | "success" | "warning" | "danger" | "teal" | "primary" {
   if (status === "completed" || status === "review_ready") {
     return "success";
   }
   if (status === "failed") {
     return "danger";
   }
-  if (["joining", "active", "transcribing", "aligning"].includes(status)) {
+  if (["joining", "active"].includes(status)) {
+    return "primary";
+  }
+  if (["transcribing", "aligning"].includes(status)) {
     return "teal";
   }
   if (["queued", "pending", "canonicalizing", "rebuilding"].includes(status)) {
@@ -319,6 +322,7 @@ export function TranscriptPage() {
   const [openReviewRowId, setOpenReviewRowId] = useState<number | null>(null);
   const [activeAudioRowId, setActiveAudioRowId] = useState<number | null>(null);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+  const [stopRequested, setStopRequested] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const streamBodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRowElementsRef = useRef(new Map<number, HTMLElement>());
@@ -396,6 +400,12 @@ export function TranscriptPage() {
     });
   }, [activeAudioRowId]);
 
+  useEffect(() => {
+    if (stopMeeting.isError || !snapshotData?.actions.can_stop_meeting) {
+      setStopRequested(false);
+    }
+  }, [snapshotData?.actions.can_stop_meeting, stopMeeting.isError]);
+
   if (!Number.isFinite(meetingId)) {
     return <LoadingView label="Geçersiz meeting kimliği" />;
   }
@@ -430,6 +440,7 @@ export function TranscriptPage() {
     data.postprocess.progress_pct !== null;
   const hasSummaryActions =
     data.actions.can_apply_all_reviews || data.actions.can_merge_duplicate_transcripts;
+  const stopButtonBusy = stopRequested || stopMeeting.isPending;
 
   function syncAudioTranscript(currentTime: number) {
     const nextActiveRowId = findActiveTranscriptId(data.transcripts, currentTime);
@@ -471,29 +482,46 @@ export function TranscriptPage() {
     audioElement.load();
   }
 
+  function requestStopMeeting() {
+    if (stopButtonBusy) {
+      return;
+    }
+
+    setStopRequested(true);
+    void stopMeeting.mutateAsync().catch(() => {
+      setStopRequested(false);
+    });
+  }
+
   return (
     <AppShell
       title={data.meeting.title}
-      subtitle="Final transcript, review akışı, canlı önizleme ve export işlemleri tek ekranda."
+      subtitle="Transcript'i gözden geçir, canlı önizlemeyi kontrol et ve çıktıları tek yerden yönet."
       aboveTitle={
         <Link className="nt-page-backlink" to="/dashboard">
           <BackIcon />
           <span>Toplantılar</span>
         </Link>
       }
-      actions={
-        <div className="nt-inline-actions">
-          {data.actions.can_stop_meeting ? (
-            <button
-              className="nt-btn nt-btn-secondary nt-btn-sm"
-              disabled={stopMeeting.isPending}
-              onClick={() => void stopMeeting.mutateAsync()}
-              type="button"
-            >
-              Toplantıyı durdur
-            </button>
-          ) : null}
-        </div>
+      titleAction={
+        data.actions.can_stop_meeting ? (
+          <button
+            aria-busy={stopButtonBusy}
+            className={`nt-btn nt-btn-danger nt-btn-sm nt-transcript-stop-btn ${stopButtonBusy ? "is-busy" : ""}`}
+            disabled={stopButtonBusy}
+            onClick={requestStopMeeting}
+            type="button"
+          >
+            {stopButtonBusy ? (
+              <>
+                <span aria-hidden="true" className="nt-transcript-stop-dot" />
+                Durdurma isteniyor
+              </>
+            ) : (
+              "Toplantıyı durdur"
+            )}
+          </button>
+        ) : null
       }
     >
       <section className="nt-transcript-top-layout">

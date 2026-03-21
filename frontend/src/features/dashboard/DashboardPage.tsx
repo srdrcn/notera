@@ -105,11 +105,14 @@ const meetingSchema = z.object({
 type MeetingForm = z.infer<typeof meetingSchema>;
 
 
-function toneForStatus(status: string): "default" | "success" | "warning" | "danger" | "teal" {
+function toneForStatus(status: string): "default" | "success" | "warning" | "danger" | "teal" | "primary" {
   if (status === "completed" || status === "review_ready") {
     return "success";
   }
-  if (status === "active" || status === "joining" || status === "transcribing" || status === "aligning") {
+  if (status === "active" || status === "joining") {
+    return "primary";
+  }
+  if (status === "transcribing" || status === "aligning") {
     return "teal";
   }
   if (status === "failed") {
@@ -202,78 +205,84 @@ export function DashboardPage() {
   return (
     <AppShell
       title="Dashboard"
-      subtitle={`${session.user?.email ?? ""} hesabı için canlı toplantılar, worker durumu ve transcript operasyonları.`}
+      subtitle="Toplantılarını başlat, durumlarını takip et ve transcript'leri tek yerden yönet."
       navSlot={
         <button className="nt-btn nt-btn-secondary nt-btn-sm" onClick={() => void session.logout()} type="button">
           Çıkış yap
         </button>
       }
     >
-      <section className="nt-metric-grid">
-        <MetricCard className="is-compact" accent="primary" label="Toplantılar" value={rows.length} />
-        <MetricCard className="is-compact" accent="teal" label="Aktif" value={activeCount} />
-      </section>
-
-      <section className="nt-dashboard-grid">
-        <article className="nt-card nt-card-padded">
-          <div className="nt-card-head">
+      <section className="nt-dashboard-stack">
+        <article className="nt-card nt-card-padded nt-dashboard-composer">
+          <div className="nt-card-head nt-dashboard-composer-head">
             <div>
-              <p className="nt-card-label">Yeni</p>
-              <h2 className="nt-section-title">Hızlı Katıl</h2>
+              <p className="nt-card-label">Yeni toplantı</p>
+              <h2 className="nt-section-title">Toplantı başlat</h2>
+              <p className="nt-card-hint">Toplantı adını ve gerçek Teams linkini gir, Notera botu toplantıya katılıp kaydı başlatsın.</p>
             </div>
           </div>
-          <form className="nt-form" onSubmit={form.handleSubmit(onSubmit)}>
-            <label className="nt-field">
-              <span>Toplantı adı</span>
-              <input className="nt-input" placeholder="Ürün senkronu" {...form.register("title")} />
-              {form.formState.errors.title ? <small>{form.formState.errors.title.message}</small> : null}
-            </label>
-            <label className="nt-field">
-              <span>Teams toplantı linki</span>
-              <textarea
-                className="nt-input nt-input-mono"
-                placeholder="Gercek Teams toplanti linkini yapistirin"
-                rows={3}
-                {...teamsLinkField}
-                onChange={(event) => {
-                  teamsLinkField.onChange(event);
-                  syncTeamsLinkField(event.target.value);
-                }}
-                onPaste={(event) => {
-                  const htmlValue = event.clipboardData.getData("text/html");
-                  const teamsLinkFromHtml = extractTeamsJoinTargetFromHtml(htmlValue);
-                  if (!teamsLinkFromHtml) {
-                    return;
-                  }
+          <form className="nt-dashboard-composer-form" onSubmit={form.handleSubmit(onSubmit)}>
+            <div className="nt-dashboard-composer-fields">
+              <label className="nt-field nt-dashboard-field-title">
+                <span>Toplantı adı</span>
+                <input className="nt-input" placeholder="Ürün senkronu" {...form.register("title")} />
+                {form.formState.errors.title ? <small>{form.formState.errors.title.message}</small> : null}
+              </label>
+              <label className="nt-field nt-dashboard-field-link">
+                <span>Teams toplantı linki</span>
+                <input
+                  className="nt-input nt-input-mono"
+                  placeholder="https://teams.live.com/meet/..."
+                  {...teamsLinkField}
+                  onChange={(event) => {
+                    teamsLinkField.onChange(event);
+                    syncTeamsLinkField(event.target.value);
+                  }}
+                  onPaste={(event) => {
+                    const htmlValue = event.clipboardData.getData("text/html");
+                    const teamsLinkFromHtml = extractTeamsJoinTargetFromHtml(htmlValue);
+                    if (!teamsLinkFromHtml) {
+                      return;
+                    }
 
-                  event.preventDefault();
-                  form.setValue("teams_link", teamsLinkFromHtml, {
-                    shouldDirty: true,
-                    shouldTouch: true,
-                    shouldValidate: true,
-                  });
-                }}
-              />
-              {form.formState.errors.teams_link ? <small>{form.formState.errors.teams_link.message}</small> : null}
-            </label>
-            <label className="nt-checkbox">
-              <input type="checkbox" {...form.register("audio_recording_enabled")} />
-              <span>Ses kaydı</span>
-            </label>
+                    event.preventDefault();
+                    form.setValue("teams_link", teamsLinkFromHtml, {
+                      shouldDirty: true,
+                      shouldTouch: true,
+                      shouldValidate: true,
+                    });
+                  }}
+                />
+                {form.formState.errors.teams_link ? <small>{form.formState.errors.teams_link.message}</small> : null}
+              </label>
+            </div>
+            <div className="nt-dashboard-composer-actions">
+              <label className="nt-checkbox nt-dashboard-composer-toggle">
+                <input type="checkbox" {...form.register("audio_recording_enabled")} />
+                <span aria-hidden="true" className="nt-dashboard-toggle-ui" />
+                <span className="nt-dashboard-toggle-copy">Toplantı sesi kaydedilsin</span>
+              </label>
+              <button className="nt-btn nt-btn-primary nt-dashboard-composer-submit" disabled={createMeeting.isPending} type="submit">
+                {createMeeting.isPending ? "Katılıyor" : "Başlat"}
+              </button>
+            </div>
             {createMeeting.error ? (
               <div className="nt-alert">{createMeeting.error.message}</div>
             ) : null}
-            <button className="nt-btn nt-btn-primary" disabled={createMeeting.isPending} type="submit">
-              {createMeeting.isPending ? "Katılıyor" : "Başlat"}
-            </button>
           </form>
         </article>
+
+        <section className="nt-metric-grid">
+          <MetricCard className="is-compact" accent="primary" label="Toplantılar" value={rows.length} />
+          <MetricCard className="is-compact" accent="teal" label="Aktif" value={activeCount} />
+        </section>
 
         <article className="nt-card nt-card-padded">
           <div className="nt-card-head">
             <div>
               <p className="nt-card-label">Toplantılar</p>
-              <h2 className="nt-section-title">Geçmiş</h2>
+              <h2 className="nt-section-title">Tüm kayıtlar</h2>
+              <p className="nt-card-hint">Detaylar ve transcript için kartlardan birine tıkla.</p>
             </div>
           </div>
           {meetings.error ? (
@@ -283,7 +292,7 @@ export function DashboardPage() {
             {rows.length === 0 ? (
               <div className="nt-empty-state">
                 <strong>Henüz meeting yok</strong>
-                <span>İlk kaydı soldan oluşturabilirsin.</span>
+                <span>İlk kaydı yukarıdaki alandan başlatabilirsin.</span>
               </div>
             ) : null}
             {rows.map((meeting) => (
