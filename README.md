@@ -1,80 +1,70 @@
 # Notera
 
-Notera, Microsoft Teams toplantılarına bot ile katılıp canlı caption, ses kaydı ve canlı önizleme toplayan; toplantı sonrasında transcript'i netleştirip review akışıyla düzenlemeyi sağlayan bir uygulamadır.
+Notera, Microsoft Teams toplantılarına bir bot ile katılıp canlı caption ve ses artefact’ları toplayan, toplantı bittikten sonra WhisperX ile ikinci bir transcript üreten ve sonucu inline review akışıyla netleştiren bir operasyon uygulamasıdır.
 
-## Ne Yapar?
+Repo artık tek bir yeni mimariye hizmet eder:
 
-- Teams toplantı linki ile yeni toplantı kaydı başlatır
-- Botu toplantıya gönderir ve oturum boyunca caption, ses ve preview toplar
-- Toplantı bitince transcript işleme aşaması çalışır
-- Transcript ekranında satır bazlı review akışı sunar
-- Review önerilerini uygular veya korur
-- Transcript'i `TXT` ve `CSV` olarak dışa aktarır
+- `frontend/`: React + TypeScript + Vite arayüzü
+- `backend/`: FastAPI API, auth, meeting lifecycle, review ve export mantığı
+- `backend/workers/`: Playwright tabanlı Teams botu ve WhisperX postprocess worker’ı
 
-## Bileşenler
+Eski Reflex uygulaması, eski Docker akışı ve legacy runtime katmanı repodan tamamen çıkarıldı.
 
-- `frontend/`
-  React + TypeScript + Vite arayüzü. Login, dashboard ve transcript ekranları burada çalışır.
-- `backend/`
-  FastAPI API katmanı. Auth, meeting lifecycle, snapshot üretimi, review işlemleri ve export mantığı burada bulunur.
-- `backend/workers/`
-  Playwright tabanlı Teams botu ve post-process worker'ları burada yer alır.
-- `data/`
-  Lokal veritabanı ve üretilen artefact'ların tutulduğu dizin.
+## Mimari
+
+### Bileşenler
+
+- `frontend`
+  Kullanıcı arayüzünü sunar. Login, dashboard ve transcript/review ekranları burada çalışır.
+- `backend`
+  Session auth, meeting CRUD, snapshot üretimi, review işlemleri, media stream ve worker orchestration burada bulunur.
+- `backend/workers`
+  Teams toplantısına katılır, caption event’leri yazar, preview üretir, ses kaydı alır ve postprocess aşamasını çalıştırır.
+
+### Dizin Yapısı
+
+```text
+.
+├── backend/
+│   ├── app/
+│   │   ├── api/
+│   │   ├── db/
+│   │   ├── models/
+│   │   ├── orchestration/
+│   │   ├── repositories/
+│   │   ├── runtime/
+│   │   ├── schemas/
+│   │   └── services/
+│   ├── workers/
+│   ├── Dockerfile
+│   └── requirements.txt
+├── frontend/
+│   ├── public/
+│   ├── src/
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   └── package.json
+├── .github/workflows/docker-image.yml
+├── .env.example
+├── docker-compose.prod.yml
+└── environment.yml
+```
 
 ## Gereksinimler
 
+Lokal geliştirme için gerekenler:
+
 - Conda
-- Python 3.11
 - Node.js 22
+- Python 3.11
 - ffmpeg
-- Playwright Chromium
+- Playwright Chromium bağımlılıkları
 
-`environment.yml` Python, Node ve backend bağımlılıklarını hazırlar.
-
-## Kurulum
-
-### 1. Conda ortamını hazırla
-
-Yeni kurulum:
-
-```bash
-conda env create -f environment.yml
-conda activate teams-bot
-```
-
-Mevcut ortamı güncellemek istersen:
-
-```bash
-conda env update -n teams-bot -f environment.yml --prune
-conda activate teams-bot
-```
-
-### 2. Playwright browser kur
-
-```bash
-conda run -n teams-bot python -m playwright install chromium
-```
-
-### 3. Frontend paketlerini yükle
-
-```bash
-cd frontend
-conda run -n teams-bot npm install
-cd ..
-```
-
-### 4. Gerekirse `.env` oluştur
-
-```bash
-cp .env.example .env
-```
-
-Varsayılan ayarlar çoğu lokal kullanım için yeterlidir. Özelleştirme gerekiyorsa [`.env.example`](/Users/serdarcan/teams-meeting-transcript/.env.example) dosyasını temel al.
+Conda tarafı `environment.yml` ile kurulur. Frontend paketleri `npm` ile yüklenir. Playwright browser binary’si ayrıca indirilmelidir.
 
 ## Ortam Değişkenleri
 
-Sık kullanılan backend değişkenleri:
+Ana backend değişkenleri:
 
 - `NOTERA_API_HOST`
 - `NOTERA_API_PORT`
@@ -90,9 +80,53 @@ Frontend için opsiyonel değişken:
 
 - `VITE_API_BASE_URL`
 
-Geliştirme modunda Vite zaten `/api` ve `/health` isteklerini `http://127.0.0.1:8000` adresine proxy eder; bu yüzden çoğu durumda `VITE_API_BASE_URL` tanımlamak gerekmez.
+Referans değerler için [`.env.example`](.env.example) dosyasını kullan.
 
-## Lokal Çalıştırma
+## Kurulum
+
+### 1. Conda ortamını hazırla
+
+Yeni kurulum için:
+
+```bash
+conda env create -f environment.yml
+conda activate teams-bot
+```
+
+Mevcut `teams-bot` ortamını güncellemek istersen:
+
+```bash
+conda env update -n teams-bot -f environment.yml --prune
+conda activate teams-bot
+```
+
+### 2. Backend bağımlılıklarını doğrula
+
+`environment.yml` backend Python bağımlılıklarını yükler. Playwright browser binary’si için ayrıca şunu çalıştır:
+
+```bash
+conda run -n teams-bot python -m playwright install chromium
+```
+
+### 3. Frontend paketlerini kur
+
+```bash
+cd frontend
+conda run -n teams-bot npm install
+cd ..
+```
+
+### 4. İstersen `.env` oluştur
+
+```bash
+cp .env.example .env
+```
+
+Varsayılan yol kullanılacaksa `.env` zorunlu değildir. Backend aksi belirtilmedikçe veriyi repo kökündeki `data/` altında tutar.
+
+## Çalıştırma Adımları
+
+### Lokal geliştirme
 
 Backend:
 
@@ -112,42 +146,48 @@ Adresler:
 - Frontend: `http://localhost:5173`
 - Backend health: `http://localhost:8000/health`
 
-## Kullanım Akışı
+Geliştirme modunda Vite, `/api` isteklerini otomatik olarak backend’e proxy eder.
 
-1. Kullanıcı giriş yapar.
-2. Dashboard üzerinden toplantı adı ve Teams toplantı linki girer.
-3. Backend toplantı kaydını oluşturur ve bot sürecini başlatır.
-4. Bot toplantıya katılır, caption, ses ve preview üretir.
-5. Toplantı tamamlanınca post-process aşaması çalışır.
-6. Transcript ekranında sonuçlar, review önerileri ve export aksiyonları görünür.
+### Uygulama akışı
 
-## Doğrulama
+1. Kullanıcı e-posta ile giriş yapar veya kayıt olur.
+2. Dashboard’dan yeni meeting oluşturur.
+3. Frontend otomatik olarak `join` çağrısı yapar.
+4. Backend bot subprocess’ini başlatır.
+5. Bot canlı caption, preview ve audio artefact’larını üretir.
+6. Bot tamamlanınca backend postprocess worker’ı başlatır.
+7. WhisperX transcript ve alignment sonucu final transcript oluşur.
+8. Review gereken satırlar transcript ekranında inline olarak görünür.
+9. Kullanıcı review kararlarını verir, gerekirse duplicate kayıtları birleştirir.
+10. Transcript `TXT` veya `CSV` olarak dışa aktarılır.
 
-Frontend type-check:
+## Build / Test / Lint Komutları
 
-```bash
-cd frontend
-./node_modules/.bin/tsc -b
-```
-
-Frontend production build:
+Frontend build ve type-check:
 
 ```bash
 cd frontend
 conda run -n teams-bot npm run build
 ```
 
-Backend syntax doğrulaması:
-
+Backend ve worker syntax doğrulaması:
+scm-history-item:/Users/serdarcan/teams-meeting-transcript?%7B%22repositoryId%22%3A%22scm0%22%2C%22historyItemId%22%3A%22deab28bb23eabc206a911bf2a0dc1dbc2219eba6%22%2C%22historyItemParentId%22%3A%2224c282fa357083777a5756df5dccc38d6d810289%22%2C%22historyItemDisplayId%22%3A%22deab28b%22%7D
 ```bash
 conda run -n teams-bot python -m compileall backend
 ```
 
-## Production
+Şu an repo içinde ayrı bir `lint` veya otomatik test framework’ü tanımlı değildir. Doğrulama akışı build, import ve syntax kontrolleri üzerinden yürür.
 
-Production compose dosyası:
+## Deployment
 
-- [`docker-compose.prod.yml`](/Users/serdarcan/teams-meeting-transcript/docker-compose.prod.yml)
+Üretim akışı iki container üzerinden çalışır:
+
+- `frontend`: Nginx ile React build çıktısını sunar
+- `backend`: FastAPI API ve local worker orchestration
+
+Hazır compose dosyası:
+
+- [`docker-compose.prod.yml`](docker-compose.prod.yml)
 
 Çalıştırma:
 
@@ -157,6 +197,31 @@ docker compose -f docker-compose.prod.yml up --build -d
 
 Varsayılan davranış:
 
-- frontend host üzerinde `3000` portunda açılır
+- frontend hostta `3000` portundan açılır
 - backend container içinde `8000` portunda çalışır
-- kalıcı veri `notera-data` volume'unda tutulur
+- kalıcı veri `/data` volume’unda tutulur
+
+Docker image workflow’u iki ayrı image üretir:
+
+- `chosenwar/notera-frontend`
+- `chosenwar/notera-backend`
+
+## Eski Yapıdan Kaldırılanlar
+
+Bu refactor ile repodan tamamen çıkarılan başlıca alanlar:
+
+- top-level `app/` klasörü ve Reflex uygulaması
+- eski root `Dockerfile`
+- eski single-image build akışı
+- legacy runtime compatibility katmanı
+- top-level `bot/` kaynak klasörü
+- kullanılmayan asset/config/script kalıntıları
+
+Repo artık yalnızca React + FastAPI + local worker mimarisine hizmet eder.
+
+## Geliştirici Notları
+
+- Worker’lar ayrı servis değil, backend tarafından subprocess olarak başlatılır.
+- SQLite bilinçli olarak korunmuştur; bağlantılar WAL ve `busy_timeout` ile açılır.
+- Runtime artefact’ları commit edilmez; `data/` ve eski lokal cache dizinleri ignore edilir.
+- Yeni kod eklerken legacy katman geri getirilmeyecek. Tüm değişiklikler mevcut mimari doğrultusunda yapılmalı.
