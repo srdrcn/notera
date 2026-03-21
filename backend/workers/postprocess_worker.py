@@ -910,17 +910,17 @@ def canonicalize_caption_events(rows: list[sqlite3.Row] | list[dict]) -> list[di
             and int(slot_index) + 6 < max_seen_slot_index
         )
         late_replay_match = is_late_replay_match(canonical, speaker, text, observed_at)
-        if late_replay_match and slot_reset_detected:
-            replay_burst_until = observed_at + timedelta(seconds=LATE_REPLAY_BURST_WINDOW_SECONDS)
-            logger.info(
-                "Skipping late caption replay after slot reset slot=%s text=%s",
+        if late_replay_match and replay_burst_until is not None and observed_at <= replay_burst_until:
+            logger.debug(
+                "Skipping late caption replay inside burst slot=%s text=%s",
                 slot_index,
                 text[:160],
             )
             continue
-        if late_replay_match and replay_burst_until is not None and observed_at <= replay_burst_until:
+        if late_replay_match and slot_reset_detected:
+            replay_burst_until = observed_at + timedelta(seconds=LATE_REPLAY_BURST_WINDOW_SECONDS)
             logger.info(
-                "Skipping late caption replay inside burst slot=%s text=%s",
+                "Skipping late caption replay after slot reset slot=%s text=%s",
                 slot_index,
                 text[:160],
             )
@@ -1320,6 +1320,55 @@ def build_final_rows(
     return rows, alignment_debug, canonical_rows
 
 
+def final_row_base_text(row: dict) -> str:
+    return normalize_text(row.get("teams_text") or row.get("whisper_text") or "")
+
+
+def final_row_score(row: dict) -> int:
+    score = revision_text_score(final_row_base_text(row))
+    score += int(round(float(row.get("coverage") or 0.0) * 100))
+    score += int(round(float(row.get("avg_confidence") or 0.0) * 100))
+    if row.get("start_sec") is not None and row.get("end_sec") is not None:
+        score += 8
+    return score
+
+
+def defensively_filter_final_rows(rows: list[dict]) -> list[dict]:
+    kept: list[dict] = []
+    for row in rows:
+        fingerprint = equivalent_text_fingerprint(final_row_base_text(row))
+        if not fingerprint:
+            kept.append(row)
+            continue
+
+        duplicate_index = None
+        current_time = row.get("caption_started_at") or row.get("caption_finalized_at")
+        for index in range(len(kept) - 1, max(-1, len(kept) - FINAL_ROW_DEFENSIVE_LOOKBACK_ROWS - 1), -1):
+            previous = kept[index]
+            if not compatible_speakers(previous.get("speaker"), row.get("speaker")):
+                continue
+            if equivalent_text_fingerprint(final_row_base_text(previous)) != fingerprint:
+                continue
+            previous_time = previous.get("caption_started_at") or previous.get("caption_finalized_at")
+            delta_seconds = (
+                abs((current_time - previous_time).total_seconds())
+                if previous_time is not None and current_time is not None
+                else 999.0
+            )
+            if delta_seconds <= FINAL_ROW_DEFENSIVE_DUPLICATE_WINDOW_SECONDS:
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            kept.append(row)
+            continue
+
+        if final_row_score(row) > final_row_score(kept[duplicate_index]):
+            kept[duplicate_index] = row
+
+    return kept
+
+
 def create_review_item(
     conn: sqlite3.Connection,
     transcript_id: int,
@@ -1606,6 +1655,7 @@ def process_meeting(meeting_id: int):
         teams_to_whisper,
         whisper_to_teams,
     )
+    final_rows = defensively_filter_final_rows(final_rows)
     alignment_payload = {
         "anchors": anchors,
         "teams_token_count": len(teams_tokens),
