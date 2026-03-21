@@ -171,7 +171,7 @@ conda run -n teams-bot npm run build
 ```
 
 Backend ve worker syntax doğrulaması:
-scm-history-item:/Users/serdarcan/teams-meeting-transcript?%7B%22repositoryId%22%3A%22scm0%22%2C%22historyItemId%22%3A%22deab28bb23eabc206a911bf2a0dc1dbc2219eba6%22%2C%22historyItemParentId%22%3A%2224c282fa357083777a5756df5dccc38d6d810289%22%2C%22historyItemDisplayId%22%3A%22deab28b%22%7D
+
 ```bash
 conda run -n teams-bot python -m compileall backend
 ```
