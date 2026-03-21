@@ -194,6 +194,8 @@ def _merge_transcript_text_pair(existing_text: str | None, new_text: str | None)
 
 TRANSCRIPT_DUPLICATE_MERGE_WINDOW_SECONDS = 12
 TRANSCRIPT_DUPLICATE_OVERLAP_WINDOW_SECONDS = 15
+SNAPSHOT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS = 180
+SNAPSHOT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS = 96
 
 
 def _merge_transcript_pair_if_candidate(
@@ -214,6 +216,57 @@ def _merge_transcript_pair_if_candidate(
         return None
 
     return _merge_transcript_text_pair(existing_text, new_text)
+
+
+def _transcript_equivalence_fingerprint(text: str | None) -> str:
+    return _normalize_transcript_text(text).casefold().rstrip(".,!?;:…")
+
+
+def _snapshot_transcript_score(transcript: Transcript) -> int:
+    score = _transcript_revision_score(transcript.text)
+    if transcript.resolution_status == "accepted":
+        score += 40
+    elif transcript.resolution_status == "auto_applied":
+        score += 20
+    if transcript.start_sec is not None and transcript.end_sec is not None:
+        score += 8
+    return score
+
+
+def _defensively_filter_visible_transcripts(transcripts: list[Transcript]) -> list[Transcript]:
+    kept: list[Transcript] = []
+    for transcript in transcripts:
+        fingerprint = _transcript_equivalence_fingerprint(transcript.text)
+        if not fingerprint:
+            kept.append(transcript)
+            continue
+
+        duplicate_index = None
+        for index in range(len(kept) - 1, max(-1, len(kept) - SNAPSHOT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS - 1), -1):
+            previous = kept[index]
+            if not _compatible_transcript_speakers(previous.speaker, transcript.speaker):
+                continue
+            if _transcript_equivalence_fingerprint(previous.text) != fingerprint:
+                continue
+            previous_time = _transcript_sort_time(previous)
+            current_time = _transcript_sort_time(transcript)
+            delta_seconds = (
+                abs((current_time - previous_time).total_seconds())
+                if previous_time is not None and current_time is not None
+                else 999.0
+            )
+            if delta_seconds <= SNAPSHOT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS:
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            kept.append(transcript)
+            continue
+
+        if _snapshot_transcript_score(transcript) > _snapshot_transcript_score(kept[duplicate_index]):
+            kept[duplicate_index] = transcript
+
+    return kept
 
 
 def _merge_datetime_min(*values: datetime | None) -> datetime | None:
@@ -471,6 +524,8 @@ def build_snapshot(
             item.id,
         ),
     )
+    if meeting.status not in {"joining", "active"}:
+        visible_transcripts = _defensively_filter_visible_transcripts(visible_transcripts)
     live_rows = _collapse_live_caption_events(caption_events)
     if meeting.postprocess_status in {POSTPROCESS_STATUS_REVIEW_READY, POSTPROCESS_STATUS_COMPLETED} and not review_items:
         duplicate_count, duplicate_ids = _collect_duplicate_transcript_merge_candidates(visible_transcripts)

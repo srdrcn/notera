@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from collections import deque
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -66,6 +67,14 @@ CHAT_AUDIO_FAILURE_MESSAGE = "Ses kaydı başlatılamadı."
 CHAT_EXIT_COMMAND = "bot ok"
 CHAT_EXIT_ACK_MESSAGE = "Çıkış komutu algılandı. Toplantıdan çıkılıyor."
 REMOTE_AUDIO_ATTRIBUTE = "data-notera-remote-audio"
+CAPTION_RECENT_SCAN_LIMIT = 24
+CAPTION_SLOT_DEDUPE_WINDOW_SECONDS = 20.0
+CAPTION_MEETING_DEDUPE_WINDOW_SECONDS = 6.0
+CAPTION_MEMORY_WINDOW_SECONDS = 180.0
+CAPTION_REPLAY_MIN_AGE_SECONDS = 12.0
+CAPTION_REPLAY_BURST_MIN_MATCHES = 4
+CAPTION_REPLAY_VISIBLE_WINDOW = 8
+CAPTION_LOG_FALLBACK_LINE_WINDOW = 18
 
 
 def get_db_path():
@@ -121,6 +130,12 @@ def make_caption_fingerprint(speaker, text):
     return f"{normalized_speaker}|{normalized_text}"
 
 
+def make_caption_equivalence_fingerprint(speaker, text):
+    normalized_speaker = normalize_caption_text(speaker).casefold()
+    normalized_text = normalize_caption_text(text).casefold().rstrip(".,!?;:…")
+    return f"{normalized_speaker}|{normalized_text}"
+
+
 def _compatible_speakers_for_merge(existing_speaker, new_speaker):
     existing_value = normalize_caption_text(existing_speaker).casefold()
     new_value = normalize_caption_text(new_speaker).casefold()
@@ -156,6 +171,143 @@ def _texts_should_merge(existing_text, new_text):
 
     ratio = SequenceMatcher(None, old_fold, new_fold).ratio()
     return ratio >= 0.82 and abs(len(new_fold) - len(old_fold)) <= 96
+
+
+def _caption_revision_score(text):
+    normalized = normalize_caption_text(text)
+    if not normalized:
+        return -1
+    return len(caption_tokens(normalized)) * 100 + len(normalized)
+
+
+def _choose_preferred_caption_text(existing_text, new_text):
+    existing_normalized = normalize_caption_text(existing_text)
+    new_normalized = normalize_caption_text(new_text)
+    if not existing_normalized:
+        return new_normalized
+    if not new_normalized:
+        return existing_normalized
+    if _caption_revision_score(new_normalized) > _caption_revision_score(existing_normalized):
+        return new_normalized
+    return existing_normalized
+
+
+def _caption_duplicate_reason(cursor, meeting_id, speaker, text, observed_at, slot_index, revision_no):
+    current_dt = observed_at or datetime.utcnow()
+    current_exact = make_caption_fingerprint(speaker, text)
+    current_equivalent = make_caption_equivalence_fingerprint(speaker, text)
+    recent_rows = cursor.execute(
+        """
+        SELECT speaker_name, text, observed_at, slot_index, revision_no
+        FROM teamscaptionevent
+        WHERE meeting_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (meeting_id, CAPTION_RECENT_SCAN_LIMIT),
+    ).fetchall()
+
+    for previous_speaker, previous_text, previous_observed_at, previous_slot_index, previous_revision_no in recent_rows:
+        previous_dt = parse_bot_dt(previous_observed_at)
+        if previous_dt is None:
+            continue
+        delta_seconds = abs((current_dt - previous_dt).total_seconds())
+        if delta_seconds > CAPTION_SLOT_DEDUPE_WINDOW_SECONDS:
+            break
+
+        previous_exact = make_caption_fingerprint(previous_speaker, previous_text)
+        previous_equivalent = make_caption_equivalence_fingerprint(previous_speaker, previous_text)
+        previous_revision = int(previous_revision_no or 0)
+
+        if (
+            slot_index is not None
+            and previous_slot_index is not None
+            and int(previous_slot_index) == int(slot_index)
+            and previous_exact == current_exact
+            and revision_no <= previous_revision
+        ):
+            return "duplicate_slot"
+
+        if (
+            delta_seconds <= CAPTION_MEETING_DEDUPE_WINDOW_SECONDS
+            and previous_equivalent == current_equivalent
+            and revision_no <= previous_revision
+        ):
+            return "duplicate_recent"
+
+    return None
+
+
+def _remember_recent_caption_event(memory, caption, observed_at):
+    if not caption:
+        return
+    memory.append(
+        {
+            "fingerprint": make_caption_equivalence_fingerprint(caption.get("speaker"), caption.get("text")),
+            "speaker": caption.get("speaker"),
+            "text": caption.get("text"),
+            "observed_at": observed_at or datetime.utcnow(),
+        }
+    )
+
+
+def _prune_recent_caption_memory(memory, current_dt):
+    while memory:
+        observed_at = memory[0].get("observed_at")
+        if observed_at is None:
+            memory.popleft()
+            continue
+        if abs((current_dt - observed_at).total_seconds()) <= CAPTION_MEMORY_WINDOW_SECONDS:
+            break
+        memory.popleft()
+
+
+def _find_recent_caption_memory_match(memory, speaker, text, current_dt):
+    fingerprint = make_caption_equivalence_fingerprint(speaker, text)
+    for entry in reversed(memory):
+        observed_at = entry.get("observed_at")
+        if observed_at is None:
+            continue
+        age_seconds = abs((current_dt - observed_at).total_seconds())
+        if age_seconds > CAPTION_MEMORY_WINDOW_SECONDS:
+            break
+        if age_seconds < CAPTION_REPLAY_MIN_AGE_SECONDS:
+            continue
+        if entry.get("fingerprint") == fingerprint:
+            return entry
+    return None
+
+
+def _caption_match_score(existing_caption, speaker, text, slot_hint):
+    existing_speaker = existing_caption.get("speaker")
+    existing_text = existing_caption.get("text")
+    if not _compatible_speakers_for_merge(existing_speaker, speaker):
+        return None
+    if not _texts_should_merge(existing_text, text):
+        return None
+
+    score = 0
+    if slot_hint and existing_caption.get("slot_hint") == slot_hint:
+        score += 80
+    existing_exact = make_caption_fingerprint(existing_speaker, existing_text)
+    current_exact = make_caption_fingerprint(speaker, text)
+    if existing_exact == current_exact:
+        score += 40
+    score += min(_caption_revision_score(text), _caption_revision_score(existing_text)) // 100
+    return score
+
+
+def _find_pending_caption_key(pending_captions, speaker, text, slot_hint):
+    best_key = None
+    best_score = None
+    for key, caption in pending_captions.items():
+        score = _caption_match_score(caption, speaker, text, slot_hint)
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best_key = key
+            best_score = score
+    return best_key
 
 
 async def get_first_visible_locator(page, selectors, timeout=1000):
@@ -490,27 +642,25 @@ def save_caption_event(meeting_id, speaker, text, sequence_no, observed_at, slot
     cursor = conn.cursor()
     observed_value = (observed_at or datetime.utcnow()).isoformat()
     try:
-        recent = cursor.execute(
-            """
-            SELECT speaker_name, text, observed_at
-            FROM teamscaptionevent
-            WHERE meeting_id = ? AND COALESCE(slot_index, -1) = COALESCE(?, -1)
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (meeting_id, slot_index),
-        ).fetchone()
-        if recent:
-            previous_speaker, previous_text, previous_observed_at = recent
-            previous_dt = parse_bot_dt(previous_observed_at)
-            current_dt = observed_at or datetime.utcnow()
-            if (
-                make_caption_fingerprint(previous_speaker, previous_text)
-                == make_caption_fingerprint(speaker, text)
-                and previous_dt
-                and abs((current_dt - previous_dt).total_seconds()) <= 20
-            ):
-                return "skipped"
+        duplicate_reason = _caption_duplicate_reason(
+            cursor,
+            meeting_id,
+            speaker,
+            text,
+            observed_at,
+            slot_index,
+            revision_no,
+        )
+        if duplicate_reason is not None:
+            logger.info(
+                "caption_duplicate_skipped meeting=%s reason=%s slot=%s revision=%s text=%s",
+                meeting_id,
+                duplicate_reason,
+                slot_index,
+                revision_no,
+                text[:160],
+            )
+            return "skipped"
 
         cursor.execute(
             """
@@ -1767,6 +1917,8 @@ async def run_bot(meeting_url, meeting_id):
             logger.info("Starting caption monitoring...")
             first_transcript_preview_captured = False
             pending_captions = {}
+            caption_stream_sequence = 0
+            recent_caption_memory = deque(maxlen=512)
             poll_count = 0
             caption_discovery_done = False
             caption_enable_attempts = 0
@@ -1808,6 +1960,7 @@ async def run_bot(meeting_url, meeting_id):
                     return False
 
                 caption_event_sequence += 1
+                _remember_recent_caption_event(recent_caption_memory, caption, event_dt)
                 logger.info("CAPTION EVENT - [%s]: %s", caption["speaker"], caption["text"])
                 if not first_transcript_preview_captured:
                     try:
@@ -1863,13 +2016,50 @@ async def run_bot(meeting_url, meeting_id):
 
                     caption_items = await page.evaluate("""() => {
                         const results = [];
+                        const maxVisibleCaptions = 8;
+                        const maxLogLines = 18;
+
+                        function domFingerprint(element, container) {
+                            if (!element) return '';
+                            const parts = [];
+                            let node = element;
+                            for (let depth = 0; depth < 4 && node && node !== container; depth += 1) {
+                                const tag = node.tagName || 'NODE';
+                                const tid = node.getAttribute?.('data-tid') || '';
+                                const key = node.getAttribute?.('data-key')
+                                    || node.getAttribute?.('data-item-key')
+                                    || node.getAttribute?.('aria-posinset')
+                                    || node.id
+                                    || '';
+                                const siblingIndex = node.parentElement
+                                    ? Array.from(node.parentElement.children).indexOf(node)
+                                    : 0;
+                                parts.push(`${tag}:${tid}:${key}:${siblingIndex}`);
+                                node = node.parentElement;
+                            }
+                            return parts.join('>');
+                        }
+
+                        function isVisibleInContainer(element, containerRect) {
+                            const rect = element.getBoundingClientRect();
+                            return rect.width > 0
+                                && rect.height > 0
+                                && rect.bottom >= containerRect.top - 2
+                                && rect.top <= containerRect.bottom + 2;
+                        }
+
                         const wrapper = document.querySelector('[data-tid="closed-caption-renderer-wrapper"]');
 
                         if (wrapper) {
-                            const captionTexts = wrapper.querySelectorAll('[data-tid="closed-caption-text"]');
-                            for (const textEl of captionTexts) {
+                            const wrapperRect = wrapper.getBoundingClientRect();
+                            const captionTexts = Array.from(wrapper.querySelectorAll('[data-tid="closed-caption-text"]'))
+                                .filter((textEl) => isVisibleInContainer(textEl, wrapperRect))
+                                .slice(-maxVisibleCaptions);
+                            const visibleCount = captionTexts.length;
+
+                            captionTexts.forEach((textEl, index) => {
                                 const text = textEl.innerText?.trim();
-                                if (!text) continue;
+                                if (!text) return;
 
                                 let speaker = 'Unknown';
                                 let node = textEl.parentElement;
@@ -1889,28 +2079,44 @@ async def run_bot(meeting_url, meeting_id):
                                     node = node.parentElement;
                                 }
 
-                                results.push({ speaker, text, idx: results.length });
-                            }
+                                const container = textEl.closest('[data-tid*="closed-caption"]') || textEl.parentElement || textEl;
+                                results.push({
+                                    speaker,
+                                    text,
+                                    slot_hint: domFingerprint(container, wrapper),
+                                    visible_index: visibleCount - index - 1,
+                                });
+                            });
                             return results;
                         }
 
-                        const logs = document.querySelectorAll('[role="log"]');
-                        for (const log of logs) {
+                        const logs = Array.from(document.querySelectorAll('[role="log"]'));
+                        logs.forEach((log, logIndex) => {
                             const lines = (log.innerText || '')
                                 .split('\\n')
                                 .map(line => line.trim())
-                                .filter(Boolean);
-                            if (lines.length < 2) continue;
-
-                            for (let i = 0; i < lines.length - 1; i += 2) {
-                                const speaker = lines[i];
-                                const text = lines[i + 1];
-                                if (!speaker || !text) continue;
-                                results.push({ speaker, text, idx: results.length });
+                                .filter(Boolean)
+                                .slice(-maxLogLines);
+                            if (lines.length < 2) {
+                                return;
                             }
-                        }
 
-                        return results;
+                            const usableLines = lines.length % 2 === 0 ? lines : lines.slice(1);
+                            const pairCount = Math.floor(usableLines.length / 2);
+                            for (let i = 0; i < usableLines.length - 1; i += 2) {
+                                const speaker = usableLines[i];
+                                const text = usableLines[i + 1];
+                                if (!speaker || !text) continue;
+                                results.push({
+                                    speaker,
+                                    text,
+                                    slot_hint: `log:${logIndex}:${i / 2}`,
+                                    visible_index: pairCount - (i / 2) - 1,
+                                });
+                            }
+                        });
+
+                        return results.slice(-maxVisibleCaptions);
                     }""")
 
                     if not caption_items and caption_enable_attempts < 3 and poll_count >= 10 and poll_count % 60 == 10:
@@ -1951,35 +2157,90 @@ async def run_bot(meeting_url, meeting_id):
                                 await leave_meeting_via_ui(page)
                             break
 
-                    seen_caption_slots = set()
+                    current_dt = datetime.utcnow()
+                    _prune_recent_caption_memory(recent_caption_memory, current_dt)
+                    replay_candidates = []
+                    normalized_caption_items = []
+                    for item in caption_items:
+                        text = normalize_caption_text(item.get("text", ""))
+                        speaker = normalize_caption_text(item.get("speaker", "Unknown")) or "Unknown"
+                        slot_hint = normalize_caption_text(item.get("slot_hint", "")) or None
+                        visible_index = item.get("visible_index")
+                        if visible_index is not None:
+                            try:
+                                visible_index = int(visible_index)
+                            except (TypeError, ValueError):
+                                visible_index = None
+                        if not text or len(text) < 2:
+                            continue
+                        if text in ("Captions are turned on.", "Captions are turned off."):
+                            continue
+                        recent_match = _find_recent_caption_memory_match(
+                            recent_caption_memory,
+                            speaker,
+                            text,
+                            current_dt,
+                        )
+                        normalized_item = {
+                            "speaker": speaker,
+                            "text": text,
+                            "slot_hint": slot_hint,
+                            "slot_index": visible_index,
+                            "recent_match": recent_match,
+                        }
+                        normalized_caption_items.append(normalized_item)
+                        if recent_match is not None and _find_pending_caption_key(pending_captions, speaker, text, slot_hint) is None:
+                            replay_candidates.append(normalized_item)
+
+                    replay_burst_detected = (
+                        len(replay_candidates) >= CAPTION_REPLAY_BURST_MIN_MATCHES
+                        and len(replay_candidates) >= max(CAPTION_REPLAY_BURST_MIN_MATCHES, len(normalized_caption_items) // 2)
+                    )
+                    if replay_burst_detected:
+                        logger.info(
+                            "caption_replay_skipped meeting=%s count=%s sample=%s",
+                            meeting_id,
+                            len(replay_candidates),
+                            replay_candidates[0]["text"][:160] if replay_candidates else "",
+                        )
+
+                    seen_caption_streams = set()
                     if caption_items:
-                        for item in caption_items:
-                            text = normalize_caption_text(item.get("text", ""))
-                            speaker = normalize_caption_text(item.get("speaker", "Unknown")) or "Unknown"
+                        for item in normalized_caption_items:
+                            text = item["text"]
+                            speaker = item["speaker"]
+                            slot_hint = item.get("slot_hint")
+                            slot_index = item.get("slot_index")
 
-                            if not text or len(text) < 2:
-                                continue
-                            if text in ("Captions are turned on.", "Captions are turned off."):
+                            stream_key = _find_pending_caption_key(pending_captions, speaker, text, slot_hint)
+                            if replay_burst_detected and stream_key is None and item.get("recent_match") is not None:
+                                logger.info(
+                                    "caption_replay_skipped meeting=%s slot_hint=%s text=%s",
+                                    meeting_id,
+                                    slot_hint,
+                                    text[:160],
+                                )
                                 continue
 
-                            slot_key = item.get("idx")
-                            if slot_key is None:
-                                slot_key = make_caption_fingerprint(speaker, text)
-                            seen_caption_slots.add(slot_key)
-                            current_dt = datetime.utcnow()
-                            previous = pending_captions.get(slot_key)
+                            if stream_key is None:
+                                caption_stream_sequence += 1
+                                stream_key = f"caption-stream:{caption_stream_sequence}"
+
+                            seen_caption_streams.add(stream_key)
+                            previous = pending_captions.get(stream_key)
                             if previous is None:
-                                pending_captions[slot_key] = {
+                                pending_captions[stream_key] = {
                                     "speaker": speaker,
                                     "text": text,
                                     "first_seen": current_dt,
                                     "last_updated_at": current_dt,
                                     "last_seen": now,
                                     "missing_polls": 0,
-                                    "slot_index": slot_key if isinstance(slot_key, int) else None,
+                                    "slot_index": slot_index,
+                                    "slot_hint": slot_hint,
                                     "revision_no": 0,
                                 }
-                                await persist_caption_event(pending_captions[slot_key])
+                                await persist_caption_event(pending_captions[stream_key])
                                 continue
 
                             same_caption_stream = (
@@ -1990,34 +2251,49 @@ async def run_bot(meeting_url, meeting_id):
                                 if make_caption_fingerprint(previous.get("speaker"), previous.get("text")) != make_caption_fingerprint(speaker, text):
                                     previous["revision_no"] = previous.get("revision_no", 0) + 1
                                     previous["speaker"] = speaker
-                                    previous["text"] = text
+                                    previous["text"] = _choose_preferred_caption_text(previous.get("text"), text)
                                     previous["last_updated_at"] = current_dt
                                     previous["last_seen"] = now
                                     previous["missing_polls"] = 0
+                                    previous["slot_index"] = slot_index if slot_index is not None else previous.get("slot_index")
+                                    previous["slot_hint"] = slot_hint or previous.get("slot_hint")
+                                    logger.info(
+                                        "caption_revision_saved meeting=%s stream=%s revision=%s text=%s",
+                                        meeting_id,
+                                        stream_key,
+                                        previous["revision_no"],
+                                        previous["text"][:160],
+                                    )
                                     await persist_caption_event(previous)
                                     continue
                                 previous["speaker"] = speaker
-                                previous["text"] = text
+                                previous["text"] = _choose_preferred_caption_text(previous.get("text"), text)
                                 previous["last_updated_at"] = current_dt
                                 previous["last_seen"] = now
                                 previous["missing_polls"] = 0
+                                previous["slot_index"] = slot_index if slot_index is not None else previous.get("slot_index")
+                                previous["slot_hint"] = slot_hint or previous.get("slot_hint")
                                 continue
 
-                            pending_captions[slot_key] = {
+                            caption_stream_sequence += 1
+                            next_stream_key = f"caption-stream:{caption_stream_sequence}"
+                            seen_caption_streams.add(next_stream_key)
+                            pending_captions[next_stream_key] = {
                                 "speaker": speaker,
                                 "text": text,
                                 "first_seen": current_dt,
                                 "last_updated_at": current_dt,
                                 "last_seen": now,
                                 "missing_polls": 0,
-                                "slot_index": slot_key if isinstance(slot_key, int) else None,
+                                "slot_index": slot_index,
+                                "slot_hint": slot_hint,
                                 "revision_no": 0,
                             }
-                            await persist_caption_event(pending_captions[slot_key])
+                            await persist_caption_event(pending_captions[next_stream_key])
 
                     keys_to_remove = []
                     for key, caption in pending_captions.items():
-                        if key not in seen_caption_slots:
+                        if key not in seen_caption_streams:
                             caption["missing_polls"] = caption.get("missing_polls", 0) + 1
                         else:
                             caption["missing_polls"] = 0

@@ -9,7 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -66,6 +66,10 @@ FORCE_SPOKEN_LANGUAGE = os.getenv("WHISPERX_FORCE_LANGUAGE", "1").strip().lower(
     "false",
     "no",
 }
+LATE_REPLAY_MATCH_WINDOW_SECONDS = 24.0
+LATE_REPLAY_BURST_WINDOW_SECONDS = 3.0
+LATE_REPLAY_SLOT_RESET_MIN_SEEN = 8
+LATE_REPLAY_LOOKBACK_ROWS = 160
 
 def configure_runtime_environment():
     os.environ.setdefault("MPLCONFIGDIR", str(runtime_cache_dir("matplotlib")))
@@ -547,6 +551,10 @@ def normalize_text(value: str | None) -> str:
     return " ".join((value or "").strip().split())
 
 
+def equivalent_text_fingerprint(value: str | None) -> str:
+    return normalize_text(value).casefold().rstrip(".,!?;:…")
+
+
 def tokenize_text(value: str | None) -> list[dict]:
     normalized = normalize_text(value)
     tokens = []
@@ -704,6 +712,29 @@ def texts_should_merge(existing_text: str | None, new_text: str | None) -> bool:
     return ratio >= 0.82 and abs(len(new_fold) - len(old_fold)) <= 96
 
 
+def is_late_replay_match(
+    canonical_rows: list[dict],
+    speaker: str,
+    text: str,
+    observed_at: datetime,
+) -> bool:
+    current_fingerprint = equivalent_text_fingerprint(text)
+    if not current_fingerprint:
+        return False
+
+    for previous in reversed(canonical_rows[-LATE_REPLAY_LOOKBACK_ROWS:]):
+        if not compatible_speakers(previous.get("speaker"), speaker):
+            continue
+        if equivalent_text_fingerprint(previous.get("text")) != current_fingerprint:
+            continue
+        previous_time = previous.get("finalized_at") or previous.get("started_at")
+        if previous_time is None:
+            continue
+        if abs((observed_at - previous_time).total_seconds()) >= LATE_REPLAY_MATCH_WINDOW_SECONDS:
+            return True
+    return False
+
+
 def find_suffix_prefix_overlap(existing_text: str | None, new_text: str | None, min_tokens: int = 4):
     existing_tokens = tokenize_text(existing_text)
     new_tokens = tokenize_text(new_text)
@@ -852,6 +883,8 @@ def build_events_from_legacy_transcripts(rows: list[sqlite3.Row]) -> list[dict]:
 def canonicalize_caption_events(rows: list[sqlite3.Row] | list[dict]) -> list[dict]:
     canonical: list[dict] = []
     slot_anchor_index: dict[int, int] = {}
+    max_seen_slot_index = -1
+    replay_burst_until: datetime | None = None
 
     for raw_row in rows:
         row = dict(raw_row)
@@ -867,6 +900,29 @@ def canonicalize_caption_events(rows: list[sqlite3.Row] | list[dict]) -> list[di
         revision_no = int(row.get("revision_no") or 0)
         if observed_at is None:
             observed_at = datetime.utcnow()
+
+        slot_reset_detected = (
+            slot_index is not None
+            and max_seen_slot_index >= LATE_REPLAY_SLOT_RESET_MIN_SEEN
+            and int(slot_index) <= max(2, max_seen_slot_index // 4)
+            and int(slot_index) + 6 < max_seen_slot_index
+        )
+        late_replay_match = is_late_replay_match(canonical, speaker, text, observed_at)
+        if late_replay_match and slot_reset_detected:
+            replay_burst_until = observed_at + timedelta(seconds=LATE_REPLAY_BURST_WINDOW_SECONDS)
+            logger.info(
+                "Skipping late caption replay after slot reset slot=%s text=%s",
+                slot_index,
+                text[:160],
+            )
+            continue
+        if late_replay_match and replay_burst_until is not None and observed_at <= replay_burst_until:
+            logger.info(
+                "Skipping late caption replay inside burst slot=%s text=%s",
+                slot_index,
+                text[:160],
+            )
+            continue
 
         candidate_index = slot_anchor_index.get(slot_index) if slot_index is not None else None
         candidate = canonical[candidate_index] if candidate_index is not None and 0 <= candidate_index < len(canonical) else (canonical[-1] if canonical else None)
@@ -922,6 +978,7 @@ def canonicalize_caption_events(rows: list[sqlite3.Row] | list[dict]) -> list[di
             }
         )
         if slot_index is not None:
+            max_seen_slot_index = max(max_seen_slot_index, int(slot_index))
             slot_anchor_index[slot_index] = len(canonical) - 1
 
     cleaned: list[dict] = []
