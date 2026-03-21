@@ -14,7 +14,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -1587,7 +1587,7 @@ def process_meeting(meeting_id: int):
 
 def main():
     if len(sys.argv) < 2:
-        raise SystemExit("Usage: python bot/postprocess_worker.py <meeting_id>")
+        raise SystemExit("Usage: python -m backend.workers.postprocess_worker <meeting_id>")
 
     meeting_id = int(sys.argv[1])
     ensure_runtime_schema(get_db_path())

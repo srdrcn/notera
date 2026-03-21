@@ -18,7 +18,6 @@ RUN python -m pip install --upgrade pip \
     && python -m playwright install --with-deps chromium
 
 COPY backend /srv/notera/backend
-COPY bot /srv/notera/bot
 
 RUN mkdir -p \
     /data \

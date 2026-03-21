@@ -15,7 +15,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -529,7 +529,7 @@ def trigger_postprocess_worker(meeting_id):
             meeting_id,
         )
         return
-    worker_path = REPO_ROOT / "bot" / "postprocess_worker.py"
+    worker_path = REPO_ROOT / "backend" / "workers" / "postprocess_worker.py"
     try:
         update_meeting_fields(
             meeting_id,
@@ -2032,4 +2032,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 2:
         asyncio.run(run_bot(sys.argv[1], sys.argv[2]))
     else:
-        print("Usage: python bot.py <url> <id>")
+        print("Usage: python -m backend.workers.bot <url> <id>")

@@ -6,7 +6,7 @@ Repo artık tek bir yeni mimariye hizmet eder:
 
 - `frontend/`: React + TypeScript + Vite arayüzü
 - `backend/`: FastAPI API, auth, meeting lifecycle, review ve export mantığı
-- `bot/`: Playwright tabanlı Teams botu ve WhisperX postprocess worker’ı
+- `backend/workers/`: Playwright tabanlı Teams botu ve WhisperX postprocess worker’ı
 
 Eski Reflex uygulaması, eski Docker akışı ve legacy runtime katmanı repodan tamamen çıkarıldı.
 
@@ -18,7 +18,7 @@ Eski Reflex uygulaması, eski Docker akışı ve legacy runtime katmanı repodan
   Kullanıcı arayüzünü sunar. Login, dashboard ve transcript/review ekranları burada çalışır.
 - `backend`
   Session auth, meeting CRUD, snapshot üretimi, review işlemleri, media stream ve worker orchestration burada bulunur.
-- `bot`
+- `backend/workers`
   Teams toplantısına katılır, caption event’leri yazar, preview üretir, ses kaydı alır ve postprocess aşamasını çalıştırır.
 
 ### Dizin Yapısı
@@ -35,11 +35,9 @@ Eski Reflex uygulaması, eski Docker akışı ve legacy runtime katmanı repodan
 │   │   ├── runtime/
 │   │   ├── schemas/
 │   │   └── services/
+│   ├── workers/
 │   ├── Dockerfile
 │   └── requirements.txt
-├── bot/
-│   ├── bot.py
-│   └── postprocess_worker.py
 ├── frontend/
 │   ├── public/
 │   ├── src/
@@ -175,7 +173,7 @@ conda run -n teams-bot npm run build
 Backend ve worker syntax doğrulaması:
 
 ```bash
-conda run -n teams-bot python -m compileall backend bot
+conda run -n teams-bot python -m compileall backend
 ```
 
 Şu an repo içinde ayrı bir `lint` veya otomatik test framework’ü tanımlı değildir. Doğrulama akışı build, import ve syntax kontrolleri üzerinden yürür.
@@ -216,7 +214,7 @@ Bu refactor ile repodan tamamen çıkarılan başlıca alanlar:
 - eski root `Dockerfile`
 - eski single-image build akışı
 - legacy runtime compatibility katmanı
-- wrapper `workers/` girişi
+- top-level `bot/` kaynak klasörü
 - kullanılmayan asset/config/script kalıntıları
 
 Repo artık yalnızca React + FastAPI + local worker mimarisine hizmet eder.
