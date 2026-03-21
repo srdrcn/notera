@@ -234,14 +234,22 @@ class MeetingSupervisor:
         if not pid or not _is_process_running(pid):
             return True
 
+        graceful_wait_seconds = min(2.5, max(timeout_seconds * 0.35, 1.0))
+        graceful_deadline = time.monotonic() + graceful_wait_seconds
+        while time.monotonic() < graceful_deadline:
+            if not _is_process_running(pid):
+                return True
+            time.sleep(0.25)
+
         try:
             process_group_id = os.getpgid(pid)
         except Exception:
             process_group_id = None
 
+        remaining_timeout = max(timeout_seconds - graceful_wait_seconds, 0.5)
         for current_signal, wait_seconds in (
-            (signal.SIGTERM, timeout_seconds / 2),
-            (signal.SIGKILL, timeout_seconds / 2),
+            (signal.SIGTERM, remaining_timeout / 2),
+            (signal.SIGKILL, remaining_timeout / 2),
         ):
             delivered = False
             if process_group_id is not None:

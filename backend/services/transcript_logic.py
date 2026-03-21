@@ -364,6 +364,8 @@ class LiveTranscriptRow:
     speaker: str
     text: str
     timestamp: str
+    start_sec: float | None = None
+    end_sec: float | None = None
     resolution_status: str = "original"
     auto_corrected: bool = False
 
@@ -425,7 +427,7 @@ def _build_audio_payload(meeting: Meeting, audio_asset: MeetingAudioAsset | None
     pcm_audio = get_meeting_pcm_audio_path(meeting.id)
     if pcm_audio.exists():
         preferred_path = pcm_audio
-    label = "WAV oynatma kopyası" if preferred_path.suffix.lower() == ".wav" else f"{audio_asset.format.upper()} master kayıt"
+    label = "Toplantı kaydı"
     return SnapshotAudioOut(
         status=meeting.audio_status,
         error=meeting.audio_error,
@@ -437,7 +439,7 @@ def _build_audio_payload(meeting: Meeting, audio_asset: MeetingAudioAsset | None
 
 def _build_preview_payload(meeting: Meeting) -> SnapshotPreviewOut:
     if meeting.user_id is None:
-        return SnapshotPreviewOut(has_preview=False, image_url=None, label="Canlı görüntü sadece toplantı sırasında görünür")
+        return SnapshotPreviewOut(has_preview=False, image_url=None, label="")
     path = preview_path(meeting.user_id, meeting.id)
     if path.exists() and meeting.status in {"joining", "active"}:
         version = int(path.stat().st_mtime)
@@ -446,7 +448,7 @@ def _build_preview_payload(meeting: Meeting) -> SnapshotPreviewOut:
             image_url=f"/api/media/meetings/{meeting.id}/preview?v={version}",
             label="Son canlı kare",
         )
-    label = "Bot henüz canlı kare yüklemedi" if meeting.status in {"joining", "active"} else "Canlı görüntü sadece toplantı sırasında görünür"
+    label = "İlk kare henüz gelmedi." if meeting.status in {"joining", "active"} else ""
     return SnapshotPreviewOut(has_preview=False, image_url=None, label=label)
 
 
@@ -481,6 +483,8 @@ def build_snapshot(
                 text=row.text,
                 teams_text=row.text,
                 timestamp=row.timestamp,
+                start_sec=row.start_sec,
+                end_sec=row.end_sec,
                 initials=speaker_initials(row.speaker),
                 color=speaker_color(meeting.id, row.speaker),
                 resolution_status=row.resolution_status,
@@ -503,6 +507,8 @@ def build_snapshot(
                     text=transcript.text,
                     teams_text=transcript.teams_text or transcript.text,
                     timestamp=timestamp_value.strftime("%H:%M:%S") if timestamp_value else "",
+                    start_sec=transcript.start_sec,
+                    end_sec=transcript.end_sec,
                     initials=speaker_initials(transcript.speaker),
                     color=speaker_color(meeting.id, transcript.speaker),
                     resolution_status=transcript.resolution_status,

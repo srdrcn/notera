@@ -960,8 +960,14 @@ async def leave_meeting_via_ui(page):
     """Try to leave the Teams meeting before closing the browser."""
     leave_selectors = [
         "button#hangup-button",
-        "button[title='Leave']",
-        "button[aria-label='Leave']",
+        "[data-tid='call-end-button']",
+        "button[title*='Leave']",
+        "button[aria-label*='Leave']",
+        "button[title*='Ayrıl']",
+        "button[aria-label*='Ayrıl']",
+        "button:has-text('Leave')",
+        "button:has-text('Ayrıl')",
+        "button:has-text('Hang up')",
     ]
 
     for selector in leave_selectors:
@@ -974,10 +980,33 @@ async def leave_meeting_via_ui(page):
                     continue
                 await candidate.click(force=True, timeout=5000)
                 logger.info(f"Clicked leave button with selector: {selector}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 return True
         except Exception as e:
             logger.debug(f"Failed clicking leave button with selector {selector}: {e}")
+
+    try:
+        clicked = await page.evaluate("""() => {
+            const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+            const target = candidates.find((element) => {
+                const text = (
+                    element.innerText ||
+                    element.getAttribute('aria-label') ||
+                    element.getAttribute('title') ||
+                    ''
+                ).trim();
+                return /leave|hang up|ayrıl/i.test(text);
+            });
+            if (!target) return false;
+            target.click();
+            return true;
+        }""")
+        if clicked:
+            logger.info("Clicked leave button via DOM text fallback.")
+            await asyncio.sleep(1)
+            return True
+    except Exception as e:
+        logger.debug("Failed leave button DOM fallback: %s", e)
 
     logger.warning("Could not find a visible Leave button before shutdown.")
     return False

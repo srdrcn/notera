@@ -39,6 +39,8 @@ export type TranscriptEntry = {
   text: string;
   teams_text: string;
   timestamp: string;
+  start_sec: number | null;
+  end_sec: number | null;
   initials: string;
   color: string;
   resolution_status: string;

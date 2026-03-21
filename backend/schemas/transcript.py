@@ -19,6 +19,8 @@ class TranscriptEntryOut(BaseModel):
     text: str
     teams_text: str
     timestamp: str
+    start_sec: float | None
+    end_sec: float | None
     initials: str
     color: str
     resolution_status: str
