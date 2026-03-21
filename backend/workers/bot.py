@@ -36,6 +36,10 @@ from backend.runtime.paths import (  # noqa: E402
     get_meeting_master_audio_path,
     get_meeting_pcm_audio_path,
 )
+from backend.runtime.teams_links import (  # noqa: E402
+    TEAMS_JOIN_WITH_ID_PAGE_URL,
+    parse_join_with_id_target,
+)
 
 # Setup logging
 log_format = "%(asctime)s - %(levelname)s - %(message)s"
@@ -287,6 +291,56 @@ async def launch_teams_browser(playwright):
     except Exception as e:
         logger.warning("msedge channel launch failed, falling back to bundled chromium: %s", e)
         return await playwright.chromium.launch(**launch_options)
+
+
+async def open_meeting_entry(page, meeting_url):
+    meeting_by_id = parse_join_with_id_target(meeting_url)
+    if not meeting_by_id:
+        logger.info("Navigating to meeting URL: %s", meeting_url)
+        await page.goto(meeting_url)
+        return
+
+    meeting_id, passcode = meeting_by_id
+    logger.info("Navigating to Teams join-by-ID page for meeting %s", meeting_id)
+    await page.goto(TEAMS_JOIN_WITH_ID_PAGE_URL)
+
+    meeting_id_input = None
+    for locator in [
+        page.get_by_label(re.compile("meeting id", re.IGNORECASE)).first,
+        page.get_by_placeholder(re.compile("meeting id", re.IGNORECASE)).first,
+        page.locator("input[name*='meeting']").first,
+    ]:
+        try:
+            await locator.wait_for(state="visible", timeout=5000)
+            meeting_id_input = locator
+            break
+        except Exception:
+            continue
+    if meeting_id_input is None:
+        raise RuntimeError("Teams join-by-ID formunda meeting ID alani bulunamadi.")
+    await meeting_id_input.fill(meeting_id)
+
+    passcode_input = None
+    for locator in [
+        page.get_by_label(re.compile("passcode", re.IGNORECASE)).first,
+        page.get_by_placeholder(re.compile("passcode", re.IGNORECASE)).first,
+        page.locator("input[name*='passcode']").first,
+        page.locator("input[type='password']").first,
+    ]:
+        try:
+            await locator.wait_for(state="visible", timeout=5000)
+            passcode_input = locator
+            break
+        except Exception:
+            continue
+    if passcode_input is None:
+        raise RuntimeError("Teams join-by-ID formunda passcode alani bulunamadi.")
+    await passcode_input.fill(passcode)
+
+    join_button = page.get_by_role("button", name=re.compile("join a meeting", re.IGNORECASE)).first
+    await join_button.wait_for(state="visible", timeout=10000)
+    await join_button.click(timeout=10000)
+    await page.wait_for_load_state("networkidle")
 
 
 async def has_caption_surface(page):
@@ -1528,8 +1582,7 @@ async def run_bot(meeting_url, meeting_id):
                 take_periodic_screenshot(page, stop_screenshots, meeting_screenshot_path)
             )
 
-            logger.info("Navigating to meeting URL: %s", meeting_url)
-            await page.goto(meeting_url)
+            await open_meeting_entry(page, meeting_url)
 
             async def handle_popups(allow_without_audio=False):
                 try:

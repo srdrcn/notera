@@ -16,9 +16,89 @@ import {
 } from "./useMeetings";
 
 
+const TEAMS_URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
+
+
+function cleanUrlCandidate(candidate: string) {
+  return candidate.trim().replace(/^<|>$/g, "").replace(/[).,;!?]+$/g, "");
+}
+
+
+function isSupportedTeamsUrl(candidate: string) {
+  const parsed = new URL(candidate);
+  const hostname = parsed.hostname.toLowerCase();
+  const path = parsed.pathname.toLowerCase();
+
+  if (hostname === "teams.live.com" || hostname.endsWith(".teams.live.com")) {
+    return true;
+  }
+  if (hostname === "teams.microsoft.com" || hostname.endsWith(".teams.microsoft.com")) {
+    return true;
+  }
+  if (hostname.endsWith("microsoft.com") && path.includes("/microsoft-teams/join-a-meeting")) {
+    return true;
+  }
+  return false;
+}
+
+
+function extractTeamsJoinTarget(rawValue: string) {
+  const value = rawValue.trim();
+  if (!value) {
+    return null;
+  }
+
+  const urlMatches = value.match(TEAMS_URL_PATTERN) ?? [];
+  for (const match of urlMatches) {
+    const candidate = cleanUrlCandidate(match);
+    try {
+      if (isSupportedTeamsUrl(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // Ignore malformed candidates and continue.
+    }
+  }
+
+  return null;
+}
+
+
+function extractTeamsJoinTargetFromHtml(rawHtml: string) {
+  if (!rawHtml || typeof DOMParser === "undefined") {
+    return null;
+  }
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(rawHtml, "text/html");
+    const anchors = Array.from(doc.querySelectorAll("a[href]"));
+
+    for (const anchor of anchors) {
+      const href = anchor.getAttribute("href");
+      if (!href) {
+        continue;
+      }
+      const teamsLink = extractTeamsJoinTarget(href);
+      if (teamsLink) {
+        return teamsLink;
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+
 const meetingSchema = z.object({
   title: z.string().trim().min(2, "Toplantı adı en az 2 karakter olmalı."),
-  teams_link: z.url("Geçerli bir Teams linki girin."),
+  teams_link: z
+    .string()
+    .trim()
+    .min(1, "Teams toplantı linki girin.")
+    .refine((value) => extractTeamsJoinTarget(value) !== null, "Geçerli bir Teams toplantı linki girin."),
   audio_recording_enabled: z.boolean(),
 });
 
@@ -73,10 +153,35 @@ export function DashboardPage() {
       audio_recording_enabled: true,
     },
   });
+  const teamsLinkField = form.register("teams_link");
+
+  function syncTeamsLinkField(rawValue: string) {
+    const teamsLink = extractTeamsJoinTarget(rawValue);
+    if (!teamsLink || teamsLink === rawValue) {
+      return;
+    }
+    form.setValue("teams_link", teamsLink, {
+      shouldDirty: true,
+      shouldTouch: true,
+      shouldValidate: true,
+    });
+  }
 
   async function onSubmit(values: MeetingForm) {
+    const teamsLink = extractTeamsJoinTarget(values.teams_link);
+    if (!teamsLink) {
+      form.setError("teams_link", {
+        type: "validate",
+        message: "Geçerli bir Teams toplantı linki girin.",
+      });
+      return;
+    }
+
     try {
-      await createMeeting.mutateAsync(values);
+      await createMeeting.mutateAsync({
+        ...values,
+        teams_link: teamsLink,
+      });
       form.reset({
         title: "",
         teams_link: "",
@@ -124,12 +229,30 @@ export function DashboardPage() {
               {form.formState.errors.title ? <small>{form.formState.errors.title.message}</small> : null}
             </label>
             <label className="nt-field">
-              <span>Teams linki</span>
+              <span>Teams toplantı linki</span>
               <textarea
                 className="nt-input nt-input-mono"
-                placeholder="https://teams.microsoft.com/..."
+                placeholder="Gercek Teams toplanti linkini yapistirin"
                 rows={3}
-                {...form.register("teams_link")}
+                {...teamsLinkField}
+                onChange={(event) => {
+                  teamsLinkField.onChange(event);
+                  syncTeamsLinkField(event.target.value);
+                }}
+                onPaste={(event) => {
+                  const htmlValue = event.clipboardData.getData("text/html");
+                  const teamsLinkFromHtml = extractTeamsJoinTargetFromHtml(htmlValue);
+                  if (!teamsLinkFromHtml) {
+                    return;
+                  }
+
+                  event.preventDefault();
+                  form.setValue("teams_link", teamsLinkFromHtml, {
+                    shouldDirty: true,
+                    shouldTouch: true,
+                    shouldValidate: true,
+                  });
+                }}
               />
               {form.formState.errors.teams_link ? <small>{form.formState.errors.teams_link.message}</small> : null}
             </label>

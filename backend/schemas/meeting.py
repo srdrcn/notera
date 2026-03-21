@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from backend.runtime.teams_links import normalize_teams_join_target
 
 
 class CreateMeetingRequest(BaseModel):
     title: str
     teams_link: str
     audio_recording_enabled: bool = True
+
+    @field_validator("teams_link")
+    @classmethod
+    def validate_teams_link(cls, value: str) -> str:
+        return normalize_teams_join_target(value)
 
 
 class MeetingSummaryOut(BaseModel):
