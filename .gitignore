@@ -26,23 +26,12 @@ pip-wheel-metadata/
 
 # Local app state
 .states/
-app/
 data/
 *.db
 *.db-shm
 *.db-wal
 
-# Bot runtime artifacts
-bot/*.log
-bot/*.png
-bot/*.html
-bot/stop_*.flag
-bot/meeting_audio/
-bot/runtime_cache/
-
 # Build / export artifacts
-frontend.zip
-backend.zip
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/

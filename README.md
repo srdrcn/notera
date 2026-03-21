@@ -210,7 +210,7 @@ Docker image workflow’u iki ayrı image üretir:
 
 Bu refactor ile repodan tamamen çıkarılan başlıca alanlar:
 
-- Reflex uygulaması ve `app/` altındaki UI/state katmanı
+- top-level `app/` klasörü ve Reflex uygulaması
 - eski root `Dockerfile`
 - eski single-image build akışı
 - legacy runtime compatibility katmanı
