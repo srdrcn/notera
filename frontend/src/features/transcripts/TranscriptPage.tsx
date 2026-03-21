@@ -3,7 +3,6 @@ import { Link, useParams } from "react-router-dom";
 
 import { AppShell } from "../../components/AppShell";
 import { LoadingView } from "../../components/LoadingView";
-import { MetricCard } from "../../components/MetricCard";
 import { StatusPill } from "../../components/StatusPill";
 import { buildApiUrl } from "../../lib/api/client";
 import type { TranscriptEntry } from "../../lib/api/types";
@@ -32,6 +31,13 @@ function toneForStatus(status: string): "default" | "success" | "warning" | "dan
   }
   return "default";
 }
+
+
+const BackIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M15 18l-6-6 6-6" />
+  </svg>
+);
 
 
 type TranscriptRowProps = {
@@ -295,7 +301,16 @@ export function TranscriptPage() {
 
   if (snapshot.error || !snapshot.data) {
     return (
-      <AppShell title="Transcript" subtitle="Snapshot yüklenemedi.">
+      <AppShell
+        title="Transcript"
+        subtitle="Snapshot yüklenemedi."
+        aboveTitle={
+          <Link className="nt-page-backlink" to="/dashboard">
+            <BackIcon />
+            <span>Toplantılar</span>
+          </Link>
+        }
+      >
         <div className="nt-alert">
           {snapshot.error?.message ?? "Bilinmeyen hata"}
         </div>
@@ -308,16 +323,21 @@ export function TranscriptPage() {
   const progressActive =
     ["transcribing", "aligning"].includes(data.postprocess.status) &&
     data.postprocess.progress_pct !== null;
+  const hasSummaryActions =
+    data.actions.can_apply_all_reviews || data.actions.can_merge_duplicate_transcripts;
 
   return (
     <AppShell
       title={data.meeting.title}
       subtitle="Final transcript, review akışı, canlı preview ve export işlemleri tek ekranda."
-      navSlot={
+      aboveTitle={
+        <Link className="nt-page-backlink" to="/dashboard">
+          <BackIcon />
+          <span>Toplantılar</span>
+        </Link>
+      }
+      actions={
         <div className="nt-inline-actions">
-          <Link className="nt-btn nt-btn-ghost nt-btn-sm" to="/dashboard">
-            Dashboard
-          </Link>
           {data.actions.can_stop_meeting ? (
             <button
               className="nt-btn nt-btn-secondary nt-btn-sm"
@@ -330,120 +350,118 @@ export function TranscriptPage() {
           ) : null}
         </div>
       }
-      actions={
-        <div className="nt-inline-actions">
-          <a className="nt-btn nt-btn-ghost nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.txt`)}>
-            TXT indir
-          </a>
-          <a className="nt-btn nt-btn-ghost nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.csv`)}>
-            CSV indir
-          </a>
-        </div>
-      }
     >
-      <section className="nt-metric-grid">
-        <MetricCard
-          accent="primary"
-          label="Meeting"
-          value={<StatusPill tone={toneForStatus(data.meeting.status)}>{data.meeting.status}</StatusPill>}
-          hint={`${data.summary.speaker_count} konuşmacı · ${data.summary.transcript_count} satır`}
-        />
-        <MetricCard
-          accent="warning"
-          label="WhisperX"
-          value={
-            progressActive ? (
-              `%${data.postprocess.progress_pct}`
+      <section className="nt-transcript-top-layout">
+        <div className="nt-top-main-stack">
+          <article className="nt-card nt-card-padded nt-transcript-summary-card">
+            <div className="nt-transcript-summary-row">
+              <div className="nt-transcript-summary-item">
+                <span className="nt-card-label">Meeting</span>
+                <div className="nt-transcript-summary-value">
+                  <StatusPill tone={toneForStatus(data.meeting.status)}>{data.meeting.status}</StatusPill>
+                </div>
+                <p className="nt-card-hint">{`${data.summary.speaker_count} konuşmacı · ${data.summary.transcript_count} satır`}</p>
+              </div>
+
+              <div className="nt-transcript-summary-item">
+                <span className="nt-card-label">WhisperX</span>
+                <div className="nt-transcript-summary-value">
+                  {progressActive ? (
+                    <strong className="nt-transcript-summary-number">%{data.postprocess.progress_pct}</strong>
+                  ) : (
+                    <StatusPill tone={toneForStatus(data.postprocess.status)}>{data.postprocess.status}</StatusPill>
+                  )}
+                </div>
+                <p className="nt-card-hint">{data.postprocess.progress_note ?? data.postprocess.error ?? "Worker idle"}</p>
+                {progressActive ? (
+                  <div className="nt-progress-shell">
+                    <div
+                      className="nt-progress-bar"
+                      style={{ width: `${data.postprocess.progress_pct ?? 0}%` }}
+                    />
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="nt-transcript-summary-item">
+                <span className="nt-card-label">Review</span>
+                <div className="nt-transcript-summary-value">
+                  <strong className="nt-transcript-summary-number">{data.actions.pending_review_count}</strong>
+                </div>
+                <p className="nt-card-hint">{`${data.actions.duplicate_merge_candidate_count} duplicate aday`}</p>
+              </div>
+            </div>
+
+            {hasSummaryActions ? (
+              <div className="nt-inline-actions nt-transcript-summary-actions">
+                {data.actions.can_apply_all_reviews ? (
+                  <button
+                    className="nt-btn nt-btn-primary nt-btn-sm"
+                    disabled={applyAllReviews.isPending}
+                    onClick={() => void applyAllReviews.mutateAsync()}
+                    type="button"
+                  >
+                    {applyAllReviews.isPending ? "Uygulanıyor" : "Tümünü uygula"}
+                  </button>
+                ) : null}
+                {data.actions.can_merge_duplicate_transcripts ? (
+                  <button
+                    className="nt-btn nt-btn-secondary nt-btn-sm"
+                    disabled={mergeDuplicates.isPending}
+                    onClick={() => void mergeDuplicates.mutateAsync()}
+                    type="button"
+                  >
+                    {mergeDuplicates.isPending ? "Birleştiriliyor" : "Duplicate kayıtları birleştir"}
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </article>
+
+          <article className="nt-card nt-card-padded nt-audio-card">
+            <div className="nt-card-head">
+              <div>
+                <p className="nt-card-label">Ses kaydı</p>
+                <h2 className="nt-section-title">{data.audio.label}</h2>
+              </div>
+            </div>
+            {data.audio.has_audio && data.audio.audio_url ? (
+              <div className="nt-audio-section">
+                <audio className="nt-audio-player" controls preload="metadata" src={buildApiUrl(data.audio.audio_url)} />
+              </div>
             ) : (
-              <StatusPill tone={toneForStatus(data.postprocess.status)}>{data.postprocess.status}</StatusPill>
-            )
-          }
-          hint={data.postprocess.progress_note ?? data.postprocess.error ?? "Worker idle"}
-          extra={
-            progressActive ? (
-              <div className="nt-progress-shell">
-                <div
-                  className="nt-progress-bar"
-                  style={{ width: `${data.postprocess.progress_pct ?? 0}%` }}
+              <div className="nt-empty-state">
+                <strong>Ses kaydı hazır değil</strong>
+                <span>{data.audio.error ?? "Bu meeting için oynatılabilir audio yok."}</span>
+              </div>
+            )}
+          </article>
+        </div>
+
+        <div className="nt-top-preview-col">
+          <article className="nt-card nt-card-padded nt-preview-card">
+            <div className="nt-card-head">
+              <div>
+                <p className="nt-card-label">Canlı preview</p>
+                <h2 className="nt-section-title">{data.preview.label}</h2>
+              </div>
+            </div>
+            {data.preview.has_preview && data.preview.image_url ? (
+              <div className="nt-preview-frame">
+                <img
+                  alt="Canlı meeting önizlemesi"
+                  className="nt-preview-image"
+                  src={buildApiUrl(data.preview.image_url)}
                 />
               </div>
-            ) : null
-          }
-        />
-        <MetricCard
-          accent="teal"
-          label="Review"
-          value={data.actions.pending_review_count}
-          hint={`${data.actions.duplicate_merge_candidate_count} duplicate aday`}
-          extra={
-            <div className="nt-inline-actions">
-              {data.actions.can_apply_all_reviews ? (
-                <button
-                  className="nt-btn nt-btn-primary nt-btn-sm"
-                  disabled={applyAllReviews.isPending}
-                  onClick={() => void applyAllReviews.mutateAsync()}
-                  type="button"
-                >
-                  {applyAllReviews.isPending ? "Uygulanıyor" : "Tümünü uygula"}
-                </button>
-              ) : null}
-              {data.actions.can_merge_duplicate_transcripts ? (
-                <button
-                  className="nt-btn nt-btn-secondary nt-btn-sm"
-                  disabled={mergeDuplicates.isPending}
-                  onClick={() => void mergeDuplicates.mutateAsync()}
-                  type="button"
-                >
-                  {mergeDuplicates.isPending ? "Birleştiriliyor" : "Duplicate kayıtları birleştir"}
-                </button>
-              ) : null}
-            </div>
-          }
-        />
-      </section>
-
-      <section className="nt-transcript-top-grid">
-        <article className="nt-card nt-card-padded">
-          <div className="nt-card-head">
-            <div>
-              <p className="nt-card-label">Ses kaydı</p>
-              <h2 className="nt-section-title">{data.audio.label}</h2>
-            </div>
-          </div>
-          {data.audio.has_audio && data.audio.audio_url ? (
-            <div className="nt-audio-section">
-              <audio className="nt-audio-player" controls preload="metadata" src={buildApiUrl(data.audio.audio_url)} />
-            </div>
-          ) : (
-            <div className="nt-empty-state">
-              <strong>Ses kaydı hazır değil</strong>
-              <span>{data.audio.error ?? "Bu meeting için oynatılabilir audio yok."}</span>
-            </div>
-          )}
-        </article>
-
-        <article className="nt-card nt-card-padded">
-          <div className="nt-card-head">
-            <div>
-              <p className="nt-card-label">Canlı preview</p>
-              <h2 className="nt-section-title">{data.preview.label}</h2>
-            </div>
-          </div>
-          {data.preview.has_preview && data.preview.image_url ? (
-            <div className="nt-preview-frame">
-              <img
-                alt="Canlı meeting önizlemesi"
-                className="nt-preview-image"
-                src={buildApiUrl(data.preview.image_url)}
-              />
-            </div>
-          ) : (
-            <div className="nt-preview-empty">
-              <strong>Preview yok</strong>
-              <span>Bot henüz güncel kare üretmedi veya meeting aktif değil.</span>
-            </div>
-          )}
-        </article>
+            ) : (
+              <div className="nt-preview-empty">
+                <strong>Preview yok</strong>
+                <span>Bot henüz güncel kare üretmedi veya meeting aktif değil.</span>
+              </div>
+            )}
+          </article>
+        </div>
       </section>
 
       <section className="nt-stream-shell nt-transcript-panel">
@@ -454,6 +472,14 @@ export function TranscriptPage() {
             <p className="nt-review-helper is-muted">
               Vurgulu satırlara tıklayarak review yapabilirsiniz. Duplicate adayları da aynı akışta işaretlenir.
             </p>
+          </div>
+          <div className="nt-stream-actions">
+             <a className="nt-btn nt-btn-primary nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.txt`)}>
+               TXT indir
+             </a>
+             <a className="nt-btn nt-btn-primary nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.csv`)}>
+               CSV indir
+             </a>
           </div>
         </div>
         {applyReview.error ? (

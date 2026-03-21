@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { z } from "zod";
 
 import { AppShell } from "../../components/AppShell";
@@ -50,7 +50,15 @@ function formatDate(value: string | null) {
 }
 
 
+const TrashIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="3 6 5 6 21 6"></polyline>
+    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+  </svg>
+);
+
 export function DashboardPage() {
+  const navigate = useNavigate();
   const session = useSession();
   const meetings = useMeetings();
   const createMeeting = useCreateMeeting();
@@ -81,40 +89,38 @@ export function DashboardPage() {
 
   const rows = meetings.data ?? [];
   const activeCount = rows.filter((row) => row.status === "joining" || row.status === "active").length;
-  const reviewReadyCount = rows.filter((row) => row.postprocess_status === "review_ready").length;
-  const whisperxCount = rows.filter((row) =>
-    ["canonicalizing", "transcribing", "aligning", "rebuilding"].includes(row.postprocess_status),
-  ).length;
+
+  function openTranscript(meetingId: number) {
+    navigate(`/transcripts/${meetingId}`);
+  }
 
   return (
     <AppShell
       title="Dashboard"
       subtitle={`${session.user?.email ?? ""} hesabı için canlı toplantılar, worker durumu ve transcript operasyonları.`}
       navSlot={
-        <button className="nt-btn nt-btn-ghost nt-btn-sm" onClick={() => void session.logout()} type="button">
+        <button className="nt-btn nt-btn-secondary nt-btn-sm" onClick={() => void session.logout()} type="button">
           Çıkış yap
         </button>
       }
     >
       <section className="nt-metric-grid">
-        <MetricCard accent="primary" label="Toplam meeting" value={rows.length} hint="Kayıtlı tüm oturumlar" />
-        <MetricCard accent="teal" label="Canlı bot" value={activeCount} hint="joining veya active durumları" />
-        <MetricCard accent="warning" label="WhisperX çalışan" value={whisperxCount} hint="canonicalizing / transcribing / aligning / rebuilding" />
-        <MetricCard accent="primary" label="Review bekleyen" value={reviewReadyCount} hint="İnline karar bekleyen transcriptler" />
+        <MetricCard className="is-compact" accent="primary" label="Toplantılar" value={rows.length} />
+        <MetricCard className="is-compact" accent="teal" label="Aktif" value={activeCount} />
       </section>
 
       <section className="nt-dashboard-grid">
         <article className="nt-card nt-card-padded">
           <div className="nt-card-head">
             <div>
-              <p className="nt-card-label">Yeni meeting</p>
-              <h2 className="nt-section-title">Bot oturumu başlat</h2>
+              <p className="nt-card-label">Yeni</p>
+              <h2 className="nt-section-title">Hızlı Katıl</h2>
             </div>
           </div>
           <form className="nt-form" onSubmit={form.handleSubmit(onSubmit)}>
             <label className="nt-field">
               <span>Toplantı adı</span>
-              <input className="nt-input" placeholder="Haftalık ürün senkronu" {...form.register("title")} />
+              <input className="nt-input" placeholder="Ürün senkronu" {...form.register("title")} />
               {form.formState.errors.title ? <small>{form.formState.errors.title.message}</small> : null}
             </label>
             <label className="nt-field">
@@ -122,20 +128,20 @@ export function DashboardPage() {
               <textarea
                 className="nt-input nt-input-mono"
                 placeholder="https://teams.microsoft.com/..."
-                rows={4}
+                rows={3}
                 {...form.register("teams_link")}
               />
               {form.formState.errors.teams_link ? <small>{form.formState.errors.teams_link.message}</small> : null}
             </label>
             <label className="nt-checkbox">
               <input type="checkbox" {...form.register("audio_recording_enabled")} />
-              <span>Ses kaydını da toplamaya çalış</span>
+              <span>Ses kaydı</span>
             </label>
             {createMeeting.error ? (
               <div className="nt-alert">{createMeeting.error.message}</div>
             ) : null}
             <button className="nt-btn nt-btn-primary" disabled={createMeeting.isPending} type="submit">
-              {createMeeting.isPending ? "Toplantıya katılıyor" : "Oluştur ve katıl"}
+              {createMeeting.isPending ? "Katılıyor" : "Başlat"}
             </button>
           </form>
         </article>
@@ -144,7 +150,7 @@ export function DashboardPage() {
           <div className="nt-card-head">
             <div>
               <p className="nt-card-label">Toplantılar</p>
-              <h2 className="nt-section-title">Durum görünümü</h2>
+              <h2 className="nt-section-title">Geçmiş</h2>
             </div>
           </div>
           {meetings.error ? (
@@ -154,35 +160,41 @@ export function DashboardPage() {
             {rows.length === 0 ? (
               <div className="nt-empty-state">
                 <strong>Henüz meeting yok</strong>
-                <span>İlk kaydı soldaki formdan oluşturabilirsin.</span>
+                <span>İlk kaydı soldan oluşturabilirsin.</span>
               </div>
             ) : null}
             {rows.map((meeting) => (
-              <article className="nt-card nt-meeting-card" key={meeting.id}>
+              <article
+                className="nt-card nt-meeting-card"
+                key={meeting.id}
+                onClick={() => openTranscript(meeting.id)}
+                onKeyDown={(event) => {
+                  if (event.target !== event.currentTarget) {
+                    return;
+                  }
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    openTranscript(meeting.id);
+                  }
+                }}
+                role="link"
+                tabIndex={0}
+              >
                 <div className="nt-meeting-head">
                   <div>
                     <h3 className="nt-meeting-title">{meeting.title}</h3>
-                    <p>Oluşturuldu: {formatDate(meeting.created_at)}</p>
+                    <p className="nt-caption">{formatDate(meeting.created_at)}</p>
                   </div>
                   <div className="nt-meeting-pills">
                     <StatusPill tone={toneForStatus(meeting.status)}>{meeting.status}</StatusPill>
-                    <StatusPill tone={toneForStatus(meeting.postprocess_status)}>{meeting.postprocess_status}</StatusPill>
                   </div>
                 </div>
-                <dl className="nt-meeting-meta">
-                  <div>
-                    <dt>Ses</dt>
-                    <dd>{meeting.audio_status}</dd>
-                  </div>
-                  <div>
-                    <dt>Başladı</dt>
-                    <dd>{formatDate(meeting.joined_at)}</dd>
-                  </div>
-                  <div>
-                    <dt>Bitti</dt>
-                    <dd>{formatDate(meeting.ended_at)}</dd>
-                  </div>
-                </dl>
+
+                <div className="nt-meeting-mini-meta">
+                   {meeting.audio_status !== "not_recorded" ? <span>● {meeting.audio_status}</span> : null}
+                   <span>{meeting.status !== "active" && meeting.joined_at ? ` · ${formatDate(meeting.joined_at).split(" ")[1]}` : ""}</span>
+                </div>
+
                 {meeting.postprocess_progress_note ? (
                   <p className="nt-meeting-note">
                     {meeting.postprocess_progress_pct !== null ? `%${meeting.postprocess_progress_pct} · ` : ""}
@@ -194,7 +206,10 @@ export function DashboardPage() {
                     <button
                       className="nt-btn nt-btn-primary nt-btn-sm"
                       disabled={joinMeeting.isPending}
-                      onClick={() => void joinMeeting.mutateAsync(meeting.id)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void joinMeeting.mutateAsync(meeting.id);
+                      }}
                       type="button"
                     >
                       Katıl
@@ -204,22 +219,27 @@ export function DashboardPage() {
                     <button
                       className="nt-btn nt-btn-secondary nt-btn-sm"
                       disabled={stopMeeting.isPending}
-                      onClick={() => void stopMeeting.mutateAsync(meeting.id)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void stopMeeting.mutateAsync(meeting.id);
+                      }}
                       type="button"
                     >
                       Durdur
                     </button>
                   ) : null}
-                  <Link className="nt-btn nt-btn-ghost nt-btn-sm" to={`/transcripts/${meeting.id}`}>
-                    Transcript
-                  </Link>
                   <button
-                    className="nt-btn nt-btn-danger nt-btn-sm"
+                    aria-label="Toplantiyi sil"
+                    className="nt-btn nt-btn-ghost nt-btn-sm nt-delete-btn"
                     disabled={deleteMeeting.isPending || meeting.can_stop}
-                    onClick={() => void deleteMeeting.mutateAsync(meeting.id)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void deleteMeeting.mutateAsync(meeting.id);
+                    }}
+                    title="Sil"
                     type="button"
                   >
-                    Sil
+                    <TrashIcon />
                   </button>
                 </div>
               </article>

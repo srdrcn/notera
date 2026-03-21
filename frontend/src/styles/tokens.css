@@ -1,5 +1,6 @@
 :root {
-  --nt-page-width: 1220px;
+  --nt-page-width: 1120px;
+  --nt-container: var(--nt-page-width);
   --nt-card-gap: 1.25rem;
-  --nt-page-padding: 1.25rem;
+  --nt-page-padding: clamp(1rem, 2vw, 1.5rem);
 }

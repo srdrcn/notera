@@ -63,11 +63,24 @@
   background: linear-gradient(180deg, color-mix(in srgb, var(--nt-surface-1) 96%, transparent), var(--nt-surface-1));
   display: grid;
   gap: 0.95rem;
+  cursor: pointer;
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.nt-meeting-card:hover {
+  border-color: var(--nt-border-hover);
+  transform: translateY(-1px);
+}
+
+.nt-meeting-card:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--nt-primary) 70%, white);
+  outline-offset: 2px;
 }
 
 .nt-meeting-head {
   display: flex;
   justify-content: space-between;
+  align-items: flex-start;
   gap: 1rem;
 }
 
@@ -90,37 +103,135 @@
   gap: 0.45rem;
 }
 
-.nt-meeting-meta {
+.nt-meeting-mini-meta {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  color: var(--nt-text-3);
+  margin-top: -0.4rem;
+  margin-bottom: 0.85rem;
+}
+
+.nt-meeting-head p {
+  margin: 0.25rem 0 0;
+  color: var(--nt-text-3);
+}
+
+.nt-meeting-note {
+  margin: 0.5rem 0 0.85rem;
+  padding: 0.625rem 0.875rem;
+  background: var(--nt-surface-2);
+  border-radius: var(--nt-radius-sm);
+  color: var(--nt-text-2);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.nt-meeting-actions {
+  width: 100%;
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.nt-delete-btn {
+  margin-left: auto !important;
+  flex-shrink: 0;
+  color: var(--nt-text-2) !important;
+  opacity: 1 !important;
+}
+
+.nt-delete-btn:hover {
+  color: var(--nt-danger) !important;
+  background: var(--nt-danger-soft) !important;
+}
+
+.nt-transcript-top-layout {
+  display: grid;
+  grid-template-columns: 1fr 380px;
+  gap: var(--nt-card-gap);
+  align-items: start;
+}
+
+.nt-top-main-stack {
+  display: grid;
+  gap: var(--nt-card-gap);
+}
+
+.nt-transcript-summary-card {
+  display: grid;
+  gap: 1rem;
+}
+
+.nt-transcript-summary-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.75rem;
-  margin: 0;
+  gap: 1rem;
+  align-items: start;
 }
 
-.nt-meeting-meta div {
-  padding: 0.8rem;
-  border-radius: var(--nt-radius-md);
-  background: color-mix(in srgb, var(--nt-surface-1) 94%, transparent);
-  border: 1px solid color-mix(in srgb, var(--nt-border) 80%, transparent);
-}
-
-.nt-meeting-meta dt {
-  margin-bottom: 0.3rem;
-  color: var(--nt-text-3);
-  font-size: 0.8rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.nt-meeting-meta dd {
-  margin: 0;
-  color: var(--nt-text-1);
-}
-
-.nt-transcript-top-grid {
+.nt-transcript-summary-item {
+  min-width: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--nt-card-gap);
+  gap: 0.4rem;
+}
+
+.nt-transcript-summary-item + .nt-transcript-summary-item {
+  padding-left: 1rem;
+  border-left: 1px solid color-mix(in srgb, var(--nt-border) 92%, transparent);
+}
+
+.nt-transcript-summary-value {
+  min-height: 1.75rem;
+  display: flex;
+  align-items: center;
+}
+
+.nt-transcript-summary-number {
+  display: block;
+  font-size: 1.5rem;
+  letter-spacing: -0.05em;
+  line-height: 1;
+}
+
+.nt-transcript-summary-item .nt-card-hint {
+  font-size: 0.84rem;
+}
+
+.nt-transcript-summary-item .nt-progress-shell {
+  margin-top: 0.15rem;
+}
+
+.nt-transcript-summary-actions {
+  padding-top: 1rem;
+  border-top: 1px solid color-mix(in srgb, var(--nt-border) 92%, transparent);
+}
+
+.nt-audio-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.nt-top-preview-col {
+  height: 100%;
+}
+
+.nt-preview-card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.nt-preview-frame {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--nt-surface-2);
+  border-radius: var(--nt-radius-md);
+  overflow: hidden;
 }
 
 .nt-preview-image {
@@ -139,6 +250,19 @@
 .nt-transcript-list {
   display: grid;
   gap: 0.2rem;
+}
+
+.nt-stream-header {
+  display: flex !important;
+  justify-content: space-between !important;
+  align-items: flex-start !important;
+  gap: 1.5rem !important;
+}
+
+.nt-stream-actions {
+  display: flex;
+  gap: 0.625rem;
+  flex-shrink: 0;
 }
 
 .nt-stream-row-layout {
@@ -250,7 +374,7 @@
 @media (max-width: 1100px) {
   .nt-auth-main,
   .nt-dashboard-grid,
-  .nt-transcript-top-grid,
+  .nt-transcript-top-layout,
   .nt-metric-grid {
     grid-template-columns: 1fr;
   }
@@ -262,11 +386,28 @@
   }
 
   .nt-page-head,
+  .nt-stream-header,
   .nt-stream-meta-row,
   .nt-review-head,
-  .nt-review-head-actions,
-  .nt-meeting-head {
+  .nt-review-head-actions {
     flex-direction: column;
+  }
+
+  .nt-meeting-head {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .nt-transcript-summary-row {
+    grid-template-columns: 1fr;
+    gap: 0.85rem;
+  }
+
+  .nt-transcript-summary-item + .nt-transcript-summary-item {
+    padding-left: 0;
+    padding-top: 0.85rem;
+    border-left: 0;
+    border-top: 1px solid color-mix(in srgb, var(--nt-border) 92%, transparent);
   }
 
   .nt-meeting-meta {

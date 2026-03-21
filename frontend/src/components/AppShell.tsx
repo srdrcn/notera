@@ -5,6 +5,7 @@ import { Link } from "react-router-dom";
 type AppShellProps = PropsWithChildren<{
   title: string;
   subtitle?: string;
+  aboveTitle?: ReactNode;
   navSlot?: ReactNode;
   actions?: ReactNode;
 }>;
@@ -13,6 +14,7 @@ type AppShellProps = PropsWithChildren<{
 export function AppShell({
   title,
   subtitle,
+  aboveTitle,
   navSlot,
   actions,
   children,
@@ -34,6 +36,7 @@ export function AppShell({
         <main className="nt-container nt-page">
           <section className="nt-page-head">
             <div>
+              {aboveTitle ? <div className="nt-page-context">{aboveTitle}</div> : null}
               <p className="nt-page-kicker">Teams transcript operations</p>
               <h1 className="nt-page-title">{title}</h1>
               {subtitle ? <p className="nt-page-subtitle">{subtitle}</p> : null}
