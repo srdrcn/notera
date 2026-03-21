@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      NOTERA_API_HOST: 0.0.0.0
+      NOTERA_API_PORT: 8000
+      NOTERA_SESSION_SECRET: change-me-in-prod
+    volumes:
+      - notera-data:/data
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  notera-data:

@@ -1,0 +1,170 @@
+.nt-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1.1rem;
+}
+
+.nt-card-label {
+  display: inline-block;
+  margin-bottom: 0.35rem;
+  color: var(--nt-text-2);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.nt-card-value {
+  display: block;
+  font-size: 1.85rem;
+  letter-spacing: -0.05em;
+  line-height: 1.05;
+}
+
+.nt-card-hint {
+  margin: 0;
+  color: var(--nt-text-2);
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+.nt-card-extra {
+  margin-top: auto;
+}
+
+.nt-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--nt-card-gap);
+}
+
+.nt-metric-card {
+  min-height: 10rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.nt-metric-primary {
+  background-image: radial-gradient(circle at top right, var(--nt-primary-soft), transparent 58%);
+}
+
+.nt-metric-teal {
+  background-image: radial-gradient(circle at top right, var(--nt-teal-soft), transparent 58%);
+}
+
+.nt-metric-warning {
+  background-image: radial-gradient(circle at top right, var(--nt-warning-soft), transparent 58%);
+}
+
+.nt-form {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.nt-field {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.nt-field > span {
+  color: var(--nt-text-2);
+  font-size: 0.9rem;
+}
+
+.nt-field > input,
+.nt-field > textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.nt-field > input:focus,
+.nt-field > textarea:focus {
+  outline: none;
+}
+
+.nt-field > small {
+  color: var(--nt-danger);
+}
+
+.nt-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  color: var(--nt-text-2);
+}
+
+.nt-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.nt-chip.is-warning {
+  background: var(--nt-warning-soft);
+  color: var(--nt-warning);
+  border-color: rgba(245, 158, 11, 0.15);
+}
+
+.nt-chip.is-teal {
+  background: var(--nt-teal-soft);
+  color: var(--nt-teal);
+  border-color: rgba(45, 212, 191, 0.15);
+}
+
+.nt-empty-state {
+  display: grid;
+  gap: 0.35rem;
+  padding: 1rem;
+  border-radius: var(--nt-radius-md);
+  background: var(--nt-surface-1);
+  color: var(--nt-text-2);
+  line-height: 1.55;
+}
+
+.nt-progress-shell {
+  width: 100%;
+  height: 0.5rem;
+  border-radius: var(--nt-radius-full);
+  background: var(--nt-surface-2);
+  overflow: hidden;
+}
+
+.nt-progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--nt-primary), var(--nt-teal));
+}
+
+.nt-avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.9rem;
+  font-weight: 700;
+  background: var(--nt-surface-2);
+  color: var(--nt-text-1);
+}
+
+.nt-avatar-tomato, .nt-avatar-red, .nt-avatar-ruby, .nt-avatar-crimson {
+  background: rgba(239, 68, 68, 0.18);
+}
+
+.nt-avatar-blue, .nt-avatar-cyan {
+  background: rgba(59, 130, 246, 0.18);
+}
+
+.nt-avatar-teal, .nt-avatar-jade {
+  background: rgba(20, 184, 166, 0.18);
+}
+
+.nt-avatar-green, .nt-avatar-grass {
+  background: rgba(16, 185, 129, 0.18);
+}
+
+.nt-avatar-orange, .nt-avatar-amber {
+  background: rgba(245, 158, 11, 0.18);
+}

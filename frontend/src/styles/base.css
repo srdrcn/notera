@@ -1,0 +1,109 @@
+a {
+  color: inherit;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.nt-page {
+  margin: 0 auto;
+  padding: 1.6rem 0 3rem;
+  display: grid;
+  gap: var(--nt-card-gap);
+}
+
+.nt-page-center {
+  display: grid;
+  place-items: center;
+}
+
+.nt-page-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.25rem;
+  align-items: end;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--nt-border) 88%, transparent);
+}
+
+.nt-page-kicker {
+  margin: 0 0 0.35rem;
+  color: var(--nt-text-2);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.nt-page-title {
+  margin: 0;
+  font-size: clamp(1.75rem, 2.6vw, 2.8rem);
+  letter-spacing: -0.05em;
+  line-height: 1.05;
+}
+
+.nt-page-subtitle {
+  margin: 0.5rem 0 0;
+  max-width: 68ch;
+  color: var(--nt-text-2);
+  line-height: 1.6;
+}
+
+.nt-page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.nt-nav-inner {
+  width: 100%;
+  max-width: var(--nt-container);
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.nt-nav-slot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.nt-section-title {
+  margin: 0;
+  font-size: 1.1rem;
+  letter-spacing: -0.03em;
+}
+
+.nt-loading-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 1rem 1.25rem;
+  border-radius: var(--nt-radius-md);
+  background: var(--nt-bg-elevated);
+  border: 1px solid var(--nt-border);
+  box-shadow: var(--nt-shadow-md);
+}
+
+.nt-loading-dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  background: var(--nt-teal);
+  animation: nt-pulse-dot 1.2s ease-in-out infinite;
+}

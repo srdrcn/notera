@@ -1,4 +1,0 @@
-
-reflex==0.8.27
-playwright>=1.40,<2
-whisperx>=3.3,<4

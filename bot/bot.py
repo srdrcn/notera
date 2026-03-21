@@ -19,7 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.app.meeting_runtime import (  # noqa: E402
+from backend.app.runtime.bootstrap import ensure_runtime_schema  # noqa: E402
+from backend.app.runtime.constants import (  # noqa: E402
     AUDIO_STATUS_DISABLED,
     AUDIO_STATUS_FAILED,
     AUDIO_STATUS_PENDING,
@@ -27,8 +28,9 @@ from app.app.meeting_runtime import (  # noqa: E402
     AUDIO_STATUS_RECORDING,
     POSTPROCESS_STATUS_PENDING,
     POSTPROCESS_STATUS_QUEUED,
-    ensure_runtime_schema,
-    get_db_path as runtime_db_path,
+)
+from backend.app.runtime.paths import (  # noqa: E402
+    db_path as runtime_db_path,
     get_meeting_audio_dir,
     get_meeting_audio_chunks_dir,
     get_meeting_master_audio_path,
@@ -302,14 +304,19 @@ async def has_caption_surface(page):
         logger.debug(f"Caption surface check failed: {e}")
         return False
 
-
-def get_stop_flag_path(meeting_id):
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(current_dir, f"stop_{meeting_id}.flag")
-
-
 def is_stop_requested(meeting_id):
-    return os.path.exists(get_stop_flag_path(meeting_id))
+    conn = sqlite3.connect(get_db_path())
+    try:
+        row = conn.execute(
+            "SELECT stop_requested FROM meeting WHERE id = ?",
+            (meeting_id,),
+        ).fetchone()
+        return bool(row[0]) if row is not None and row[0] is not None else False
+    except Exception as e:
+        logger.debug("Could not resolve stop flag from database for meeting %s: %s", meeting_id, e)
+        return False
+    finally:
+        conn.close()
 
 
 def is_audio_recording_enabled(meeting_id):
@@ -516,6 +523,12 @@ def probe_audio_duration_ms(audio_path):
 
 
 def trigger_postprocess_worker(meeting_id):
+    if os.getenv("NOTERA_DISABLE_INTERNAL_POSTPROCESS_TRIGGER") == "1":
+        logger.info(
+            "Skipping internal post-process trigger for meeting %s because external supervisor is enabled.",
+            meeting_id,
+        )
+        return
     worker_path = REPO_ROOT / "bot" / "postprocess_worker.py"
     try:
         update_meeting_fields(
@@ -918,11 +931,12 @@ async def leave_meeting_via_ui(page):
 
 def get_live_meeting_screenshot_path(meeting_id):
     """Return the per-user, per-meeting asset path for live screenshots."""
-    current_dir = os.path.dirname(os.path.abspath(__file__))
     db_path = get_db_path()
-    screenshot_dir = os.path.abspath(
-        os.path.join(current_dir, '..', 'app', 'assets', 'live_meeting_frames')
-    )
+    screenshot_root = os.getenv("NOTERA_LIVE_PREVIEW_ROOT")
+    if screenshot_root:
+        screenshot_dir = os.path.abspath(screenshot_root)
+    else:
+        screenshot_dir = os.path.abspath(os.path.join(REPO_ROOT, "data", "live_previews"))
     os.makedirs(screenshot_dir, exist_ok=True)
 
     user_id = "unknown"
@@ -2007,12 +2021,6 @@ async def run_bot(meeting_url, meeting_id):
             update_meeting_fields(meeting_id, ended_at=datetime.utcnow().isoformat())
             trigger_postprocess_worker(meeting_id)
             delete_live_meeting_screenshot(meeting_screenshot_path)
-            stop_flag_path = get_stop_flag_path(meeting_id)
-            if os.path.exists(stop_flag_path):
-                try:
-                    os.remove(stop_flag_path)
-                except OSError as e:
-                    logger.debug("Could not remove stop flag %s: %s", stop_flag_path, e)
             for current_signal, previous_handler in previous_handlers.items():
                 try:
                     signal.signal(current_signal, previous_handler)

@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: Build and Push Docker Images
 
 on:
   push:
@@ -14,12 +14,19 @@ concurrency:
   group: docker-image-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE_NAME: chosenwar/notera
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: backend
+            image_name: chosenwar/notera-backend
+            dockerfile: backend/Dockerfile
+          - component: frontend
+            image_name: chosenwar/notera-frontend
+            dockerfile: frontend/Dockerfile
 
     steps:
       - name: Check out the repo
@@ -41,19 +48,19 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ matrix.image_name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
 
-      - name: Build and push image
+      - name: Build and push ${{ matrix.component }} image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./${{ matrix.dockerfile }}
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}

@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -17,7 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.app.meeting_runtime import (  # noqa: E402
+from backend.app.runtime.bootstrap import ensure_runtime_schema  # noqa: E402
+from backend.app.runtime.constants import (  # noqa: E402
     AUDIO_STATUS_READY,
     POSTPROCESS_STATUS_ALIGNING,
     POSTPROCESS_STATUS_CANONICALIZING,
@@ -31,15 +33,17 @@ from app.app.meeting_runtime import (  # noqa: E402
     TRANSCRIPT_STATUS_AUTO_APPLIED,
     TRANSCRIPT_STATUS_ORIGINAL,
     TRANSCRIPT_STATUS_PENDING_REVIEW,
-    ensure_runtime_schema,
+)
+from backend.app.runtime.paths import (  # noqa: E402
     get_alignment_map_path,
-    get_db_path,
+    db_path as get_db_path,
     get_meeting_pcm_audio_path,
     get_review_clip_filename,
     get_review_clip_path,
     get_teams_canonical_path,
     get_whisperx_result_path,
     remove_review_clips_for_meeting,
+    runtime_cache_dir,
 )
 
 
@@ -63,17 +67,68 @@ FORCE_SPOKEN_LANGUAGE = os.getenv("WHISPERX_FORCE_LANGUAGE", "1").strip().lower(
     "no",
 }
 
-
-def runtime_cache_dir(name: str) -> Path:
-    path = REPO_ROOT / "bot" / "runtime_cache" / name
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def configure_runtime_environment():
     os.environ.setdefault("MPLCONFIGDIR", str(runtime_cache_dir("matplotlib")))
     os.environ.setdefault("HF_HOME", str(runtime_cache_dir("huggingface")))
     os.environ.setdefault("XDG_CACHE_HOME", str(runtime_cache_dir("xdg")))
+
+
+def configure_torch_checkpoint_compatibility():
+    try:
+        import torch
+        from omegaconf.base import ContainerMetadata
+        from omegaconf.dictconfig import DictConfig
+        from omegaconf.listconfig import ListConfig
+        from omegaconf.nodes import (
+            AnyNode,
+            BooleanNode,
+            BytesNode,
+            EnumNode,
+            FloatNode,
+            IntegerNode,
+            PathNode,
+            StringNode,
+            ValueNode,
+        )
+    except Exception:
+        return
+
+    # Older pyannote checkpoints can still rely on objects that PyTorch 2.6+
+    # no longer accepts by default when `weights_only=True`.
+    try:
+        torch.serialization.add_safe_globals(
+            [
+                ContainerMetadata,
+                DictConfig,
+                ListConfig,
+                AnyNode,
+                BooleanNode,
+                BytesNode,
+                EnumNode,
+                FloatNode,
+                IntegerNode,
+                PathNode,
+                StringNode,
+                ValueNode,
+            ]
+        )
+    except Exception:
+        pass
+
+    if getattr(torch.load, "_notera_trusted_checkpoint_patch", False):
+        return
+
+    original_torch_load = torch.load
+
+    def trusted_torch_load(*args, **kwargs):
+        # WhisperX / pyannote checkpoints used by this app are treated as
+        # trusted runtime assets; force legacy load semantics to keep
+        # PyTorch 2.6+ compatibility with older OmegaConf-based checkpoints.
+        kwargs["weights_only"] = False
+        return original_torch_load(*args, **kwargs)
+
+    trusted_torch_load._notera_trusted_checkpoint_patch = True  # type: ignore[attr-defined]
+    torch.load = trusted_torch_load
 
 
 def huggingface_model_cached(repo_id: str) -> bool:
@@ -82,11 +137,22 @@ def huggingface_model_cached(repo_id: str) -> bool:
     return snapshots_dir.exists() and any(snapshots_dir.iterdir())
 
 
+def huggingface_model_snapshot_path(repo_id: str) -> Path | None:
+    model_dir = runtime_cache_dir("huggingface") / "hub" / f"models--{repo_id.replace('/', '--')}"
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+    snapshots = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+    if not snapshots:
+        return None
+    return snapshots[-1]
+
+
 def dependency_error_message(require_whisperx: bool) -> str | None:
     if require_whisperx and importlib.util.find_spec("whisperx") is None:
         return (
             "WhisperX kurulu değil. "
-            "`conda activate teams-bot && python -m pip install -r app/requirements.txt` "
+            "`conda activate teams-bot && python -m pip install -r backend/requirements.txt` "
             "veya `python -m pip install whisperx` çalıştırın."
         )
     if require_whisperx and shutil.which("ffmpeg") is None:
@@ -320,6 +386,7 @@ def persist_json(path: Path, payload):
 
 def load_whisperx_result(audio_path: Path, meeting_id: int) -> dict:
     configure_runtime_environment()
+    configure_torch_checkpoint_compatibility()
     try:
         import whisperx
         import whisperx.alignment as whisperx_alignment
@@ -327,7 +394,7 @@ def load_whisperx_result(audio_path: Path, meeting_id: int) -> dict:
     except Exception as exc:
         raise RuntimeError(
             "WhisperX import edilemedi. "
-            "teams-bot env içinde `python -m pip install -r app/requirements.txt` çalıştırın. "
+            "teams-bot env içinde `python -m pip install -r backend/requirements.txt` çalıştırın. "
             f"Ayrıntı: {exc}"
         ) from exc
 
@@ -397,7 +464,13 @@ def load_whisperx_result(audio_path: Path, meeting_id: int) -> dict:
         return result
 
     align_model_name = TURKISH_ALIGNMENT_MODEL if language_code.startswith("tr") else None
-    align_cache_only = bool(align_model_name and huggingface_model_cached(align_model_name))
+    align_snapshot_path = (
+        huggingface_model_snapshot_path(align_model_name)
+        if align_model_name
+        else None
+    )
+    align_model_source = str(align_snapshot_path) if align_snapshot_path else align_model_name
+    align_cache_only = bool(align_snapshot_path)
     try:
         update_meeting_postprocess_status(
             meeting_id,
@@ -406,12 +479,27 @@ def load_whisperx_result(audio_path: Path, meeting_id: int) -> dict:
             None,
             "Hizalama modeli yükleniyor",
         )
-        align_model, metadata = whisperx.load_align_model(
-            language_code=language_code,
-            device="cpu",
-            model_name=align_model_name,
-            model_cache_only=align_cache_only,
-        )
+        align_kwargs = {
+            "language_code": language_code,
+            "device": "cpu",
+            "model_name": align_model_source,
+        }
+        try:
+            signature = inspect.signature(whisperx.load_align_model)
+            if "model_cache_only" in signature.parameters:
+                align_kwargs["model_cache_only"] = align_cache_only
+            if "model_dir" in signature.parameters:
+                align_kwargs["model_dir"] = str(runtime_cache_dir("huggingface"))
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            align_model, metadata = whisperx.load_align_model(**align_kwargs)
+        except TypeError as exc:
+            if "model_cache_only" not in str(exc):
+                raise
+            align_kwargs.pop("model_cache_only", None)
+            align_model, metadata = whisperx.load_align_model(**align_kwargs)
         update_meeting_postprocess_status(
             meeting_id,
             POSTPROCESS_STATUS_ALIGNING,
@@ -435,6 +523,8 @@ def load_whisperx_result(audio_path: Path, meeting_id: int) -> dict:
             )
         aligned_result["language"] = language_code
         aligned_result["_alignment_model"] = align_model_name or metadata.get("language")
+        if align_snapshot_path:
+            aligned_result["_alignment_model_source"] = str(align_snapshot_path)
         result = aligned_result
     except Exception as exc:
         logger.warning("WhisperX alignment failed, continuing with coarse segments: %s", exc)
@@ -651,6 +741,60 @@ def texts_equivalent_for_review(current_text: str, suggested_text: str) -> bool:
     if normalize_text(current_text).casefold() == normalize_text(suggested_text).casefold():
         return True
     return caption_tokens(current_text) == caption_tokens(suggested_text)
+
+
+def looks_garbled_caption(text: str) -> bool:
+    normalized = normalize_text(text)
+    tokens = caption_tokens(normalized)
+    token_count = len(tokens)
+    if token_count < 6:
+        return False
+
+    punctuation_count = sum(normalized.count(mark) for mark in ".!?…")
+    unique_ratio = len(set(tokens)) / max(token_count, 1)
+    signals = 0
+
+    if not text_ends_cleanly(normalized):
+        signals += 1
+    if punctuation_count == 0 and token_count >= 8:
+        signals += 1
+    if len(normalized) >= 80 and punctuation_count == 0:
+        signals += 1
+    if token_count >= 8 and unique_ratio <= 0.78:
+        signals += 1
+
+    return signals >= 2
+
+
+def should_force_low_confidence_review(
+    teams_text: str,
+    whisper_text: str,
+    coverage: float,
+    avg_confidence: float,
+) -> bool:
+    if not whisper_text or texts_equivalent_for_review(teams_text, whisper_text):
+        return False
+    if coverage >= 0.60 or coverage < 0.10:
+        return False
+
+    teams_tokens = caption_tokens(teams_text)
+    whisper_tokens = caption_tokens(whisper_text)
+    if len(teams_tokens) < 6 or len(whisper_tokens) < 3:
+        return False
+    if not looks_garbled_caption(teams_text):
+        return False
+
+    signals = 0
+    if sequence_ratio(teams_text, whisper_text) <= 0.45:
+        signals += 1
+    if len(teams_tokens) >= len(whisper_tokens) * 2:
+        signals += 1
+    if revision_text_score(whisper_text) >= revision_text_score(teams_text) + 12:
+        signals += 1
+    if text_ends_cleanly(whisper_text):
+        signals += 1
+
+    return signals >= 2
 
 
 def token_edit_distance(left: list[str], right: list[str]) -> int:
@@ -1241,6 +1385,10 @@ def persist_final_outputs(
                         and avg_confidence >= 0.72
                         else "sentence"
                     )
+                elif should_force_low_confidence_review(teams_text, whisper_text, coverage, avg_confidence):
+                    resolution_status = TRANSCRIPT_STATUS_PENDING_REVIEW
+                    should_create_review = True
+                    granularity = "sentence"
                 else:
                     granularity = "sentence"
             else:
@@ -1283,7 +1431,7 @@ def persist_final_outputs(
             if should_create_review:
                 clip_start_sec = None
                 clip_end_sec = None
-                if row.get("start_sec") is not None and row.get("end_sec") is not None and coverage >= 0.60:
+                if row.get("start_sec") is not None and row.get("end_sec") is not None:
                     clip_start_sec = max(float(row["start_sec"]) - 1.0, 0.0)
                     clip_end_sec = max(float(row["end_sec"]) + 1.0, clip_start_sec + 1.0)
                 review_item_id = create_review_item(
@@ -1420,8 +1568,21 @@ def process_meeting(meeting_id: int):
     clear_previous_outputs(meeting_id)
     pending_reviews = persist_final_outputs(meeting_id, final_rows, source_audio_path)
     if pending_reviews:
-        update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_REVIEW_READY, None, None, None)
-    update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_COMPLETED, None, None, None)
+        update_meeting_postprocess_status(
+            meeting_id,
+            POSTPROCESS_STATUS_REVIEW_READY,
+            None,
+            None,
+            None,
+        )
+    else:
+        update_meeting_postprocess_status(
+            meeting_id,
+            POSTPROCESS_STATUS_COMPLETED,
+            None,
+            None,
+            None,
+        )
 
 
 def main():

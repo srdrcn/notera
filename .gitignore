@@ -26,17 +26,11 @@ pip-wheel-metadata/
 
 # Local app state
 .states/
-app/.states/
-app/.web/
-app/alembic.ini
-app/alembic/
-app/assets/external/
-app/assets/live_meeting_frames/
-app/assets/meeting_audio/
-app/assets/review_audio_clips/
-app/reflex.db
-app/app/reflex.db
+app/
+data/
 *.db
+*.db-shm
+*.db-wal
 
 # Bot runtime artifacts
 bot/*.log
@@ -49,8 +43,12 @@ bot/runtime_cache/
 # Build / export artifacts
 frontend.zip
 backend.zip
-app/frontend.zip
-app/backend.zip
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
 
 # Secrets / env
 .env
