@@ -41,6 +41,8 @@ export function LoginPage() {
 
   async function onSubmit(values: AuthForm) {
     await activeMutation.mutateAsync(values);
+    const state = location.state as { from?: string } | null;
+    navigate(state?.from ?? "/dashboard", { replace: true });
   }
 
   return (
