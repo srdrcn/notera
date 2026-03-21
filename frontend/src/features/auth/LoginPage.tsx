@@ -7,9 +7,8 @@ import { z } from "zod";
 import { useSession } from "../../app/session";
 import { useLogin, useRegister } from "./useAuthMutations";
 
-
 const authSchema = z.object({
-  email: z.email("Geçerli bir e-posta adresi girin."),
+  email: z.string().trim().email("Geçerli bir e-posta adresi girin."),
 });
 
 type AuthForm = z.infer<typeof authSchema>;
@@ -40,7 +39,9 @@ export function LoginPage() {
   const activeMutation = mode === "login" ? login : register;
 
   async function onSubmit(values: AuthForm) {
-    await activeMutation.mutateAsync(values);
+    await activeMutation.mutateAsync({
+      email: values.email.trim().toLowerCase(),
+    });
     const state = location.state as { from?: string } | null;
     navigate(state?.from ?? "/dashboard", { replace: true });
   }

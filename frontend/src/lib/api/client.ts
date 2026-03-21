@@ -43,6 +43,11 @@ export async function apiRequest<T = unknown>(
       const payload = await response.json();
       if (typeof payload?.detail === "string") {
         message = payload.detail;
+      } else if (Array.isArray(payload?.detail) && payload.detail.length > 0) {
+        const firstDetail = payload.detail[0];
+        if (typeof firstDetail?.msg === "string") {
+          message = firstDetail.msg;
+        }
       }
     } else {
       const text = await response.text();

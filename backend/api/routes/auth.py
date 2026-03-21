@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from backend.api.deps import current_user
 from backend.config import get_settings
 from backend.db.session import get_db
-from backend.schemas.auth import EmailAuthRequest, SessionOut, UserOut
+from backend.schemas.auth import EmailAuthRequest, SessionOut, UserOut, normalize_email_input
 from backend.services.auth import login_or_register, logout_cookie
 
 
@@ -28,15 +28,16 @@ def _write_session_cookie(response: Response, token: str) -> None:
 
 @router.post("/register", response_model=SessionOut)
 def register(
-    payload: EmailAuthRequest,
     request: Request,
     response: Response,
+    payload: EmailAuthRequest | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
     try:
+        email = normalize_email_input(payload.email if payload else None)
         result = login_or_register(
             db,
-            payload.email,
+            email,
             register=True,
             user_agent=request.headers.get("user-agent"),
             ip_address=request.client.host if request.client else None,
@@ -50,15 +51,16 @@ def register(
 
 @router.post("/login", response_model=SessionOut)
 def login(
-    payload: EmailAuthRequest,
     request: Request,
     response: Response,
+    payload: EmailAuthRequest | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
     try:
+        email = normalize_email_input(payload.email if payload else None)
         result = login_or_register(
             db,
-            payload.email,
+            email,
             register=False,
             user_agent=request.headers.get("user-agent"),
             ip_address=request.client.host if request.client else None,

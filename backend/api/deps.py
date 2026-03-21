@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import Cookie, Depends, HTTPException, status
+from fastapi import Cookie, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from backend.config import get_settings

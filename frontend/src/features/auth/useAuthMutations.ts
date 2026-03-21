@@ -10,12 +10,19 @@ type AuthPayload = {
 };
 
 
+function normalizeAuthPayload(payload: AuthPayload): AuthPayload {
+  return {
+    email: payload.email.trim().toLowerCase(),
+  };
+}
+
+
 export function useRegister() {
   return useMutation({
     mutationFn: (payload: AuthPayload) =>
       apiRequest<SessionResponse>("/api/auth/register", {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify(normalizeAuthPayload(payload)),
       }),
     onSuccess: async (response) => {
       queryClient.setQueryData(["session"], response.user);
@@ -29,7 +36,7 @@ export function useLogin() {
     mutationFn: (payload: AuthPayload) =>
       apiRequest<SessionResponse>("/api/auth/login", {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify(normalizeAuthPayload(payload)),
       }),
     onSuccess: async (response) => {
       queryClient.setQueryData(["session"], response.user);
