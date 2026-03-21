@@ -49,6 +49,7 @@ type TranscriptRowProps = {
   isOpen: boolean;
   isAudioActive: boolean;
   isAudioPlaying: boolean;
+  audioSeekEnabled: boolean;
   onOpen: (rowId: number) => void;
   onSeekToTime: (timeSec: number) => void;
   registerRowElement: (rowId: number, node: HTMLElement | null) => void;
@@ -60,13 +61,14 @@ function TranscriptRow({
   isOpen,
   isAudioActive,
   isAudioPlaying,
+  audioSeekEnabled,
   onOpen,
   onSeekToTime,
   registerRowElement,
 }: TranscriptRowProps) {
   const review = row.review;
   const isClickable = Boolean(review);
-  const seekTimeSec = row.start_sec ?? row.end_sec ?? null;
+  const seekTimeSec = audioSeekEnabled ? row.start_sec ?? row.end_sec ?? null : null;
 
   const classNames = [
     "nt-stream-item",
@@ -194,7 +196,16 @@ function TranscriptRow({
 
 
 function findActiveTranscriptId(rows: TranscriptEntry[], currentTime: number) {
-  const timedRows = rows.filter((row) => row.start_sec !== null);
+  const timedRows = rows
+    .filter((row) => row.start_sec !== null || row.end_sec !== null)
+    .sort((left, right) => {
+      const leftStart = left.start_sec ?? left.end_sec ?? Number.POSITIVE_INFINITY;
+      const rightStart = right.start_sec ?? right.end_sec ?? Number.POSITIVE_INFINITY;
+      if (leftStart !== rightStart) {
+        return leftStart - rightStart;
+      }
+      return left.id - right.id;
+    });
   if (timedRows.length === 0) {
     return null;
   }
@@ -212,6 +223,45 @@ function findActiveTranscriptId(rows: TranscriptEntry[], currentTime: number) {
   }
 
   return null;
+}
+
+
+function hasReliableTranscriptAudioSync(rows: TranscriptEntry[], durationSec: number) {
+  if (!Number.isFinite(durationSec) || durationSec <= 0) {
+    return true;
+  }
+
+  const timedRows = rows.filter((row) => row.start_sec !== null || row.end_sec !== null);
+  if (timedRows.length < 2) {
+    return true;
+  }
+
+  const rowTimes = timedRows
+    .map((row) => row.end_sec ?? row.start_sec ?? null)
+    .filter((value): value is number => value !== null);
+  if (rowTimes.length === 0) {
+    return true;
+  }
+
+  const earliestStart = Math.min(
+    ...timedRows.map((row) => row.start_sec ?? row.end_sec ?? Number.POSITIVE_INFINITY),
+  );
+  const latestEnd = Math.max(...rowTimes);
+  const overflowCount = timedRows.filter((row) => {
+    const rowEnd = row.end_sec ?? row.start_sec ?? 0;
+    return rowEnd > durationSec + 1.5;
+  }).length;
+
+  if (earliestStart > durationSec + 1.5) {
+    return false;
+  }
+  if (latestEnd > durationSec + 2.5) {
+    return false;
+  }
+  if (overflowCount > Math.max(1, Math.floor(timedRows.length * 0.2))) {
+    return false;
+  }
+  return true;
 }
 
 
@@ -322,6 +372,7 @@ export function TranscriptPage() {
   const [openReviewRowId, setOpenReviewRowId] = useState<number | null>(null);
   const [activeAudioRowId, setActiveAudioRowId] = useState<number | null>(null);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+  const [audioDurationSec, setAudioDurationSec] = useState(0);
   const [stopRequested, setStopRequested] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const streamBodyRef = useRef<HTMLDivElement | null>(null);
@@ -364,16 +415,25 @@ export function TranscriptPage() {
   }, [openReviewRowId]);
 
   useEffect(() => {
+    setAudioDurationSec(0);
+  }, [snapshotData?.audio.audio_url]);
+
+  useEffect(() => {
     const audioElement = audioRef.current;
     if (!audioElement || !snapshotData) {
       setActiveAudioRowId(null);
       setIsAudioPlaying(false);
       return;
     }
+    if (!hasReliableTranscriptAudioSync(snapshotData.transcripts, audioDurationSec || audioElement.duration)) {
+      setActiveAudioRowId(null);
+      setIsAudioPlaying(!audioElement.paused && !audioElement.ended);
+      return;
+    }
     const nextActiveRowId = findActiveTranscriptId(snapshotData.transcripts, audioElement.currentTime);
     setActiveAudioRowId((currentValue) => (currentValue === nextActiveRowId ? currentValue : nextActiveRowId));
     setIsAudioPlaying(!audioElement.paused && !audioElement.ended);
-  }, [snapshotData]);
+  }, [audioDurationSec, snapshotData]);
 
   useEffect(() => {
     if (activeAudioRowId === null) {
@@ -441,8 +501,18 @@ export function TranscriptPage() {
   const hasSummaryActions =
     data.actions.can_apply_all_reviews || data.actions.can_merge_duplicate_transcripts;
   const stopButtonBusy = stopRequested || stopMeeting.isPending;
+  const isTranscriptAudioSyncReliable = hasReliableTranscriptAudioSync(data.transcripts, audioDurationSec);
+  const effectiveActiveAudioRowId = isTranscriptAudioSyncReliable ? activeAudioRowId : null;
+  const audioSyncNotice =
+    audioDurationSec > 0 && !isTranscriptAudioSyncReliable
+      ? "Bu kayıtta ses süresi transcript zamanlarıyla örtüşmüyor. Satır vurgusu ve satırdan oynatma kapatıldı."
+      : null;
 
   function syncAudioTranscript(currentTime: number) {
+    if (!isTranscriptAudioSyncReliable) {
+      setActiveAudioRowId(null);
+      return;
+    }
     const nextActiveRowId = findActiveTranscriptId(data.transcripts, currentTime);
     setActiveAudioRowId((currentValue) => (currentValue === nextActiveRowId ? currentValue : nextActiveRowId));
   }
@@ -456,6 +526,10 @@ export function TranscriptPage() {
   }
 
   function seekAudioToTime(timeSec: number) {
+    if (!isTranscriptAudioSyncReliable) {
+      return;
+    }
+
     const audioElement = audioRef.current;
     if (!audioElement) {
       return;
@@ -607,16 +681,34 @@ export function TranscriptPage() {
                   ref={audioRef}
                   preload="metadata"
                   src={buildApiUrl(data.audio.audio_url)}
-                  onLoadedMetadata={(event) => syncAudioTranscript(event.currentTarget.currentTime)}
+                  onLoadedMetadata={(event) => {
+                    setAudioDurationSec(
+                      Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0
+                        ? event.currentTarget.duration
+                        : 0,
+                    );
+                    syncAudioTranscript(event.currentTarget.currentTime);
+                  }}
+                  onDurationChange={(event) => {
+                    setAudioDurationSec(
+                      Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0
+                        ? event.currentTarget.duration
+                        : 0,
+                    );
+                  }}
                   onPlay={(event) => {
                     setIsAudioPlaying(true);
                     syncAudioTranscript(event.currentTarget.currentTime);
                   }}
                   onPause={() => setIsAudioPlaying(false)}
-                  onEnded={() => setIsAudioPlaying(false)}
+                  onEnded={(event) => {
+                    setIsAudioPlaying(false);
+                    syncAudioTranscript(event.currentTarget.currentTime);
+                  }}
                   onSeeked={(event) => syncAudioTranscript(event.currentTarget.currentTime)}
                   onTimeUpdate={(event) => syncAudioTranscript(event.currentTarget.currentTime)}
                 />
+                {audioSyncNotice ? <p className="nt-audio-sync-note">{audioSyncNotice}</p> : null}
               </div>
             ) : (
               <div className="nt-empty-state">
@@ -691,8 +783,9 @@ export function TranscriptPage() {
           {data.transcripts.map((row) => (
             <TranscriptRow
               key={row.id}
-              isAudioActive={row.id === activeAudioRowId}
-              isAudioPlaying={isAudioPlaying && row.id === activeAudioRowId}
+              audioSeekEnabled={isTranscriptAudioSyncReliable}
+              isAudioActive={row.id === effectiveActiveAudioRowId}
+              isAudioPlaying={isAudioPlaying && row.id === effectiveActiveAudioRowId}
               isOpen={row.id === openReviewRowId}
               onOpen={setOpenReviewRowId}
               onSeekToTime={seekAudioToTime}

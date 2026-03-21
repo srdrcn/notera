@@ -224,9 +224,14 @@ def _caption_duplicate_reason(cursor, meeting_id, speaker, text, observed_at, sl
             and previous_slot_index is not None
             and int(previous_slot_index) == int(slot_index)
             and previous_exact == current_exact
-            and revision_no <= previous_revision
         ):
-            return "duplicate_slot"
+            return "duplicate_slot_exact"
+
+        if (
+            delta_seconds <= CAPTION_MEETING_DEDUPE_WINDOW_SECONDS
+            and previous_exact == current_exact
+        ):
+            return "duplicate_recent_exact"
 
         if (
             delta_seconds <= CAPTION_MEETING_DEDUPE_WINDOW_SECONDS
@@ -766,7 +771,10 @@ class MeetingAudioChunkWriter:
         self.mime_type = ""
         self.format = "webm"
         self.accept_writes = True
+        self.chunk_dir = get_meeting_audio_chunks_dir(self.meeting_id)
         self.aggregate_path = get_meeting_audio_dir(self.meeting_id) / "recording.part"
+        for stale_chunk in self.chunk_dir.glob("chunk_*"):
+            stale_chunk.unlink(missing_ok=True)
         self.aggregate_path.unlink(missing_ok=True)
 
     def save_chunk(self, payload):
@@ -785,13 +793,11 @@ class MeetingAudioChunkWriter:
         self.chunk_index += 1
         self.mime_type = mime_type or self.mime_type
         self.format = self._format_from_mime(self.mime_type)
+        chunk_path = self.chunk_dir / f"chunk_{self.chunk_index:05d}.{self.format}"
+        chunk_path.write_bytes(raw_bytes)
+        self.chunk_paths.append(chunk_path)
         with self.aggregate_path.open("ab") as aggregate_file:
             aggregate_file.write(raw_bytes)
-        if DEBUG_ARTIFACTS_ENABLED:
-            chunk_dir = get_meeting_audio_chunks_dir(self.meeting_id)
-            chunk_path = chunk_dir / f"chunk_{self.chunk_index:05d}.{self.format}"
-            chunk_path.write_bytes(raw_bytes)
-            self.chunk_paths.append(chunk_path)
         logger.info(
             "Saved audio chunk for meeting %s: part #%s (%s bytes)",
             self.meeting_id,
@@ -801,13 +807,112 @@ class MeetingAudioChunkWriter:
         return True
 
     def finalize(self):
-        if not self.aggregate_path.exists() or self.aggregate_path.stat().st_size <= 0:
+        master_path = get_meeting_master_audio_path(self.meeting_id, self.format)
+        pcm_path = get_meeting_pcm_audio_path(self.meeting_id)
+        finalized = False
+        if self._should_prefer_aggregate_stream() and self.aggregate_path.exists() and self.aggregate_path.stat().st_size > 0:
+            shutil.copy2(self.aggregate_path, master_path)
+            finalized = True
+        elif self.chunk_paths:
+            finalized = self._finalize_from_chunk_concat(master_path)
+        elif self.aggregate_path.exists() and self.aggregate_path.stat().st_size > 0:
+            shutil.copy2(self.aggregate_path, master_path)
+            finalized = True
+
+        if not finalized:
             raise RuntimeError("no audio chunks were captured")
 
-        master_path = get_meeting_master_audio_path(self.meeting_id, self.format)
-        shutil.copy2(self.aggregate_path, master_path)
-        pcm_path = get_meeting_pcm_audio_path(self.meeting_id)
-        pcm_result = subprocess.run(
+        pcm_result = self._build_pcm_copy(master_path, pcm_path)
+        if pcm_result.returncode != 0 and self.chunk_paths and not self._should_prefer_aggregate_stream():
+            if self._finalize_from_chunk_concat(master_path):
+                pcm_result = self._build_pcm_copy(master_path, pcm_path)
+
+        if pcm_result.returncode != 0 and self.chunk_paths and self._should_prefer_aggregate_stream():
+            logger.warning(
+                "Could not decode aggregate audio stream for meeting %s: %s",
+                self.meeting_id,
+                pcm_result.stderr.strip() or "ffmpeg conversion failed",
+            )
+            if self._finalize_from_chunk_concat(master_path):
+                pcm_result = self._build_pcm_copy(master_path, pcm_path)
+
+        if pcm_result.returncode != 0:
+            logger.warning(
+                "Could not create PCM audio copy for meeting %s: %s",
+                self.meeting_id,
+                pcm_result.stderr.strip() or "ffmpeg conversion failed",
+            )
+        logger.info("Finalized master audio for meeting %s at %s", self.meeting_id, master_path)
+        duration_ms = probe_audio_duration_ms(pcm_path) if pcm_path.exists() else None
+        if duration_ms is None:
+            duration_ms = probe_audio_duration_ms(master_path)
+        return master_path, pcm_path if pcm_path.exists() else None, self.format, duration_ms
+
+    def stop_accepting_writes(self):
+        self.accept_writes = False
+
+    def _should_prefer_aggregate_stream(self):
+        return self.format in {"webm", "ogg"}
+
+    def _finalize_from_chunk_concat(self, master_path):
+        if not self.chunk_paths:
+            return False
+        concat_manifest_path = self.chunk_dir / "concat_inputs.txt"
+        concat_manifest_path.write_text(
+            "".join(f"file '{self._escape_concat_path(path)}'\n" for path in self.chunk_paths),
+            encoding="utf-8",
+        )
+        concat_copy_result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_manifest_path),
+                "-c",
+                "copy",
+                str(master_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if concat_copy_result.returncode != 0:
+            logger.warning(
+                "Could not concat audio chunks with stream copy for meeting %s: %s",
+                self.meeting_id,
+                concat_copy_result.stderr.strip() or "ffmpeg concat copy failed",
+            )
+            concat_transcode_result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_manifest_path),
+                    *self._master_transcode_args(),
+                    str(master_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if concat_transcode_result.returncode != 0:
+                logger.warning(
+                    "Could not concat audio chunks with transcode for meeting %s: %s",
+                    self.meeting_id,
+                    concat_transcode_result.stderr.strip() or "audio chunk concat failed",
+                )
+                return False
+        return True
+
+    @staticmethod
+    def _build_pcm_copy(master_path, pcm_path):
+        return subprocess.run(
             [
                 "ffmpeg",
                 "-y",
@@ -822,18 +927,19 @@ class MeetingAudioChunkWriter:
             capture_output=True,
             text=True,
         )
-        if pcm_result.returncode != 0:
-            logger.warning(
-                "Could not create PCM audio copy for meeting %s: %s",
-                self.meeting_id,
-                pcm_result.stderr.strip() or "ffmpeg conversion failed",
-            )
-        logger.info("Finalized master audio for meeting %s at %s", self.meeting_id, master_path)
-        duration_ms = probe_audio_duration_ms(master_path)
-        return master_path, pcm_path if pcm_path.exists() else None, self.format, duration_ms
 
-    def stop_accepting_writes(self):
-        self.accept_writes = False
+    def _master_transcode_args(self):
+        if self.format == "wav":
+            return ["-vn", "-c:a", "pcm_s16le"]
+        if self.format == "m4a":
+            return ["-vn", "-c:a", "aac", "-b:a", "128k"]
+        if self.format == "ogg":
+            return ["-vn", "-c:a", "libopus"]
+        return ["-vn", "-c:a", "libopus"]
+
+    @staticmethod
+    def _escape_concat_path(path):
+        return str(path).replace("'", "'\\''")
 
     @staticmethod
     def _format_from_mime(mime_type):
@@ -2248,10 +2354,16 @@ async def run_bot(meeting_url, meeting_id):
                                 and _texts_should_merge(previous.get("text"), text)
                             )
                             if same_caption_stream:
-                                if make_caption_fingerprint(previous.get("speaker"), previous.get("text")) != make_caption_fingerprint(speaker, text):
+                                next_speaker = speaker
+                                if normalize_caption_text(next_speaker).casefold() in {"", "unknown"}:
+                                    next_speaker = previous.get("speaker") or speaker
+                                next_text = _choose_preferred_caption_text(previous.get("text"), text)
+                                previous_exact = make_caption_fingerprint(previous.get("speaker"), previous.get("text"))
+                                next_exact = make_caption_fingerprint(next_speaker, next_text)
+                                if previous_exact != next_exact:
                                     previous["revision_no"] = previous.get("revision_no", 0) + 1
-                                    previous["speaker"] = speaker
-                                    previous["text"] = _choose_preferred_caption_text(previous.get("text"), text)
+                                    previous["speaker"] = next_speaker
+                                    previous["text"] = next_text
                                     previous["last_updated_at"] = current_dt
                                     previous["last_seen"] = now
                                     previous["missing_polls"] = 0
@@ -2266,8 +2378,8 @@ async def run_bot(meeting_url, meeting_id):
                                     )
                                     await persist_caption_event(previous)
                                     continue
-                                previous["speaker"] = speaker
-                                previous["text"] = _choose_preferred_caption_text(previous.get("text"), text)
+                                previous["speaker"] = next_speaker
+                                previous["text"] = next_text
                                 previous["last_updated_at"] = current_dt
                                 previous["last_seen"] = now
                                 previous["missing_polls"] = 0

@@ -399,6 +399,13 @@
   line-height: 1.45;
 }
 
+.nt-audio-sync-note {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: color-mix(in srgb, var(--nt-warning) 78%, white 12%);
+}
+
 .nt-audio-native {
   display: none;
 }

@@ -196,6 +196,8 @@ TRANSCRIPT_DUPLICATE_MERGE_WINDOW_SECONDS = 12
 TRANSCRIPT_DUPLICATE_OVERLAP_WINDOW_SECONDS = 15
 SNAPSHOT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS = 180
 SNAPSHOT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS = 96
+LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS = 90
+LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS = 64
 
 
 def _merge_transcript_pair_if_candidate(
@@ -417,10 +419,134 @@ class LiveTranscriptRow:
     speaker: str
     text: str
     timestamp: str
+    observed_at: datetime | None = None
+    slot_index: int | None = None
+    revision_no: int | None = None
     start_sec: float | None = None
     end_sec: float | None = None
     resolution_status: str = "original"
     auto_corrected: bool = False
+
+
+def _merge_live_rows(previous: LiveTranscriptRow, current: LiveTranscriptRow) -> None:
+    merged_text = _merge_transcript_text_pair(previous.text, current.text)
+    if merged_text:
+        previous_tokens = _transcript_tokens(previous.text)
+        current_tokens = _transcript_tokens(current.text)
+        shared_prefix = _fuzzy_common_prefix_token_count(previous_tokens, current_tokens) if previous_tokens and current_tokens else 0
+        if (
+            shared_prefix == min(len(previous_tokens), len(current_tokens))
+            and _transcript_revision_score(current.text) > _transcript_revision_score(merged_text)
+        ):
+            merged_text = _choose_preferred_transcript_text(merged_text, current.text)
+    previous.text = merged_text or _choose_preferred_transcript_text(
+        previous.text,
+        current.text,
+    )
+    previous.timestamp = current.timestamp or previous.timestamp
+    previous.id = current.id
+    previous.observed_at = current.observed_at or previous.observed_at
+    previous.slot_index = current.slot_index if current.slot_index is not None else previous.slot_index
+    previous.revision_no = current.revision_no if current.revision_no is not None else previous.revision_no
+
+
+def _is_prefix_style_live_revision(existing_text: str | None, new_text: str | None) -> bool:
+    existing_tokens = _transcript_tokens(existing_text)
+    new_tokens = _transcript_tokens(new_text)
+    if not existing_tokens or not new_tokens:
+        return False
+    shared_prefix = _fuzzy_common_prefix_token_count(existing_tokens, new_tokens)
+    shorter_length = min(len(existing_tokens), len(new_tokens))
+    return shorter_length >= 3 and shared_prefix == shorter_length
+
+
+def _find_live_row_merge_index(rows: list[LiveTranscriptRow], current: LiveTranscriptRow) -> int | None:
+    best_index = None
+    best_score = None
+    current_fingerprint = _transcript_equivalence_fingerprint(current.text)
+
+    for index in range(len(rows) - 1, max(-1, len(rows) - LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS - 1), -1):
+        previous = rows[index]
+        if not _compatible_transcript_speakers(previous.speaker, current.speaker):
+            continue
+
+        delta_seconds = (
+            abs((current.observed_at - previous.observed_at).total_seconds())
+            if previous.observed_at is not None and current.observed_at is not None
+            else 999.0
+        )
+        if delta_seconds > LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS:
+            continue
+
+        score = None
+        previous_fingerprint = _transcript_equivalence_fingerprint(previous.text)
+        merged_text = _merge_transcript_text_pair(previous.text, current.text)
+        same_slot = (
+            previous.slot_index is not None
+            and current.slot_index is not None
+            and previous.slot_index == current.slot_index
+        )
+        revision_continues = (
+            previous.revision_no is None
+            or current.revision_no is None
+            or current.revision_no >= previous.revision_no
+        )
+
+        if same_slot and revision_continues and merged_text:
+            score = 300
+        elif same_slot and revision_continues and previous_fingerprint == current_fingerprint:
+            score = 260
+        elif (
+            not same_slot
+            and _is_prefix_style_live_revision(previous.text, current.text)
+        ):
+            score = 160
+        elif (previous.slot_index is None or current.slot_index is None) and merged_text:
+            score = 180
+        elif previous_fingerprint == current_fingerprint:
+            score = 120
+
+        if score is None:
+            continue
+
+        if best_score is None or score > best_score:
+            best_index = index
+            best_score = score
+
+    return best_index
+
+
+def _defensively_filter_live_rows(rows: list[LiveTranscriptRow]) -> list[LiveTranscriptRow]:
+    kept: list[LiveTranscriptRow] = []
+    for row in rows:
+        fingerprint = _transcript_equivalence_fingerprint(row.text)
+        if not fingerprint:
+            kept.append(row)
+            continue
+
+        duplicate_index = None
+        for index in range(len(kept) - 1, max(-1, len(kept) - LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS - 1), -1):
+            previous = kept[index]
+            if not _compatible_transcript_speakers(previous.speaker, row.speaker):
+                continue
+            if _transcript_equivalence_fingerprint(previous.text) != fingerprint:
+                continue
+            delta_seconds = (
+                abs((row.observed_at - previous.observed_at).total_seconds())
+                if previous.observed_at is not None and row.observed_at is not None
+                else 999.0
+            )
+            if delta_seconds <= LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS:
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            kept.append(row)
+            continue
+
+        _merge_live_rows(kept[duplicate_index], row)
+
+    return kept
 
 
 def _collapse_live_caption_events(events: list[TeamsCaptionEvent]) -> list[LiveTranscriptRow]:
@@ -435,15 +561,16 @@ def _collapse_live_caption_events(events: list[TeamsCaptionEvent]) -> list[LiveT
             speaker=event.speaker_name,
             text=normalized_text,
             timestamp=timestamp,
+            observed_at=event.observed_at,
+            slot_index=getattr(event, "slot_index", None),
+            revision_no=getattr(event, "revision_no", None),
         )
-        if rows and _compatible_transcript_speakers(rows[-1].speaker, row.speaker):
-            if _transcript_texts_should_merge(rows[-1].text, row.text):
-                rows[-1].text = _merge_transcript_text_pair(rows[-1].text, row.text) or rows[-1].text
-                rows[-1].timestamp = row.timestamp or rows[-1].timestamp
-                rows[-1].id = row.id
-                continue
+        merge_index = _find_live_row_merge_index(rows, row)
+        if merge_index is not None:
+            _merge_live_rows(rows[merge_index], row)
+            continue
         rows.append(row)
-    return rows
+    return _defensively_filter_live_rows(rows)
 
 
 def speaker_initials(name: str) -> str:
