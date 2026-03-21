@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import io
 
-from backend.app.schemas.transcript import MeetingSnapshotOut
+from backend.schemas.transcript import MeetingSnapshotOut
 
 
 def export_txt(snapshot: MeetingSnapshotOut) -> str:

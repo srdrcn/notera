@@ -5,15 +5,15 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 
-from backend.app.db.session import engine
-from backend.app.models import Base
-from backend.app.runtime.constants import (
+from backend.db.session import engine
+from backend.models import Base
+from backend.runtime.constants import (
     AUDIO_STATUS_PENDING,
     POSTPROCESS_STATUS_PENDING,
     REVIEW_STATUS_PENDING,
     TRANSCRIPT_STATUS_ORIGINAL,
 )
-from backend.app.runtime.paths import db_path
+from backend.runtime.paths import db_path
 
 
 def _connect(target: Path) -> sqlite3.Connection:

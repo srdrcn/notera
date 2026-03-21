@@ -5,14 +5,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.app.api.routes.auth import router as auth_router
-from backend.app.api.routes.exports import router as exports_router
-from backend.app.api.routes.media import router as media_router
-from backend.app.api.routes.meetings import router as meetings_router
-from backend.app.api.routes.reviews import router as reviews_router
-from backend.app.config import get_settings
-from backend.app.orchestration.supervisor import supervisor
-from backend.app.runtime.bootstrap import ensure_schema
+from backend.api.routes.auth import router as auth_router
+from backend.api.routes.exports import router as exports_router
+from backend.api.routes.media import router as media_router
+from backend.api.routes.meetings import router as meetings_router
+from backend.api.routes.reviews import router as reviews_router
+from backend.config import get_settings
+from backend.orchestration.supervisor import supervisor
+from backend.runtime.bootstrap import ensure_schema
 
 
 settings = get_settings()

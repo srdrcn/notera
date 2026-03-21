@@ -4,10 +4,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.app.api.deps import owned_user
-from backend.app.db.session import get_db
-from backend.app.models import Meeting, Transcript, TranscriptReviewItem
-from backend.app.services.reviews import (
+from backend.api.deps import owned_user
+from backend.db.session import get_db
+from backend.models import Meeting, Transcript, TranscriptReviewItem
+from backend.services.reviews import (
     apply_all_reviews,
     apply_review,
     duplicate_merge_candidate_count,

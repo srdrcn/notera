@@ -8,8 +8,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
-from backend.app.models import Meeting, MeetingAudioAsset, TeamsCaptionEvent, Transcript, TranscriptReviewItem
-from backend.app.runtime.constants import (
+from backend.models import Meeting, MeetingAudioAsset, TeamsCaptionEvent, Transcript, TranscriptReviewItem
+from backend.runtime.constants import (
     AUDIO_STATUS_DISABLED,
     AUDIO_STATUS_FAILED,
     POSTPROCESS_STATUS_ALIGNING,
@@ -17,8 +17,8 @@ from backend.app.runtime.constants import (
     POSTPROCESS_STATUS_REVIEW_READY,
     POSTPROCESS_STATUS_TRANSCRIBING,
 )
-from backend.app.runtime.paths import get_meeting_pcm_audio_path, preview_path
-from backend.app.schemas.transcript import (
+from backend.runtime.paths import get_meeting_pcm_audio_path, preview_path
+from backend.schemas.transcript import (
     MeetingSnapshotOut,
     ReviewOut,
     SnapshotActionsOut,

@@ -3,10 +3,10 @@ from __future__ import annotations
 from fastapi import Cookie, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from backend.app.config import get_settings
-from backend.app.db.session import get_db
-from backend.app.models import User
-from backend.app.services.auth import authenticate_cookie
+from backend.config import get_settings
+from backend.db.session import get_db
+from backend.models import User
+from backend.services.auth import authenticate_cookie
 
 
 settings = get_settings()

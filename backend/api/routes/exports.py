@@ -4,17 +4,17 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import PlainTextResponse, Response
 from sqlalchemy.orm import Session
 
-from backend.app.api.deps import owned_user
-from backend.app.db.session import get_db
-from backend.app.repositories.meetings import (
+from backend.api.deps import owned_user
+from backend.db.session import get_db
+from backend.repositories.meetings import (
     caption_events_for_meeting,
     get_owned_meeting,
     latest_audio_asset,
     review_items_for_transcripts,
     transcripts_for_meeting,
 )
-from backend.app.services.exports import export_csv, export_txt
-from backend.app.services.transcript_logic import build_snapshot
+from backend.services.exports import export_csv, export_txt
+from backend.services.transcript_logic import build_snapshot
 
 
 router = APIRouter(prefix="/api/meetings", tags=["exports"])

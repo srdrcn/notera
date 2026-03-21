@@ -35,4 +35,4 @@ ENV NOTERA_DB_PATH=/data/notera.db \
 EXPOSE 8000
 
 ENTRYPOINT ["tini", "--"]
-CMD ["python", "-m", "backend.app"]
+CMD ["python", "-m", "backend"]

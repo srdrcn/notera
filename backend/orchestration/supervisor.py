@@ -11,10 +11,10 @@ from datetime import datetime
 
 from sqlalchemy import select
 
-from backend.app.config import get_settings
-from backend.app.db.session import db_session
-from backend.app.models import Meeting, WorkerRun
-from backend.app.runtime.constants import POSTPROCESS_STATUS_FAILED, POSTPROCESS_STATUS_PENDING
+from backend.config import get_settings
+from backend.db.session import db_session
+from backend.models import Meeting, WorkerRun
+from backend.runtime.constants import POSTPROCESS_STATUS_FAILED, POSTPROCESS_STATUS_PENDING
 
 
 logger = logging.getLogger("notera.supervisor")

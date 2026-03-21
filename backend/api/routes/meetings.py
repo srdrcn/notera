@@ -3,20 +3,20 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from backend.app.api.deps import owned_user
-from backend.app.db.session import get_db
-from backend.app.orchestration.supervisor import supervisor
-from backend.app.repositories.meetings import (
+from backend.api.deps import owned_user
+from backend.db.session import get_db
+from backend.orchestration.supervisor import supervisor
+from backend.repositories.meetings import (
     caption_events_for_meeting,
     get_owned_meeting,
     latest_audio_asset,
     review_items_for_transcripts,
     transcripts_for_meeting,
 )
-from backend.app.schemas.meeting import CreateMeetingRequest, MeetingSummaryOut
-from backend.app.schemas.transcript import MeetingSnapshotOut
-from backend.app.services.meetings import create_meeting, delete_meeting, list_meeting_summaries, meeting_summary
-from backend.app.services.transcript_logic import build_snapshot
+from backend.schemas.meeting import CreateMeetingRequest, MeetingSummaryOut
+from backend.schemas.transcript import MeetingSnapshotOut
+from backend.services.meetings import create_meeting, delete_meeting, list_meeting_summaries, meeting_summary
+from backend.services.transcript_logic import build_snapshot
 
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])

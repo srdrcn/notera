@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import (
+from backend.models import (
     Meeting,
     MeetingAudioAsset,
     TeamsCaptionEvent,

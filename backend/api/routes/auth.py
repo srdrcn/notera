@@ -3,11 +3,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
-from backend.app.api.deps import current_user
-from backend.app.config import get_settings
-from backend.app.db.session import get_db
-from backend.app.schemas.auth import EmailAuthRequest, SessionOut, UserOut
-from backend.app.services.auth import login_or_register, logout_cookie
+from backend.api.deps import current_user
+from backend.config import get_settings
+from backend.db.session import get_db
+from backend.schemas.auth import EmailAuthRequest, SessionOut, UserOut
+from backend.services.auth import login_or_register, logout_cookie
 
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])

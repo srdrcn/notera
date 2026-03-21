@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from backend.app.config import get_settings
+from backend.config import get_settings
 
 
 def _ensure_dir(path: Path) -> Path:

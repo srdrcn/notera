@@ -1,1 +1,0 @@
-"""Notera backend package."""

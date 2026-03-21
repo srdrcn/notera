@@ -5,15 +5,15 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.app.models import Meeting, Transcript, TranscriptReviewItem
-from backend.app.runtime.constants import (
+from backend.models import Meeting, Transcript, TranscriptReviewItem
+from backend.runtime.constants import (
     REVIEW_STATUS_ACCEPTED,
     REVIEW_STATUS_PENDING,
     REVIEW_STATUS_REJECTED,
     TRANSCRIPT_STATUS_ACCEPTED,
     TRANSCRIPT_STATUS_REJECTED,
 )
-from backend.app.services.transcript_logic import (
+from backend.services.transcript_logic import (
     _collect_duplicate_transcript_merge_candidates,
     merge_duplicate_transcripts_after_reviews,
 )

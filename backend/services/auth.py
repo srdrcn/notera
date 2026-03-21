@@ -7,9 +7,9 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from backend.app.config import get_settings
-from backend.app.models import User
-from backend.app.repositories.auth import (
+from backend.config import get_settings
+from backend.models import User
+from backend.repositories.auth import (
     create_session,
     create_user,
     get_active_session_by_hash,

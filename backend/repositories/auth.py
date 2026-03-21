@@ -5,7 +5,7 @@ from datetime import datetime
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
-from backend.app.models import AuthSession, User
+from backend.models import AuthSession, User
 
 
 def get_user_by_email(db: Session, email: str) -> User | None:

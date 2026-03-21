@@ -4,9 +4,9 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from backend.app.models import Meeting
-from backend.app.repositories.meetings import delete_meeting_related_rows, get_owned_meeting, list_meetings_for_user
-from backend.app.runtime.paths import cleanup_meeting_artifacts
+from backend.models import Meeting
+from backend.repositories.meetings import delete_meeting_related_rows, get_owned_meeting, list_meetings_for_user
+from backend.runtime.paths import cleanup_meeting_artifacts
 
 
 def meeting_summary(meeting: Meeting) -> dict:

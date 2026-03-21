@@ -7,10 +7,10 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.app.api.deps import owned_user
-from backend.app.db.session import get_db
-from backend.app.models import Meeting, MeetingAudioAsset, Transcript, TranscriptReviewItem
-from backend.app.runtime.paths import get_meeting_pcm_audio_path, preview_path, review_clip_root
+from backend.api.deps import owned_user
+from backend.db.session import get_db
+from backend.models import Meeting, MeetingAudioAsset, Transcript, TranscriptReviewItem
+from backend.runtime.paths import get_meeting_pcm_audio_path, preview_path, review_clip_root
 
 
 router = APIRouter(prefix="/api/media", tags=["media"])

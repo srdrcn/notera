@@ -19,8 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from backend.app.runtime.bootstrap import ensure_runtime_schema  # noqa: E402
-from backend.app.runtime.constants import (  # noqa: E402
+from backend.runtime.bootstrap import ensure_runtime_schema  # noqa: E402
+from backend.runtime.constants import (  # noqa: E402
     AUDIO_STATUS_DISABLED,
     AUDIO_STATUS_FAILED,
     AUDIO_STATUS_PENDING,
@@ -29,7 +29,7 @@ from backend.app.runtime.constants import (  # noqa: E402
     POSTPROCESS_STATUS_PENDING,
     POSTPROCESS_STATUS_QUEUED,
 )
-from backend.app.runtime.paths import (  # noqa: E402
+from backend.runtime.paths import (  # noqa: E402
     db_path as runtime_db_path,
     get_meeting_audio_dir,
     get_meeting_audio_chunks_dir,

@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from backend.app.config import get_settings
+from backend.config import get_settings
 
 
 settings = get_settings()

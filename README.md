@@ -131,7 +131,7 @@ Varsayılan yol kullanılacaksa `.env` zorunlu değildir. Backend aksi belirtilm
 Backend:
 
 ```bash
-conda run -n teams-bot python -m backend.app
+conda run -n teams-bot python -m backend
 ```
 
 Frontend:
