@@ -4,18 +4,37 @@ import { apiRequest } from "../../lib/api/client";
 import { queryClient } from "../../lib/api/queryClient";
 import type { MeetingSnapshot, MeetingSummary } from "../../lib/api/types";
 
+const ACTIVE_MEETING_STATUSES = new Set(["joining", "active"]);
+const ACTIVE_POSTPROCESS_STATUSES = new Set(["transcribing", "aligning"]);
+const STABLE_TRANSCRIPT_STATUSES = new Set(["review_ready", "completed", "failed"]);
+
+
+function meetingSnapshotRefetchInterval(snapshot: MeetingSnapshot | undefined): number | false {
+  if (!snapshot) {
+    return 1_500;
+  }
+
+  if (ACTIVE_MEETING_STATUSES.has(snapshot.meeting.status)) {
+    return 1_500;
+  }
+
+  if (ACTIVE_POSTPROCESS_STATUSES.has(snapshot.postprocess.status)) {
+    return 1_500;
+  }
+
+  if (STABLE_TRANSCRIPT_STATUSES.has(snapshot.postprocess.status)) {
+    return false;
+  }
+
+  return 5_000;
+}
+
 
 export function useMeetingSnapshot(meetingId: number) {
   return useQuery({
     queryKey: ["meeting-snapshot", meetingId],
     queryFn: () => apiRequest<MeetingSnapshot>(`/api/meetings/${meetingId}/snapshot`),
-    refetchInterval: (query) => {
-      const snapshot = query.state.data;
-      if (!snapshot) {
-        return 1000;
-      }
-      return ["transcribing", "aligning"].includes(snapshot.postprocess.status) ? 250 : 1000;
-    },
+    refetchInterval: (query) => meetingSnapshotRefetchInterval(query.state.data),
   });
 }
 

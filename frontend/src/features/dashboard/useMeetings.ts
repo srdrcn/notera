@@ -11,12 +11,34 @@ type CreateMeetingPayload = {
   audio_recording_enabled: boolean;
 };
 
+const STABLE_POSTPROCESS_STATUSES = new Set(["completed", "review_ready", "failed"]);
+
+
+function meetingsRefetchInterval(meetings: MeetingSummary[] | undefined): number {
+  if (!meetings || meetings.length === 0) {
+    return 10_000;
+  }
+
+  if (meetings.some((meeting) => ["joining", "active"].includes(meeting.status))) {
+    return 3_000;
+  }
+
+  const allMeetingsStable = meetings.every(
+    (meeting) => meeting.status === "completed" && STABLE_POSTPROCESS_STATUSES.has(meeting.postprocess_status),
+  );
+  if (allMeetingsStable) {
+    return 10_000;
+  }
+
+  return 5_000;
+}
+
 
 export function useMeetings() {
   return useQuery({
     queryKey: ["meetings"],
     queryFn: () => apiRequest<MeetingSummary[]>("/api/meetings"),
-    refetchInterval: 1000,
+    refetchInterval: (query) => meetingsRefetchInterval(query.state.data),
   });
 }
 
