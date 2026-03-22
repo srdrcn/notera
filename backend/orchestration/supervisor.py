@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -19,6 +20,7 @@ from backend.runtime.constants import (
     POSTPROCESS_STATUS_PENDING,
     POSTPROCESS_STATUS_QUEUED,
 )
+from backend.runtime.logging import bind_context, log_event, reset_context
 
 
 logger = logging.getLogger("notera.supervisor")
@@ -39,13 +41,40 @@ def _is_process_running(pid: int | None) -> bool:
         return False
 
 
+def _relay_json_log(text: str, meeting_id: int, worker_type: str, run_id: int) -> bool:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    payload.setdefault("meeting_id", meeting_id)
+    payload.setdefault("worker_type", worker_type)
+    payload.setdefault("run_id", run_id)
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return True
+
+
 def _relay_stream(stream, meeting_id: int, worker_type: str, run_id: int, level: int) -> None:
+    token = bind_context(meeting_id=meeting_id, worker_type=worker_type, run_id=run_id)
     try:
         for line in iter(stream.readline, ""):
             text = line.rstrip()
-            if text:
-                logger.log(level, "[meeting=%s worker=%s run=%s] %s", meeting_id, worker_type, run_id, text)
+            if not text:
+                continue
+            if _relay_json_log(text, meeting_id, worker_type, run_id):
+                continue
+            log_event(
+                logger,
+                level,
+                "worker.stream",
+                "Relayed worker output",
+                output=text,
+            )
     finally:
+        reset_context(token)
         stream.close()
 
 
@@ -53,7 +82,7 @@ class MeetingSupervisor:
     def __init__(self) -> None:
         self._lock = threading.Lock()
 
-    def _worker_env(self) -> dict[str, str]:
+    def _worker_env(self, meeting_id: int, worker_type: str, run_id: int) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
             {
@@ -63,6 +92,9 @@ class MeetingSupervisor:
                 "NOTERA_REVIEW_CLIP_ROOT": str(settings.review_clip_root),
                 "NOTERA_RUNTIME_CACHE_ROOT": str(settings.runtime_cache_root),
                 "NOTERA_DISABLE_INTERNAL_POSTPROCESS_TRIGGER": "1",
+                "NOTERA_MEETING_ID": str(meeting_id),
+                "NOTERA_WORKER_RUN_ID": str(run_id),
+                "NOTERA_WORKER_TYPE": worker_type,
                 "PYTHONPATH": str(settings.repo_root),
             }
         )
@@ -97,15 +129,25 @@ class MeetingSupervisor:
                     if meeting.postprocess_status not in {"completed", "review_ready"}:
                         meeting.postprocess_status = POSTPROCESS_STATUS_FAILED
                         meeting.postprocess_error = "Postprocess worker beklenmeden sonlandı."
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "worker.reconciled.failed",
+                    "Worker run was marked failed during supervisor reconciliation",
+                    meeting_id=run.meeting_id,
+                    worker_type=run.worker_type,
+                    run_id=run.id,
+                    pid=run.pid,
+                    exit_code=run.exit_code,
+                )
                 db.add(meeting)
 
-    def _mark_run_started(self, meeting_id: int, worker_type: str, pid: int) -> int:
+    def _create_run(self, meeting_id: int, worker_type: str) -> int:
         with db_session() as db:
             run = WorkerRun(
                 meeting_id=meeting_id,
                 worker_type=worker_type,
-                status="running",
-                pid=pid,
+                status="starting",
                 started_at=datetime.utcnow(),
             )
             db.add(run)
@@ -114,56 +156,134 @@ class MeetingSupervisor:
             if meeting is not None:
                 if worker_type == "bot":
                     meeting.active_bot_run_id = run.id
-                    meeting.bot_pid = pid
+                    meeting.bot_pid = None
                     meeting.stop_requested = False
                 else:
                     meeting.active_postprocess_run_id = run.id
                 db.add(meeting)
             return run.id
 
-    def _watch_process(self, process: subprocess.Popen[str], meeting_id: int, worker_type: str, run_id: int) -> None:
-        exit_code = process.wait()
-        should_recover_postprocess = False
+    def _mark_run_started(self, meeting_id: int, worker_type: str, run_id: int, pid: int) -> None:
         with db_session() as db:
             run = db.get(WorkerRun, run_id)
             meeting = db.get(Meeting, meeting_id)
             if run is not None:
-                run.exit_code = exit_code
+                run.status = "running"
+                run.pid = pid
+                db.add(run)
+            if meeting is not None:
+                if worker_type == "bot":
+                    meeting.bot_pid = pid
+                db.add(meeting)
+
+    def _mark_run_failed_to_start(self, meeting_id: int, worker_type: str, run_id: int, error_message: str) -> None:
+        with db_session() as db:
+            run = db.get(WorkerRun, run_id)
+            meeting = db.get(Meeting, meeting_id)
+            if run is not None:
+                run.status = "failed"
+                run.exit_code = -1
+                run.error_message = error_message
                 run.ended_at = datetime.utcnow()
-                run.status = "completed" if exit_code == 0 else "failed"
                 db.add(run)
             if meeting is not None:
                 if worker_type == "bot":
                     if meeting.active_bot_run_id == run_id:
                         meeting.active_bot_run_id = None
                     meeting.bot_pid = None
-                    should_recover_postprocess = (
-                        meeting.status == "completed"
-                        and meeting.postprocess_status in RECOVERABLE_POSTPROCESS_STATUSES
-                        and not meeting.active_postprocess_run_id
-                    )
+                    if meeting.status == "joining":
+                        meeting.status = "pending"
                 else:
                     if meeting.active_postprocess_run_id == run_id:
                         meeting.active_postprocess_run_id = None
+                    if meeting.postprocess_status not in {"completed", "review_ready"}:
+                        meeting.postprocess_status = POSTPROCESS_STATUS_FAILED
+                        meeting.postprocess_error = error_message
                 db.add(meeting)
 
-        if worker_type == "bot" and (exit_code == 0 or should_recover_postprocess):
-            try:
-                self.ensure_postprocess(meeting_id)
-            except Exception:
-                logger.exception("Failed starting postprocess for meeting %s after bot exit", meeting_id)
+    def _watch_process(self, process: subprocess.Popen[str], meeting_id: int, worker_type: str, run_id: int) -> None:
+        token = bind_context(meeting_id=meeting_id, worker_type=worker_type, run_id=run_id)
+        try:
+            exit_code = process.wait()
+            should_recover_postprocess = False
+            with db_session() as db:
+                run = db.get(WorkerRun, run_id)
+                meeting = db.get(Meeting, meeting_id)
+                if run is not None:
+                    run.exit_code = exit_code
+                    run.ended_at = datetime.utcnow()
+                    run.status = "completed" if exit_code == 0 else "failed"
+                    db.add(run)
+                if meeting is not None:
+                    if worker_type == "bot":
+                        if meeting.active_bot_run_id == run_id:
+                            meeting.active_bot_run_id = None
+                        meeting.bot_pid = None
+                        should_recover_postprocess = (
+                            meeting.status == "completed"
+                            and meeting.postprocess_status in RECOVERABLE_POSTPROCESS_STATUSES
+                            and not meeting.active_postprocess_run_id
+                        )
+                    else:
+                        if meeting.active_postprocess_run_id == run_id:
+                            meeting.active_postprocess_run_id = None
+                    db.add(meeting)
+
+            log_event(
+                logger,
+                logging.INFO if exit_code == 0 else logging.ERROR,
+                "worker.completed" if exit_code == 0 else "worker.failed",
+                "Worker process exited" if exit_code == 0 else "Worker process failed",
+                pid=process.pid,
+                exit_code=exit_code,
+            )
+            if worker_type == "bot" and (exit_code == 0 or should_recover_postprocess):
+                try:
+                    self.ensure_postprocess(meeting_id)
+                except Exception:
+                    logger.exception("Failed starting postprocess for meeting %s after bot exit", meeting_id)
+        finally:
+            reset_context(token)
 
     def _spawn(self, meeting_id: int, worker_type: str, command: list[str]) -> int:
-        process = subprocess.Popen(
-            command,
-            cwd=str(settings.repo_root),
-            env=self._worker_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
+        run_id = self._create_run(meeting_id, worker_type)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(settings.repo_root),
+                env=self._worker_env(meeting_id, worker_type, run_id),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self._mark_run_failed_to_start(meeting_id, worker_type, run_id, str(exc))
+            log_event(
+                logger,
+                logging.ERROR,
+                "worker.spawn_failed",
+                "Worker process failed to start",
+                meeting_id=meeting_id,
+                worker_type=worker_type,
+                run_id=run_id,
+                error_name=type(exc).__name__,
+                error_message=str(exc),
+                exc_info=exc,
+            )
+            raise
+
+        self._mark_run_started(meeting_id, worker_type, run_id, process.pid)
+        log_event(
+            logger,
+            logging.INFO,
+            "worker.spawned",
+            "Worker process spawned",
+            meeting_id=meeting_id,
+            worker_type=worker_type,
+            run_id=run_id,
+            pid=process.pid,
         )
-        run_id = self._mark_run_started(meeting_id, worker_type, process.pid)
         threading.Thread(
             target=_relay_stream,
             args=(process.stdout, meeting_id, worker_type, run_id, logging.INFO),
@@ -219,7 +339,7 @@ class MeetingSupervisor:
                     run = db.get(WorkerRun, meeting.active_postprocess_run_id)
                     if run and _is_process_running(run.pid):
                         return run.id
-                meeting.postprocess_status = meeting.postprocess_status or POSTPROCESS_STATUS_PENDING
+                meeting.postprocess_status = POSTPROCESS_STATUS_QUEUED
                 meeting.postprocess_error = None
                 meeting.updated_at = datetime.utcnow()
                 db.add(meeting)
@@ -250,6 +370,7 @@ class MeetingSupervisor:
                     if run and _is_process_running(run.pid):
                         return run.id
                     meeting.active_postprocess_run_id = None
+                meeting.postprocess_status = POSTPROCESS_STATUS_QUEUED
                 meeting.postprocess_error = None
                 meeting.updated_at = datetime.utcnow()
                 db.add(meeting)

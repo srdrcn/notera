@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     log_level: str = "INFO"
+    log_format: str = "json"
 
     session_cookie_name: str = "notera_session"
     session_ttl_hours: int = 24 * 30

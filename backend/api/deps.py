@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from backend.config import get_settings
 from backend.db.session import get_db
 from backend.models import User
+from backend.runtime.logging import bind_context
 from backend.services.auth import authenticate_cookie
 
 
@@ -20,6 +21,7 @@ def current_user(
     user = authenticate_cookie(db, session_cookie)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    bind_context(user_id=user.id)
     return user
 
 

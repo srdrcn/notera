@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.runtime.bootstrap import ensure_runtime_schema  # noqa: E402
+from backend.runtime.logging import bind_context, configure_logging, log_event, reset_context  # noqa: E402
 from backend.runtime.constants import (  # noqa: E402
     AUDIO_STATUS_DISABLED,
     AUDIO_STATUS_FAILED,
@@ -42,17 +43,8 @@ from backend.runtime.teams_links import (  # noqa: E402
     parse_join_with_id_target,
 )
 
-# Setup logging
-log_format = "%(asctime)s - %(levelname)s - %(message)s"
-logging.basicConfig(
-    level=logging.INFO,
-    format=log_format,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
-    force=True,
-)
-logger = logging.getLogger("TeamsBot")
+configure_logging()
+logger = logging.getLogger("notera.worker.bot")
 DEBUG_ARTIFACTS_ENABLED = False
 CHAT_NOTICE_MESSAGE = (
     "Konuşmaları kayıt altına almaya başladım. "
@@ -122,6 +114,14 @@ def caption_token_match(left_token, right_token):
         return True
 
     return False
+
+
+def caption_metrics(text):
+    normalized = normalize_caption_text(text)
+    return {
+        "text_length": len(normalized),
+        "token_count": len(caption_tokens(normalized)),
+    }
 
 
 def make_caption_fingerprint(speaker, text):
@@ -453,7 +453,13 @@ async def launch_teams_browser(playwright):
 async def open_meeting_entry(page, meeting_url):
     meeting_by_id = parse_join_with_id_target(meeting_url)
     if not meeting_by_id:
-        logger.info("Navigating to meeting URL: %s", meeting_url)
+        log_event(
+            logger,
+            logging.INFO,
+            "meeting.navigation.started",
+            "Navigating to Teams meeting URL",
+            navigation_mode="direct_link",
+        )
         await page.goto(meeting_url)
         return
 
@@ -657,13 +663,15 @@ def save_caption_event(meeting_id, speaker, text, sequence_no, observed_at, slot
             revision_no,
         )
         if duplicate_reason is not None:
-            logger.info(
-                "caption_duplicate_skipped meeting=%s reason=%s slot=%s revision=%s text=%s",
-                meeting_id,
-                duplicate_reason,
-                slot_index,
-                revision_no,
-                text[:160],
+            log_event(
+                logger,
+                logging.INFO,
+                "caption.duplicate_skipped",
+                "Duplicate caption skipped",
+                duplicate_reason=duplicate_reason,
+                slot_index=slot_index,
+                revision_no=revision_no,
+                **caption_metrics(text),
             )
             return "skipped"
 
@@ -829,23 +837,31 @@ class MeetingAudioChunkWriter:
 
         if pcm_result.returncode != 0 and self.chunk_paths and self._should_prefer_aggregate_stream():
             logger.warning(
-                "Could not decode aggregate audio stream for meeting %s: %s",
+                "Could not decode aggregate audio stream for meeting %s (ffmpeg_return_code=%s)",
                 self.meeting_id,
-                pcm_result.stderr.strip() or "ffmpeg conversion failed",
+                pcm_result.returncode,
             )
             if self._finalize_from_chunk_concat(master_path):
                 pcm_result = self._build_pcm_copy(master_path, pcm_path)
 
         if pcm_result.returncode != 0:
             logger.warning(
-                "Could not create PCM audio copy for meeting %s: %s",
+                "Could not create PCM audio copy for meeting %s (ffmpeg_return_code=%s)",
                 self.meeting_id,
-                pcm_result.stderr.strip() or "ffmpeg conversion failed",
+                pcm_result.returncode,
             )
-        logger.info("Finalized master audio for meeting %s at %s", self.meeting_id, master_path)
         duration_ms = probe_audio_duration_ms(pcm_path) if pcm_path.exists() else None
         if duration_ms is None:
             duration_ms = probe_audio_duration_ms(master_path)
+        log_event(
+            logger,
+            logging.INFO,
+            "audio.finalized",
+            "Meeting audio finalized",
+            duration_ms=duration_ms,
+            has_pcm_copy=pcm_path.exists(),
+            format=self.format,
+        )
         if master_path.exists() and (pcm_path.exists() or duration_ms is not None):
             self._cleanup_temporary_audio_parts()
         return master_path, pcm_path if pcm_path.exists() else None, self.format, duration_ms
@@ -1311,11 +1327,11 @@ def delete_live_meeting_screenshot(screenshot_path):
         return
     try:
         os.remove(screenshot_path)
-        logger.info("Deleted live meeting screenshot: %s", screenshot_path)
+        logger.info("Deleted live meeting screenshot asset.")
     except FileNotFoundError:
         return
     except Exception as e:
-        logger.debug(f"Could not delete live meeting screenshot {screenshot_path}: {e}")
+        logger.debug("Could not delete live meeting screenshot asset: %s", e)
 
 
 async def take_periodic_screenshot(page, stop_event, screenshot_path):
@@ -1323,7 +1339,7 @@ async def take_periodic_screenshot(page, stop_event, screenshot_path):
     while not stop_event.is_set():
         try:
             await page.screenshot(path=screenshot_path)
-            logger.info(f"Periodic screenshot updated: {screenshot_path}")
+            logger.info("Periodic live preview screenshot updated.")
         except Exception as e:
             logger.error(f"Failed to take periodic screenshot: {e}")
         await asyncio.sleep(10)
@@ -1460,12 +1476,7 @@ async def dump_dom(page, filename="debug_dom.html"):
             written_paths.append((html_path, png_path, json_path))
 
         latest_html, latest_png, latest_json = written_paths[0]
-        logger.info(
-            "Debug artifacts written: html=%s screenshot=%s summary=%s",
-            latest_html,
-            latest_png,
-            latest_json,
-        )
+        logger.info("Debug artifacts written for bot session inspection.")
         return True
     except Exception as e:
         logger.error(f"Failed to dump debug artifacts: {e}")
@@ -1822,8 +1833,11 @@ def update_meeting_status(meeting_id, status, clear_bot_pid=False):
 
 async def run_bot(meeting_url, meeting_id):
     meeting_id = int(meeting_id)
+    run_id_value = os.getenv("NOTERA_WORKER_RUN_ID")
+    run_id = int(run_id_value) if run_id_value and run_id_value.isdigit() else run_id_value
+    context_token = bind_context(meeting_id=meeting_id, worker_type="bot", run_id=run_id)
     ensure_runtime_schema(get_db_path())
-    logger.info("Bot starting for meeting ID: %s", meeting_id)
+    log_event(logger, logging.INFO, "worker.started", "Bot worker started")
     shutdown_requested = False
     leave_attempted = False
     meeting_screenshot_path = get_live_meeting_screenshot_path(meeting_id)
@@ -2077,7 +2091,16 @@ async def run_bot(meeting_url, meeting_id):
 
                 caption_event_sequence += 1
                 _remember_recent_caption_event(recent_caption_memory, caption, event_dt)
-                logger.info("CAPTION EVENT - [%s]: %s", caption["speaker"], caption["text"])
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "caption.event.saved",
+                    "Caption event persisted",
+                    slot_index=caption.get("slot_index"),
+                    revision_no=caption.get("revision_no", 0),
+                    speaker_known=normalize_caption_text(caption.get("speaker")).casefold() not in {"", "unknown"},
+                    **caption_metrics(caption.get("text")),
+                )
                 if not first_transcript_preview_captured:
                     try:
                         await page.screenshot(path=meeting_screenshot_path)
@@ -2115,9 +2138,12 @@ async def run_bot(meeting_url, meeting_id):
                             for (const p of patterns) {
                                 const els = document.querySelectorAll(p.sel);
                                 if (els.length > 0) {
-                                    results[p.name] = els.length + ' elements, first: ' +
-                                        els[0].tagName + ' | text: ' + (els[0].innerText || '').substring(0, 100) +
-                                        ' | html: ' + els[0].outerHTML.substring(0, 200);
+                                    results[p.name] = {
+                                        count: els.length,
+                                        firstTag: els[0].tagName,
+                                        firstClass: String(els[0].className || '').substring(0, 80),
+                                        hasText: Boolean((els[0].innerText || '').trim()),
+                                    };
                                 }
                             }
                             return results;
@@ -2313,11 +2339,13 @@ async def run_bot(meeting_url, meeting_id):
                         and len(replay_candidates) >= max(CAPTION_REPLAY_BURST_MIN_MATCHES, len(normalized_caption_items) // 2)
                     )
                     if replay_burst_detected:
-                        logger.info(
-                            "caption_replay_skipped meeting=%s count=%s sample=%s",
-                            meeting_id,
-                            len(replay_candidates),
-                            replay_candidates[0]["text"][:160] if replay_candidates else "",
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "caption.replay_burst_detected",
+                            "Caption replay burst detected",
+                            replay_candidate_count=len(replay_candidates),
+                            sample_text_length=len(replay_candidates[0]["text"]) if replay_candidates else 0,
                         )
 
                     seen_caption_streams = set()
@@ -2330,11 +2358,13 @@ async def run_bot(meeting_url, meeting_id):
 
                             stream_key = _find_pending_caption_key(pending_captions, speaker, text, slot_hint)
                             if replay_burst_detected and stream_key is None and item.get("recent_match") is not None:
-                                logger.info(
-                                    "caption_replay_skipped meeting=%s slot_hint=%s text=%s",
-                                    meeting_id,
-                                    slot_hint,
-                                    text[:160],
+                                log_event(
+                                    logger,
+                                    logging.INFO,
+                                    "caption.replay_skipped",
+                                    "Late caption replay skipped",
+                                    slot_hint=slot_hint,
+                                    **caption_metrics(text),
                                 )
                                 continue
 
@@ -2379,12 +2409,14 @@ async def run_bot(meeting_url, meeting_id):
                                     previous["missing_polls"] = 0
                                     previous["slot_index"] = slot_index if slot_index is not None else previous.get("slot_index")
                                     previous["slot_hint"] = slot_hint or previous.get("slot_hint")
-                                    logger.info(
-                                        "caption_revision_saved meeting=%s stream=%s revision=%s text=%s",
-                                        meeting_id,
-                                        stream_key,
-                                        previous["revision_no"],
-                                        previous["text"][:160],
+                                    log_event(
+                                        logger,
+                                        logging.INFO,
+                                        "caption.revision_saved",
+                                        "Caption revision saved",
+                                        stream_key=stream_key,
+                                        revision_no=previous["revision_no"],
+                                        **caption_metrics(previous["text"]),
                                     )
                                     await persist_caption_event(previous)
                                     continue
@@ -2506,6 +2538,8 @@ async def run_bot(meeting_url, meeting_id):
                     signal.signal(current_signal, previous_handler)
                 except Exception:
                     pass
+            log_event(logger, logging.INFO, "worker.completed", "Bot worker finished")
+            reset_context(context_token)
 
 if __name__ == "__main__":
     import sys

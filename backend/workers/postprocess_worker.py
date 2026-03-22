@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.runtime.bootstrap import ensure_runtime_schema  # noqa: E402
+from backend.runtime.logging import bind_context, configure_logging, log_event, reset_context  # noqa: E402
 from backend.runtime.constants import (  # noqa: E402
     AUDIO_STATUS_READY,
     POSTPROCESS_STATUS_ALIGNING,
@@ -46,14 +47,8 @@ from backend.runtime.paths import (  # noqa: E402
     runtime_cache_dir,
 )
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
-)
-logger = logging.getLogger("PostprocessWorker")
+configure_logging()
+logger = logging.getLogger("notera.worker.postprocess")
 
 ASR_MODEL_DEFAULT = "large-v3"
 TURKISH_ALIGNMENT_MODEL = "cahya/wav2vec2-base-turkish"
@@ -377,7 +372,7 @@ def convert_audio_to_pcm(master_audio_path: Path, meeting_id: int) -> Path:
         "16000",
         str(output_path),
     ]
-    logger.info("Converting %s to %s", master_audio_path, output_path)
+    logger.info("Converting meeting audio to PCM format.")
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ffmpeg conversion failed")
@@ -912,17 +907,17 @@ def canonicalize_caption_events(rows: list[sqlite3.Row] | list[dict]) -> list[di
         late_replay_match = is_late_replay_match(canonical, speaker, text, observed_at)
         if late_replay_match and replay_burst_until is not None and observed_at <= replay_burst_until:
             logger.debug(
-                "Skipping late caption replay inside burst slot=%s text=%s",
+                "Skipping late caption replay inside burst slot=%s text_length=%s",
                 slot_index,
-                text[:160],
+                len(text),
             )
             continue
         if late_replay_match and slot_reset_detected:
             replay_burst_until = observed_at + timedelta(seconds=LATE_REPLAY_BURST_WINDOW_SECONDS)
             logger.info(
-                "Skipping late caption replay after slot reset slot=%s text=%s",
+                "Skipping late caption replay after slot reset slot=%s text_length=%s",
                 slot_index,
-                text[:160],
+                len(text),
             )
             continue
 
@@ -1443,7 +1438,7 @@ def create_audio_clip(
     ]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.warning("Failed to create review clip: %s", result.stderr.strip())
+        logger.warning("Failed to create review clip (ffmpeg_return_code=%s)", result.returncode)
         return None
     return get_review_clip_filename(meeting_id, transcript_id, review_item_id)
 
@@ -1699,15 +1694,29 @@ def main():
         raise SystemExit("Usage: python -m backend.workers.postprocess_worker <meeting_id>")
 
     meeting_id = int(sys.argv[1])
+    run_id_value = os.getenv("NOTERA_WORKER_RUN_ID")
+    run_id = int(run_id_value) if run_id_value and run_id_value.isdigit() else run_id_value
+    context_token = bind_context(meeting_id=meeting_id, worker_type="postprocess", run_id=run_id)
     ensure_runtime_schema(get_db_path())
     update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_QUEUED, None, None, None)
     try:
+        log_event(logger, logging.INFO, "worker.started", "Postprocess worker started")
         process_meeting(meeting_id)
-        logger.info("Post-process completed for meeting %s", meeting_id)
+        log_event(logger, logging.INFO, "worker.completed", "Postprocess worker completed")
     except Exception as exc:
-        logger.exception("Post-process failed for meeting %s", meeting_id)
+        log_event(
+            logger,
+            logging.ERROR,
+            "worker.failed",
+            "Postprocess worker failed",
+            error_name=type(exc).__name__,
+            error_message=str(exc),
+            exc_info=exc,
+        )
         update_meeting_postprocess_status(meeting_id, POSTPROCESS_STATUS_FAILED, str(exc), None, None)
         raise
+    finally:
+        reset_context(context_token)
 
 
 if __name__ == "__main__":

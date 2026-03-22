@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from backend.api.deps import owned_user
 from backend.db.session import get_db
 from backend.orchestration.supervisor import supervisor
+from backend.runtime.logging import bind_context, log_event
 from backend.repositories.meetings import (
     caption_events_for_meeting,
     get_owned_meeting,
@@ -20,11 +23,21 @@ from backend.services.transcript_logic import build_snapshot
 
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+logger = logging.getLogger("notera.routes.meetings")
 
 
 @router.get("", response_model=list[MeetingSummaryOut])
 def list_meetings(user=Depends(owned_user), db: Session = Depends(get_db)):
-    return list_meeting_summaries(db, user.id)
+    meetings = list_meeting_summaries(db, user.id)
+    log_event(
+        logger,
+        logging.DEBUG,
+        "meeting.list.loaded",
+        "Meeting list loaded",
+        user_id=user.id,
+        meeting_count=len(meetings),
+    )
+    return meetings
 
 
 @router.post("", response_model=MeetingSummaryOut)
@@ -36,6 +49,16 @@ def create_new_meeting(
     meeting = create_meeting(db, user.id, payload.title, payload.teams_link, payload.audio_recording_enabled)
     db.commit()
     db.refresh(meeting)
+    bind_context(meeting_id=meeting.id)
+    log_event(
+        logger,
+        logging.INFO,
+        "meeting.created",
+        "Meeting created",
+        meeting_id=meeting.id,
+        user_id=user.id,
+        audio_recording_enabled=meeting.audio_recording_enabled,
+    )
     return meeting_summary(meeting)
 
 
@@ -44,6 +67,7 @@ def get_meeting(meeting_id: int, user=Depends(owned_user), db: Session = Depends
     meeting = get_owned_meeting(db, user.id, meeting_id)
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
+    bind_context(meeting_id=meeting.id)
     return meeting_summary(meeting)
 
 
@@ -52,10 +76,21 @@ def join_meeting(meeting_id: int, user=Depends(owned_user), db: Session = Depend
     meeting = get_owned_meeting(db, user.id, meeting_id)
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
+    bind_context(meeting_id=meeting.id)
     try:
-        supervisor.start_bot(meeting)
+        run_id = supervisor.start_bot(meeting)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    log_event(
+        logger,
+        logging.INFO,
+        "meeting.join.requested",
+        "Meeting join requested",
+        meeting_id=meeting.id,
+        user_id=user.id,
+        run_id=run_id,
+        worker_type="bot",
+    )
     db.expire_all()
     meeting = get_owned_meeting(db, user.id, meeting_id)
     return meeting_summary(meeting)
@@ -66,10 +101,20 @@ def stop_meeting(meeting_id: int, user=Depends(owned_user), db: Session = Depend
     meeting = get_owned_meeting(db, user.id, meeting_id)
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
+    bind_context(meeting_id=meeting.id)
     try:
-        supervisor.stop_bot(meeting)
+        stopped = supervisor.stop_bot(meeting)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    log_event(
+        logger,
+        logging.INFO,
+        "meeting.stop.requested",
+        "Meeting stop requested",
+        meeting_id=meeting.id,
+        user_id=user.id,
+        bot_stopped=stopped,
+    )
     db.expire_all()
     meeting = get_owned_meeting(db, user.id, meeting_id)
     return meeting_summary(meeting)
@@ -82,6 +127,15 @@ def remove_meeting(meeting_id: int, user=Depends(owned_user), db: Session = Depe
         db.commit()
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    bind_context(meeting_id=meeting_id)
+    log_event(
+        logger,
+        logging.INFO,
+        "meeting.deleted",
+        "Meeting deleted",
+        meeting_id=meeting_id,
+        user_id=user.id,
+    )
     return {"ok": True}
 
 
@@ -90,7 +144,25 @@ def meeting_snapshot(meeting_id: int, user=Depends(owned_user), db: Session = De
     meeting = get_owned_meeting(db, user.id, meeting_id)
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
-    supervisor.ensure_postprocess(meeting_id)
+    bind_context(meeting_id=meeting.id)
+    previous_run_id = meeting.active_postprocess_run_id
+    previous_status = meeting.postprocess_status
+    recovered_run_id = supervisor.ensure_postprocess(meeting_id)
+    if (
+        recovered_run_id is not None
+        and previous_run_id != recovered_run_id
+        and previous_status in {"pending", "queued"}
+    ):
+        log_event(
+            logger,
+            logging.INFO,
+            "meeting.postprocess.recovered",
+            "Meeting postprocess recovered from snapshot request",
+            meeting_id=meeting.id,
+            user_id=user.id,
+            run_id=recovered_run_id,
+            worker_type="postprocess",
+        )
     db.expire_all()
     meeting = get_owned_meeting(db, user.id, meeting_id)
     if meeting is None:
