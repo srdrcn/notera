@@ -2,6 +2,39 @@
 
 Notera, Microsoft Teams toplantılarına bot ile katılıp canlı caption, ses kaydı ve önizleme toplayan; toplantı sonrasında transcript'i işleyip review akışıyla düzenlemeyi sağlayan bir uygulamadır.
 
+## Mimari
+
+```mermaid
+flowchart TD
+    U[User / Browser] --> F[Frontend\nReact + Vite]
+    F -->|HTTP / API| A[Backend API\nFastAPI]
+    A -->|SQLAlchemy| D[(SQLite\nnotera.db)]
+    A --> S[Meeting Supervisor]
+
+    S -->|spawn| B[Bot Worker\nPlaywright + Teams]
+    S -->|spawn| P[Postprocess Worker\nWhisperX]
+
+    B -->|join / monitor| T[Microsoft Teams Meeting]
+    B -->|caption events / status| D
+    B -->|audio / preview artifacts| M[(data/meeting_audio\n+ live_previews)]
+
+    P -->|read captions + audio| D
+    P -->|read audio| M
+    P -->|transcript / review outputs| D
+    P -->|canonical / alignment / clips| R[(review_clips\n+ json artifacts)]
+
+    F -->|poll snapshot / actions / exports| A
+    A -->|snapshot / exports| F
+```
+
+Kısa akış:
+
+1. Frontend, meeting oluşturma ve transcript ekranı için Backend API ile konuşur.
+2. Backend, meeting lifecycle'ını ve worker süreçlerini `MeetingSupervisor` üzerinden yönetir.
+3. Bot worker Teams toplantısına katılır; canlı caption, ses kaydı ve önizleme üretir.
+4. Postprocess worker toplantı sonrası caption ve audio artefact'larını işleyip final transcript ve review kayıtlarını oluşturur.
+5. Frontend dashboard, transcript, review ve export ekranlarını bu veriler üzerinden sunar.
+
 ## Özellikler
 
 - Teams toplantı linki ile yeni toplantı başlatma
