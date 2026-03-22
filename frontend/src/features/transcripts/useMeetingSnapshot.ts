@@ -5,9 +5,17 @@ import { queryClient } from "../../lib/api/queryClient";
 import type { MeetingSnapshot, MeetingSummary } from "../../lib/api/types";
 
 const ACTIVE_MEETING_STATUSES = new Set(["joining", "active"]);
-const ACTIVE_POSTPROCESS_STATUSES = new Set(["transcribing", "aligning"]);
+const ACTIVE_POSTPROCESS_STATUSES = new Set([
+  "binding_sources",
+  "materializing_audio",
+  "transcribing_participants",
+  "assembling_segments",
+  "transcribing",
+  "aligning",
+  "canonicalizing",
+  "rebuilding",
+]);
 const STABLE_TRANSCRIPT_STATUSES = new Set(["review_ready", "completed", "failed"]);
-
 
 function meetingSnapshotRefetchInterval(snapshot: MeetingSnapshot | undefined): number | false {
   if (!snapshot) {
@@ -29,7 +37,6 @@ function meetingSnapshotRefetchInterval(snapshot: MeetingSnapshot | undefined): 
   return 5_000;
 }
 
-
 export function useMeetingSnapshot(meetingId: number) {
   return useQuery({
     queryKey: ["meeting-snapshot", meetingId],
@@ -38,14 +45,12 @@ export function useMeetingSnapshot(meetingId: number) {
   });
 }
 
-
 function invalidateMeeting(meetingId: number) {
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: ["meeting-snapshot", meetingId] }),
     queryClient.invalidateQueries({ queryKey: ["meetings"] }),
   ]);
 }
-
 
 export function useStopTranscriptMeeting(meetingId: number) {
   return useMutation({
@@ -57,45 +62,49 @@ export function useStopTranscriptMeeting(meetingId: number) {
   });
 }
 
-
-export function useApplyReview(meetingId: number) {
+export function useUpdateSegmentParticipant(meetingId: number) {
   return useMutation({
-    mutationFn: (reviewId: number) =>
-      apiRequest(`/api/reviews/${reviewId}/apply`, {
-        method: "POST",
+    mutationFn: ({ segmentId, participantId }: { segmentId: number; participantId: number | null }) =>
+      apiRequest(`/api/transcript-segments/${segmentId}/participant`, {
+        method: "PATCH",
+        body: JSON.stringify({ participant_id: participantId }),
       }),
     onSuccess: () => invalidateMeeting(meetingId),
   });
 }
 
-
-export function useKeepReview(meetingId: number) {
+export function useMergeParticipants(meetingId: number) {
   return useMutation({
-    mutationFn: (reviewId: number) =>
-      apiRequest(`/api/reviews/${reviewId}/keep`, {
+    mutationFn: ({ sourceParticipantId, targetParticipantId }: { sourceParticipantId: number; targetParticipantId: number }) =>
+      apiRequest(`/api/meetings/${meetingId}/participants/merge`, {
         method: "POST",
+        body: JSON.stringify({
+          source_participant_id: sourceParticipantId,
+          target_participant_id: targetParticipantId,
+        }),
       }),
     onSuccess: () => invalidateMeeting(meetingId),
   });
 }
 
-
-export function useApplyAllReviews(meetingId: number) {
+export function useSplitParticipant(meetingId: number) {
   return useMutation({
-    mutationFn: () =>
-      apiRequest(`/api/meetings/${meetingId}/reviews/apply-all`, {
+    mutationFn: ({
+      participantId,
+      segmentIds,
+      displayName,
+    }: {
+      participantId: number;
+      segmentIds: number[];
+      displayName: string;
+    }) =>
+      apiRequest(`/api/meetings/${meetingId}/participants/split`, {
         method: "POST",
-      }),
-    onSuccess: () => invalidateMeeting(meetingId),
-  });
-}
-
-
-export function useMergeDuplicates(meetingId: number) {
-  return useMutation({
-    mutationFn: () =>
-      apiRequest(`/api/meetings/${meetingId}/transcripts/merge-duplicates`, {
-        method: "POST",
+        body: JSON.stringify({
+          participant_id: participantId,
+          segment_ids: segmentIds,
+          display_name: displayName,
+        }),
       }),
     onSuccess: () => invalidateMeeting(meetingId),
   });

@@ -45,7 +45,7 @@ from backend.runtime.teams_links import (  # noqa: E402
 
 configure_logging()
 logger = logging.getLogger("notera.worker.bot")
-DEBUG_ARTIFACTS_ENABLED = False
+DEBUG_ARTIFACTS_ENABLED = os.getenv("NOTERA_DEBUG_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "on"}
 CHAT_NOTICE_MESSAGE = (
     "Konuşmaları kayıt altına almaya başladım. "
     "Beni toplantıdan çıkarmak için chat'e sadece 'bot ok' yazabilirsiniz."
@@ -67,6 +67,105 @@ CAPTION_REPLAY_MIN_AGE_SECONDS = 12.0
 CAPTION_REPLAY_BURST_MIN_MATCHES = 4
 CAPTION_REPLAY_VISIBLE_WINDOW = 8
 CAPTION_LOG_FALLBACK_LINE_WINDOW = 18
+PARTICIPANT_REGISTRY_CONFIG = {
+    "version": 2,
+    "panel_selectors": [
+        "[data-tid='roster-panel']",
+        "[data-tid*='roster-panel']",
+        "[data-tid='roster-panel-content']",
+        "[data-tid*='participants-panel']",
+        "[data-tid*='people-panel']",
+        "[data-tid*='right-side-panel']",
+        "[aria-label*='Participants'][role='dialog']",
+        "[aria-label*='People'][role='dialog']",
+        "[title*='Participants'][role='dialog']",
+        "[title*='People'][role='dialog']",
+    ],
+    "panel_button_selectors": [
+        "#roster-button",
+        "button[aria-label*='Participants']",
+        "button[aria-label*='People']",
+        "button[title*='Participants']",
+        "button[title*='People']",
+        "button:has-text('Participants')",
+        "button:has-text('People')",
+        "[role='button'][aria-label*='Show Participants']",
+        "[role='button'][aria-label*='Show participants']",
+        "[role='button'][title*='Participants']",
+        "[data-tid='roster-button']",
+        "[data-tid*='participants']",
+        "[data-tid*='roster']",
+    ],
+    "row_selectors": [
+        "[role='listitem']",
+        "[role='row']",
+        "[role='treeitem']",
+        "[role='option']",
+        "[role='menuitem']",
+        "[data-tid*='participant']",
+        "[data-tid*='roster-item']",
+        "[data-tid*='people-picker']",
+        "[data-tid*='persona']",
+        "[data-tid*='member']",
+        ".roster-item",
+        "[class*='participant']",
+        "[class*='roster']",
+        "[class*='persona']",
+    ],
+    "tile_selectors": [
+        "[data-tid*='video-tile']",
+        "[data-tid*='calling-participant']",
+        "[data-tid*='grid-tile']",
+        ".video-tile",
+        "[class*='videoTile']",
+    ],
+    "name_selectors": [
+        "[data-tid*='display-name']",
+        "[data-tid*='participant-name']",
+        "[data-tid*='persona-name']",
+        "[data-tid*='roster-name']",
+        "[data-tid*='item-display-name']",
+        "[id*='itemDisplayName']",
+        "[class*='displayName']",
+        "[class*='participant-name']",
+        "[class*='persona']",
+        "[class*='name']",
+    ],
+    "speaking_selectors": [
+        "[data-tid='voice-level-stream-outline']",
+        "[data-tid*='voice-level']",
+        "[data-tid*='speaking']",
+        "[aria-label*='speaking']",
+        "[title*='speaking']",
+        "[class*='speaking']",
+        "[class*='active-speaker']",
+        "[class*='talking']",
+        ".vdi-frame-occlusion",
+    ],
+    "identity_attributes": [
+        "data-participant-id",
+        "data-user-id",
+        "data-object-id",
+        "data-person-id",
+        "data-id",
+        "data-key",
+        "data-item-key",
+    ],
+    "participant_keywords": [
+        "participant",
+        "participants",
+        "people",
+        "roster",
+        "attendee",
+        "member",
+        "guest",
+        "show participants",
+        "katılımcı",
+        "katilimci",
+        "kişi",
+        "kisi",
+    ],
+}
 
 
 def get_db_path():
@@ -379,6 +478,572 @@ async def open_more_menu(page):
     return False
 
 
+async def install_participant_registry_hook(page):
+    try:
+        return await page.evaluate(
+            """(config) => {
+              const version = Number(config?.version || 1);
+              if (window.__noteraParticipantRegistry?.version === version) {
+                window.__noteraParticipantRegistry.config = config;
+                window.__noteraParticipantRegistry.ensureObserver();
+                return true;
+              }
+
+              const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+              const lower = (value) => normalize(value).toLowerCase();
+              const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const listHasMatch = (value, values) => values.some((candidate) => lower(value).includes(lower(candidate)));
+              const hasParticipantHint = (value) => listHasMatch(value, config.participant_keywords || []);
+              const participantHeaderVisible = (root) => {
+                const header = root?.querySelector?.('[data-tid="right-side-panel-header-title"], [role="heading"], h1, h2, h3');
+                const headerText = normalize(header?.innerText || header?.getAttribute?.('aria-label') || header?.getAttribute?.('title') || '');
+                return hasParticipantHint(headerText);
+              };
+              const isLikelyDisplayName = (value) => {
+                const candidate = normalize(value);
+                if (!candidate || candidate.length > 120) return false;
+                if (/^(participants?|people|meeting chat|chat|search|call controls|more options)$/i.test(candidate)) return false;
+                if (/^(organizer|presenter|attendee|guest|speaker|microphone|muted)$/i.test(candidate)) return false;
+                return true;
+              };
+              const queryAllSafe = (root, selectors) => {
+                const results = [];
+                for (const selector of selectors || []) {
+                  try {
+                    results.push(...Array.from(root.querySelectorAll(selector)));
+                  } catch (_err) {
+                    continue;
+                  }
+                }
+                return results;
+              };
+              const pushUnique = (values, node) => {
+                if (!node || values.includes(node) || !isVisible(node)) return;
+                values.push(node);
+              };
+              const extractAttribute = (row, names) => {
+                for (const name of names || []) {
+                  const direct = row.getAttribute?.(name);
+                  if (direct) return direct;
+                }
+                for (const child of Array.from(row.querySelectorAll('*')).slice(0, 12)) {
+                  for (const name of names || []) {
+                    const value = child.getAttribute?.(name);
+                    if (value) return value;
+                  }
+                }
+                return '';
+              };
+              const extractDisplayName = (row, lines) => {
+                for (const selector of config.name_selectors || []) {
+                  try {
+                    const node = row.querySelector(selector);
+                    const value = normalize(node?.innerText || node?.getAttribute?.('aria-label') || node?.getAttribute?.('title') || '');
+                    if (isLikelyDisplayName(value)) return value;
+                  } catch (_err) {
+                    continue;
+                  }
+                }
+                return lines.find((line) => isLikelyDisplayName(line)) || '';
+              };
+              const detectSpeaking = (row, text) => {
+                if (queryAllSafe(row, config.speaking_selectors).length > 0) {
+                  return true;
+                }
+                return /(currently speaking|is speaking|konusuyor|konuşuyor|speaking|talking)/.test(lower(text));
+              };
+              const buildEntry = (row, sourceKind) => {
+                if (!isVisible(row)) return null;
+                const text = normalize(row.innerText || row.getAttribute('aria-label') || row.getAttribute('title') || '');
+                if (!text || text.length > 400) return null;
+                const lines = text.split('\\n').map((line) => normalize(line)).filter(Boolean);
+                const displayName = extractDisplayName(row, lines);
+                if (!isLikelyDisplayName(displayName)) return null;
+                const stableKey =
+                  extractAttribute(row, ['data-key', 'data-item-key', 'data-id', 'data-person-id'])
+                  || row.id
+                  || row.getAttribute('aria-posinset')
+                  || '';
+                const platformIdentity =
+                  extractAttribute(row, config.identity_attributes)
+                  || row.dataset?.participantId
+                  || row.dataset?.personId
+                  || '';
+                const lowered = lower(text);
+                const roleLine = lines.find((line) => /(organizer|presenter|attendee|sunucu|duzenleyen)/i.test(line)) || '';
+                return {
+                  display_name: displayName,
+                  stable_key: stableKey,
+                  platform_identity: platformIdentity,
+                  role: roleLine || null,
+                  join_state: /(left|not in this meeting|ayrildi|ayrıldı)/.test(lowered) ? 'left' : 'present',
+                  is_speaking: detectSpeaking(row, text),
+                  is_muted: /(muted|mic off|microphone off|mikrofon kapali|mikrofon kapalı|sesi kapali|sesi kapalı)/.test(lowered),
+                  is_bot: /transcription bot|notera bot| bot$/i.test(displayName),
+                  dom_key: [
+                    sourceKind,
+                    stableKey,
+                    row.getAttribute('data-tid') || '',
+                    row.getAttribute('role') || '',
+                    row.getAttribute('aria-label') || '',
+                    row.className || '',
+                  ].filter(Boolean).join('|'),
+                };
+              };
+              const findPanelRoots = () => {
+                const roots = [];
+                for (const selector of config.panel_selectors || []) {
+                  try {
+                    const node = document.querySelector(selector);
+                    if (node?.getAttribute?.('data-tid') === 'calling-right-side-panel' && !participantHeaderVisible(node)) {
+                      continue;
+                    }
+                    pushUnique(roots, node);
+                  } catch (_err) {
+                    continue;
+                  }
+                }
+                const genericContainers = Array.from(document.querySelectorAll('[role="dialog"], aside, [role="complementary"], section, div'));
+                for (const node of genericContainers) {
+                  if (!isVisible(node)) continue;
+                  const ownText = lower([
+                    node.getAttribute('data-tid'),
+                    node.getAttribute('aria-label'),
+                    node.getAttribute('title'),
+                  ].filter(Boolean).join(' '));
+                  const header = node.querySelector('[data-tid="right-side-panel-header-title"], [role="heading"], h1, h2, h3');
+                  const headingText = lower(header?.innerText || header?.getAttribute?.('aria-label') || header?.getAttribute?.('title') || '');
+                  if (hasParticipantHint(`${ownText} ${headingText}`)) {
+                    pushUnique(roots, node);
+                  }
+                }
+                return roots;
+              };
+              const collectFromRoots = (roots, sourceKind, results, seen) => {
+                for (const root of roots) {
+                  const rows = queryAllSafe(root, config.row_selectors);
+                  for (const row of rows) {
+                    const entry = buildEntry(row, sourceKind);
+                    if (!entry) continue;
+                    const dedupeKey = `${entry.stable_key}|${entry.platform_identity}|${entry.display_name}|${sourceKind}`;
+                    if (seen.has(dedupeKey)) continue;
+                    seen.add(dedupeKey);
+                    results.push(entry);
+                  }
+                }
+              };
+              const collectVideoTileFallback = (results, seen) => {
+                const tiles = queryAllSafe(document, config.tile_selectors);
+                for (const tile of tiles) {
+                  const entry = buildEntry(tile, 'video_tile');
+                  if (!entry) continue;
+                  const dedupeKey = `${entry.stable_key}|${entry.platform_identity}|${entry.display_name}|video_tile`;
+                  if (seen.has(dedupeKey)) continue;
+                  seen.add(dedupeKey);
+                  results.push(entry);
+                }
+              };
+              const collectSnapshot = () => {
+                const results = [];
+                const seen = new Set();
+                const roots = findPanelRoots();
+                collectFromRoots(roots, 'participant_panel', results, seen);
+                if (!results.length) {
+                  collectVideoTileFallback(results, seen);
+                }
+                return results;
+              };
+
+              const state = {
+                version,
+                config,
+                observer: null,
+                lastSnapshot: [],
+                lastMutationAtMs: null,
+                refresh() {
+                  this.lastSnapshot = collectSnapshot();
+                  this.lastMutationAtMs = Date.now();
+                  return this.lastSnapshot;
+                },
+                ensureObserver() {
+                  if (this.observer || !document.body) return;
+                  this.observer = new MutationObserver(() => {
+                    this.refresh();
+                  });
+                  this.observer.observe(document.body, {
+                    subtree: true,
+                    childList: true,
+                    attributes: true,
+                    attributeFilter: ['data-tid', 'aria-label', 'title', 'class', 'style'],
+                  });
+                },
+                disconnect() {
+                  if (this.observer) {
+                    this.observer.disconnect();
+                    this.observer = null;
+                  }
+                },
+              };
+
+              state.refresh();
+              state.ensureObserver();
+              window.__noteraParticipantRegistry = state;
+              window.__noteraGetParticipantSnapshot = () => {
+                state.ensureObserver();
+                return {
+                  items: state.refresh(),
+                  changed_at_ms: state.lastMutationAtMs,
+                };
+              };
+              return true;
+            }""",
+            PARTICIPANT_REGISTRY_CONFIG,
+        )
+    except Exception as e:
+        logger.debug("Could not install participant registry hook: %s", e)
+        return False
+
+
+async def participant_panel_visible(page):
+    selectors = PARTICIPANT_REGISTRY_CONFIG["panel_selectors"]
+    for selector in selectors:
+        try:
+            if not await page.locator(selector).first.is_visible(timeout=250):
+                continue
+            if selector == "[data-tid*='right-side-panel']":
+                header_text = await page.evaluate(
+                    """() => {
+                      const root = document.querySelector('[data-tid="calling-right-side-panel"]');
+                      const header = root?.querySelector?.('[data-tid="right-side-panel-header-title"], [role="heading"], h1, h2, h3');
+                      return (header?.innerText || header?.getAttribute?.('aria-label') || header?.getAttribute?.('title') || '').trim();
+                    }"""
+                )
+                if not re.search(r"participant|people|roster|katılımc|kisi|kişi", (header_text or ""), re.IGNORECASE):
+                    continue
+                return True
+        except Exception:
+            continue
+    try:
+        return await page.evaluate(
+            """() => {
+              const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const hasParticipantHint = (value) => /participant|people|roster|attendee|member|guest|katılımc|kisi|kişi/.test(value);
+              const candidates = Array.from(document.querySelectorAll('[role="dialog"], aside, [role="complementary"], section, div'));
+              for (const node of candidates) {
+                if (!isVisible(node)) continue;
+                const ownText = normalize([
+                  node.getAttribute('data-tid'),
+                  node.getAttribute('aria-label'),
+                  node.getAttribute('title'),
+                ].filter(Boolean).join(' '));
+                const headingText = normalize(
+                  (node.querySelector('[data-tid="right-side-panel-header-title"], h1, h2, h3, [role="heading"]')?.innerText || '')
+                );
+                if (!hasParticipantHint(`${ownText} ${headingText}`)) continue;
+                const hasRows = node.querySelector(
+                  '[role="listitem"], [role="row"], [role="treeitem"], [role="option"], [data-tid*="participant"], [data-tid*="persona"], [data-tid*="roster"], [class*="participant"], [class*="roster"], [class*="persona"]'
+                );
+                if (hasRows || headingText) {
+                  return true;
+                }
+              }
+              return false;
+            }"""
+        )
+    except Exception:
+        return False
+
+
+async def open_participant_panel(page):
+    if await participant_panel_visible(page):
+        return True
+    selectors = PARTICIPANT_REGISTRY_CONFIG["panel_button_selectors"]
+    if await click_first_visible_selector(page, selectors, "participant panel", wait_after=1):
+        return await participant_panel_visible(page)
+    try:
+        clicked = await page.evaluate(
+            """() => {
+              const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const scoreFor = (value) => {
+                let score = 0;
+                if (/participants?/.test(value)) score += 6;
+                if (/people/.test(value)) score += 5;
+                if (/roster/.test(value)) score += 4;
+                if (/member|attendee|guest/.test(value)) score += 3;
+                if (/chat and people/.test(value)) score += 2;
+                if (/katılımc|kisi|kişi/.test(value)) score += 4;
+                if (/chat/.test(value) && !/people|participant/.test(value)) score -= 3;
+                if (/more/.test(value)) score -= 2;
+                return score;
+              };
+              let best = null;
+              let bestScore = 0;
+              for (const node of Array.from(document.querySelectorAll('button, [role="button"], [role="tab"]'))) {
+                if (!isVisible(node)) continue;
+                const text = normalize([
+                  node.innerText,
+                  node.getAttribute('aria-label'),
+                  node.getAttribute('title'),
+                  node.getAttribute('data-tid'),
+                  node.id,
+                ].filter(Boolean).join(' '));
+                const score = scoreFor(text);
+                if (score > bestScore) {
+                  best = node;
+                  bestScore = score;
+                }
+              }
+              if (!best || bestScore <= 0) return false;
+              best.click();
+              return true;
+            }"""
+        )
+        if clicked:
+            logger.info("Opened participant panel via generic button scan.")
+            await asyncio.sleep(1)
+            return await participant_panel_visible(page)
+    except Exception as e:
+        logger.debug("Generic participant panel opener failed: %s", e)
+    return False
+
+
+async def collect_participant_registry_snapshot(page, observed_at):
+    await install_participant_registry_hook(page)
+    snapshot = await page.evaluate(
+        "() => window.__noteraGetParticipantSnapshot ? window.__noteraGetParticipantSnapshot() : ({items: []})"
+    )
+    items = (snapshot or {}).get("items") or []
+    normalized_items = []
+    for item in items or []:
+        display_name, role_value = split_participant_display_name(
+            item.get("display_name") or "",
+            item.get("role"),
+        )
+        if not display_name:
+            continue
+        stable_key = normalize_caption_text(item.get("stable_key"))
+        platform_identity = normalize_caption_text(item.get("platform_identity"))
+        if is_generic_participant_identity(stable_key):
+            stable_key = ""
+        if is_generic_participant_identity(platform_identity):
+            platform_identity = ""
+        normalized_items.append(
+            {
+                "display_name": display_name,
+                "stable_key": stable_key,
+                "platform_identity": platform_identity,
+                "role": role_value,
+                "join_state": normalize_caption_text(item.get("join_state")) or "present",
+                "is_speaking": bool(item.get("is_speaking")),
+                "is_muted": bool(item.get("is_muted")),
+                "dom_key": normalize_caption_text(item.get("dom_key")),
+                "is_bot": bool(item.get("is_bot")) or is_bot_participant_name(display_name),
+                "observed_at": observed_at,
+            }
+        )
+    deduped_items = {}
+    for item in normalized_items:
+        dedupe_key = (
+            item.get("platform_identity")
+            or item.get("stable_key")
+            or item.get("display_name", "").casefold()
+        )
+        current = deduped_items.get(dedupe_key)
+        if current is None:
+            deduped_items[dedupe_key] = item
+            continue
+        current_score = int(bool(current.get("platform_identity"))) * 4 + int(bool(current.get("stable_key"))) * 2 + int(bool(current.get("role")))
+        next_score = int(bool(item.get("platform_identity"))) * 4 + int(bool(item.get("stable_key"))) * 2 + int(bool(item.get("role")))
+        if next_score > current_score:
+            deduped_items[dedupe_key] = item
+
+    final_items = list(deduped_items.values())
+    by_display_name = {}
+    for item in final_items:
+        display_key = item.get("display_name", "").casefold()
+        current = by_display_name.get(display_key)
+        if current is None:
+            by_display_name[display_key] = item
+            continue
+        current_score = int(bool(current.get("platform_identity"))) * 4 + int(bool(current.get("stable_key"))) * 2 + int(bool(current.get("role")))
+        next_score = int(bool(item.get("platform_identity"))) * 4 + int(bool(item.get("stable_key"))) * 2 + int(bool(item.get("role")))
+        if next_score > current_score:
+            by_display_name[display_key] = item
+
+    return list(by_display_name.values())
+
+
+async def collect_participant_debug_state(page):
+    try:
+        return await page.evaluate(
+            """(config) => {
+              const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+              const lower = (value) => normalize(value).toLowerCase();
+              const isVisible = (node) => {
+                if (!node) return false;
+                const style = window.getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const summarize = (node) => ({
+                tag: node.tagName,
+                data_tid: node.getAttribute('data-tid') || '',
+                role: node.getAttribute('role') || '',
+                aria_label: node.getAttribute('aria-label') || '',
+                title: node.getAttribute('title') || '',
+                class_name: String(node.className || '').slice(0, 200),
+                text: normalize(node.innerText || '').slice(0, 300),
+              });
+              const visibleButtons = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"]'))
+                .filter((node) => isVisible(node))
+                .map((node) => summarize(node))
+                .filter((item) => /participant|people|roster|katılımc|kisi|kişi/.test(lower([item.aria_label, item.title, item.text, item.data_tid].join(' '))))
+                .slice(0, 20);
+              const visiblePanels = Array.from(document.querySelectorAll('[role="dialog"], aside, [role="complementary"], section, div'))
+                .filter((node) => isVisible(node))
+                .map((node) => summarize(node))
+                .filter((item) => /participant|people|roster|katılımc|kisi|kişi/.test(lower([item.aria_label, item.title, item.text, item.data_tid].join(' '))))
+                .slice(0, 20);
+              let rowCount = 0;
+              for (const selector of config?.row_selectors || []) {
+                try {
+                  rowCount += document.querySelectorAll(selector).length;
+                } catch (_err) {
+                  continue;
+                }
+              }
+              let tileCount = 0;
+              for (const selector of config?.tile_selectors || []) {
+                try {
+                  tileCount += document.querySelectorAll(selector).length;
+                } catch (_err) {
+                  continue;
+                }
+              }
+              return {
+                observer_installed: Boolean(window.__noteraParticipantRegistry?.observer),
+                snapshot_count: (window.__noteraParticipantRegistry?.lastSnapshot || []).length,
+                visible_buttons: visibleButtons,
+                visible_panels: visiblePanels,
+                row_selector_match_count: rowCount,
+                tile_selector_match_count: tileCount,
+              };
+            }""",
+            PARTICIPANT_REGISTRY_CONFIG,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def sync_speaker_activity(meeting_id, participant_items, active_speaker_state, current_offset_ms):
+    seen_keys = set()
+    for item in participant_items:
+        participant_key = extract_participant_key(item)
+        participant_id = upsert_meeting_participant(
+            meeting_id,
+            participant_key,
+            item.get("display_name") or "Unknown",
+            platform_identity=item.get("platform_identity") or None,
+            role=item.get("role") or None,
+            is_bot=bool(item.get("is_bot")),
+            join_state=item.get("join_state") or "present",
+        )
+        if participant_id <= 0:
+            continue
+        seen_keys.add(participant_key)
+        if item.get("dom_key"):
+            register_identity_evidence(
+                meeting_id,
+                participant_id,
+                "dom_key",
+                item["dom_key"],
+                confidence=0.95,
+                payload={"participant_key": participant_key},
+            )
+        if item.get("platform_identity"):
+            register_identity_evidence(
+                meeting_id,
+                participant_id,
+                "platform_identity",
+                item["platform_identity"],
+                confidence=0.98,
+                payload={"participant_key": participant_key},
+            )
+
+        active_entry = active_speaker_state.get(participant_key)
+        if item.get("is_speaking"):
+            if active_entry is None:
+                active_speaker_state[participant_key] = {
+                    "participant_id": participant_id,
+                    "start_offset_ms": current_offset_ms,
+                    "last_seen_offset_ms": current_offset_ms,
+                }
+            else:
+                active_entry["participant_id"] = participant_id
+                active_entry["last_seen_offset_ms"] = current_offset_ms
+        elif active_entry is not None:
+            append_speaker_activity_interval(
+                meeting_id,
+                active_entry["participant_id"],
+                active_entry["start_offset_ms"],
+                current_offset_ms,
+                source="roster_speaking_indicator",
+                confidence=0.91,
+                metadata={"participant_key": participant_key},
+            )
+            del active_speaker_state[participant_key]
+
+    stale_keys = []
+    for participant_key, entry in active_speaker_state.items():
+        if participant_key in seen_keys:
+            continue
+        if current_offset_ms - entry.get("last_seen_offset_ms", current_offset_ms) < 3000:
+            continue
+        append_speaker_activity_interval(
+            meeting_id,
+            entry["participant_id"],
+            entry["start_offset_ms"],
+            current_offset_ms,
+            source="roster_speaking_indicator",
+            confidence=0.75,
+            metadata={"participant_key": participant_key, "closed_reason": "participant_missing"},
+        )
+        stale_keys.append(participant_key)
+    for participant_key in stale_keys:
+        active_speaker_state.pop(participant_key, None)
+
+
+def flush_speaker_activity(meeting_id, active_speaker_state, current_offset_ms):
+    for participant_key, entry in list(active_speaker_state.items()):
+        append_speaker_activity_interval(
+            meeting_id,
+            entry["participant_id"],
+            entry["start_offset_ms"],
+            current_offset_ms,
+            source="roster_speaking_indicator",
+            confidence=0.7,
+            metadata={"participant_key": participant_key, "closed_reason": "meeting_end"},
+        )
+        active_speaker_state.pop(participant_key, None)
+
+
 async def open_language_and_speech_menu(page):
     """Open the Language and speech submenu when Teams exposes captions there."""
     language_and_speech_selectors = [
@@ -643,6 +1308,398 @@ def register_audio_asset(
         conn.commit()
     except Exception as e:
         logger.error("Failed registering audio asset for meeting %s: %s", meeting_id, e)
+    finally:
+        conn.close()
+
+
+def normalize_participant_name(value):
+    return normalize_caption_text(value)
+
+
+def is_bot_participant_name(value):
+    normalized = normalize_participant_name(value).casefold()
+    return normalized in {"transcription bot", "notera bot", "bot"} or normalized.endswith(" bot")
+
+
+def is_generic_participant_identity(value):
+    normalized = normalize_caption_text(value).casefold()
+    if not normalized:
+        return False
+    generic_fragments = (
+        "participant-avatar",
+        "avatar-image-container",
+        "avatar",
+        "image-container",
+        "voice-level-stream-outline",
+        "ai-interpreter-outline",
+        "outline",
+    )
+    return any(fragment in normalized for fragment in generic_fragments)
+
+
+def split_participant_display_name(display_name, role_hint=None):
+    cleaned_name = normalize_participant_name(display_name)
+    cleaned_role = normalize_caption_text(role_hint)
+    if not cleaned_name:
+        return "", cleaned_role or None
+
+    suffix_match = re.match(
+        r"^(?P<name>.+?)\s*\((?P<role>guest|organizer|presenter|attendee)\)$",
+        cleaned_name,
+        re.IGNORECASE,
+    )
+    if suffix_match:
+        return (
+            normalize_participant_name(suffix_match.group("name")),
+            normalize_caption_text(suffix_match.group("role")),
+        )
+
+    inline_match = re.match(
+        r"^(?P<name>.+?)\s+(?P<role>Organizer|Guest|Presenter|Attendee)$",
+        cleaned_name,
+        re.IGNORECASE,
+    )
+    if inline_match:
+        return (
+            normalize_participant_name(inline_match.group("name")),
+            normalize_caption_text(inline_match.group("role")),
+        )
+
+    return cleaned_name, cleaned_role or None
+
+
+def extract_participant_key(item):
+    stable_key = normalize_caption_text(item.get("stable_key"))
+    platform_identity = normalize_caption_text(item.get("platform_identity"))
+    if is_generic_participant_identity(stable_key):
+        stable_key = ""
+    if is_generic_participant_identity(platform_identity):
+        platform_identity = ""
+    display_name = normalize_participant_name(item.get("display_name") or item.get("name") or "Unknown")
+    if stable_key:
+        return f"teams-roster:{stable_key}"
+    if platform_identity:
+        return f"teams-platform:{platform_identity}"
+    bucket = int(datetime.utcnow().timestamp() // 900)
+    return f"teams-name:{display_name.casefold()}:{bucket}"
+
+
+def upsert_meeting_participant(
+    meeting_id,
+    participant_key,
+    display_name,
+    platform_identity=None,
+    role=None,
+    is_bot=False,
+    join_state="present",
+):
+    cleaned_display_name = normalize_participant_name(display_name) or "Unknown"
+    normalized_name = cleaned_display_name.casefold()
+    now_iso = datetime.utcnow().isoformat()
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        existing = cursor.execute(
+            """
+            SELECT id
+            FROM meetingparticipant
+            WHERE meeting_id = ? AND participant_key = ?
+            LIMIT 1
+            """,
+            (meeting_id, participant_key),
+        ).fetchone()
+        if existing:
+            cursor.execute(
+                """
+                UPDATE meetingparticipant
+                SET platform_identity = COALESCE(?, platform_identity),
+                    display_name = ?,
+                    normalized_name = ?,
+                    role = COALESCE(?, role),
+                    is_bot = COALESCE(?, is_bot),
+                    join_state = ?,
+                    last_seen_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    platform_identity,
+                    cleaned_display_name,
+                    normalized_name,
+                    role,
+                    1 if is_bot else 0,
+                    join_state,
+                    now_iso,
+                    now_iso,
+                    existing[0],
+                ),
+            )
+            conn.commit()
+            return int(existing[0])
+
+        cursor.execute(
+            """
+            INSERT INTO meetingparticipant (
+                meeting_id,
+                participant_key,
+                platform_identity,
+                display_name,
+                normalized_name,
+                role,
+                is_bot,
+                join_state,
+                first_seen_at,
+                last_seen_at,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                meeting_id,
+                participant_key,
+                platform_identity,
+                cleaned_display_name,
+                normalized_name,
+                role,
+                1 if is_bot else 0,
+                join_state,
+                now_iso,
+                now_iso,
+                now_iso,
+                now_iso,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    except Exception as e:
+        logger.error("Failed upserting meeting participant for meeting %s: %s", meeting_id, e)
+        return 0
+    finally:
+        conn.close()
+
+
+def register_identity_evidence(
+    meeting_id,
+    participant_id,
+    evidence_type,
+    evidence_value,
+    confidence=0.0,
+    audio_source_id=None,
+    payload=None,
+):
+    if participant_id <= 0 or not evidence_value:
+        return
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO identityevidence (
+                meeting_id,
+                participant_id,
+                audio_source_id,
+                evidence_type,
+                evidence_value,
+                confidence,
+                observed_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                meeting_id,
+                participant_id,
+                audio_source_id,
+                evidence_type,
+                evidence_value,
+                confidence,
+                datetime.utcnow().isoformat(),
+                json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.debug("Failed recording identity evidence for meeting %s: %s", meeting_id, e)
+    finally:
+        conn.close()
+
+
+def register_audio_source(
+    meeting_id,
+    source_key,
+    source_kind,
+    track_id=None,
+    stream_id=None,
+    file_path=None,
+    fmt=None,
+    status="pending",
+):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    now_iso = datetime.utcnow().isoformat()
+    try:
+        existing = cursor.execute(
+            """
+            SELECT id
+            FROM audiosource
+            WHERE meeting_id = ? AND source_key = ?
+            LIMIT 1
+            """,
+            (meeting_id, source_key),
+        ).fetchone()
+        if existing:
+            cursor.execute(
+                """
+                UPDATE audiosource
+                SET track_id = COALESCE(?, track_id),
+                    stream_id = COALESCE(?, stream_id),
+                    file_path = COALESCE(?, file_path),
+                    format = COALESCE(?, format),
+                    status = COALESCE(?, status),
+                    last_seen_at = ?,
+                    sample_rate_hz = COALESCE(sample_rate_hz, 16000),
+                    channel_count = COALESCE(channel_count, 1)
+                WHERE id = ?
+                """,
+                (
+                    track_id,
+                    stream_id,
+                    file_path,
+                    fmt,
+                    status,
+                    now_iso,
+                    existing[0],
+                ),
+            )
+            conn.commit()
+            return int(existing[0])
+        cursor.execute(
+            """
+            INSERT INTO audiosource (
+                meeting_id,
+                source_key,
+                source_kind,
+                track_id,
+                stream_id,
+                file_path,
+                format,
+                sample_rate_hz,
+                channel_count,
+                first_seen_at,
+                last_seen_at,
+                status,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                meeting_id,
+                source_key,
+                source_kind,
+                track_id,
+                stream_id,
+                file_path,
+                fmt,
+                16000 if fmt == "wav" else None,
+                1 if fmt == "wav" else None,
+                now_iso,
+                now_iso,
+                status,
+                now_iso,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    except Exception as e:
+        logger.error("Failed registering audio source for meeting %s: %s", meeting_id, e)
+        return 0
+    finally:
+        conn.close()
+
+
+def write_participant_snapshot_debug(meeting_id, observed_at, participant_items, debug_state=None):
+    if not DEBUG_ARTIFACTS_ENABLED:
+        return
+    try:
+        payload = {
+            "meeting_id": meeting_id,
+            "observed_at": observed_at.isoformat() if observed_at else None,
+            "participant_count": len(participant_items or []),
+            "items": participant_items or [],
+            "debug_state": debug_state or {},
+        }
+        path = get_bot_debug_path(f"participant_snapshot_meeting_{meeting_id}.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.debug("Could not write participant snapshot debug for meeting %s: %s", meeting_id, e)
+
+
+def finalize_audio_sources(meeting_id, status="ready"):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    now_iso = datetime.utcnow().isoformat()
+    try:
+        cursor.execute(
+            """
+            UPDATE audiosource
+            SET status = ?,
+                last_seen_at = COALESCE(last_seen_at, ?)
+            WHERE meeting_id = ?
+            """,
+            (status, now_iso, meeting_id),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error("Failed finalizing audio sources for meeting %s: %s", meeting_id, e)
+    finally:
+        conn.close()
+
+
+def append_speaker_activity_interval(
+    meeting_id,
+    participant_id,
+    start_offset_ms,
+    end_offset_ms,
+    source="roster_speaking_indicator",
+    confidence=0.0,
+    metadata=None,
+):
+    if participant_id <= 0 or end_offset_ms <= start_offset_ms:
+        return
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO speakeractivityevent (
+                meeting_id,
+                participant_id,
+                start_offset_ms,
+                end_offset_ms,
+                source,
+                confidence,
+                metadata_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                meeting_id,
+                participant_id,
+                int(start_offset_ms),
+                int(end_offset_ms),
+                source,
+                confidence,
+                json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error("Failed saving speaker activity interval for meeting %s: %s", meeting_id, e)
     finally:
         conn.close()
 
@@ -1528,9 +2585,21 @@ async def install_teams_audio_hook(context):
               audioEl.dataset.noteraRemoteTrackId = trackId;
               audioEl.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;';
               ensureContainer().appendChild(audioEl);
-              const entry = {{ trackId, track, stream, audioEl }};
+              const entry = {{ trackId, track, stream, streamId: stream.id || '', audioEl }};
               remoteAudioEntries.set(trackId, entry);
               connectToRecorderIfReady(entry);
+              if (typeof window.__noteraRegisterAudioSource === 'function') {{
+                Promise.resolve(window.__noteraRegisterAudioSource({{
+                  source_key: `webrtc:track:${{trackId}}`,
+                  source_kind: 'webrtc_remote_track',
+                  track_id: trackId,
+                  stream_id: entry.streamId || '',
+                  format: 'webm',
+                  status: 'recording',
+                }})).catch((error) => {{
+                  console.warn('[Notera] Failed registering audio source', error);
+                }});
+              }}
 
               const cleanup = () => {{
                 remoteAudioEntries.delete(trackId);
@@ -1657,6 +2726,20 @@ async def install_teams_audio_hook(context):
 
             const audioEntries = Array.from(remoteAudioEntries.values());
             for (const entry of audioEntries) {{
+              if (typeof window.__noteraRegisterAudioSource === 'function') {{
+                try {{
+                  await window.__noteraRegisterAudioSource({{
+                    source_key: `webrtc:track:${{entry.trackId}}`,
+                    source_kind: 'webrtc_remote_track',
+                    track_id: entry.trackId,
+                    stream_id: entry.streamId || '',
+                    format: 'webm',
+                    status: 'recording',
+                  }});
+                }} catch (error) {{
+                  console.warn('[Notera] Failed backfilling audio source registration', error);
+                }}
+              }}
               await controller.connectEntry(entry);
             }}
 
@@ -1752,11 +2835,27 @@ async def get_remote_audio_info(page):
         return {"count": 0, "activeRecorderSources": 0}
 
 
-async def start_browser_audio_capture(page, chunk_writer):
+async def start_browser_audio_capture(page, chunk_writer, meeting_id):
     try:
         await page.expose_function("__noteraSaveAudioChunk", chunk_writer.save_chunk)
     except Exception as e:
         if "__noteraSaveAudioChunk" not in str(e):
+            raise
+    try:
+        await page.expose_function(
+            "__noteraRegisterAudioSource",
+            lambda payload: register_audio_source(
+                meeting_id,
+                (payload or {}).get("source_key") or f"webrtc:track:{datetime.utcnow().timestamp()}",
+                (payload or {}).get("source_kind") or "webrtc_remote_track",
+                track_id=(payload or {}).get("track_id"),
+                stream_id=(payload or {}).get("stream_id"),
+                fmt=(payload or {}).get("format"),
+                status=(payload or {}).get("status") or "recording",
+            ),
+        )
+    except Exception as e:
+        if "__noteraRegisterAudioSource" not in str(e):
             raise
 
     deadline = asyncio.get_running_loop().time() + 30
@@ -1846,7 +2945,9 @@ async def run_bot(meeting_url, meeting_id):
     audio_capture_error = None
     audio_failure_notified = False
     chunk_writer = MeetingAudioChunkWriter(meeting_id) if audio_recording_enabled else None
-    caption_event_sequence = 0
+    participant_panel_opened = False
+    active_speaker_state = {}
+    meeting_started_monotonic = None
 
     if audio_recording_enabled:
         update_audio_status(meeting_id, AUDIO_STATUS_PENDING, None)
@@ -2010,32 +3111,52 @@ async def run_bot(meeting_url, meeting_id):
                 await page.screenshot(path=screenshot_path)
                 return
 
-            logger.info("Joined successfully! Monitoring for captions...")
+            logger.info("Joined successfully! Monitoring participant registry and audio sources...")
             update_meeting_status(meeting_id, "active")
+            meeting_started_monotonic = asyncio.get_running_loop().time()
 
             await asyncio.sleep(15)
             await page.screenshot(path=meeting_screenshot_path)
             logger.info("Post-join screenshot taken. Stopping periodic shots.")
             stop_screenshots.set()
 
-            logger.info("Enabling live captions in the bot session.")
             await dump_dom(page, "initial_join_dom.html")
-            initial_caption_enabled = await try_enable_live_captions(page)
-            if initial_caption_enabled:
-                logger.info("Live captions enabled immediately after join.")
+            await install_participant_registry_hook(page)
+            participant_panel_opened = await open_participant_panel(page)
+            if participant_panel_opened:
+                logger.info("Participant panel opened successfully.")
             else:
-                logger.warning("Initial live caption enable attempt did not produce a caption DOM.")
+                logger.warning("Participant panel could not be opened immediately after join.")
+
+            async def restore_participant_panel(reason):
+                nonlocal participant_panel_opened
+                participant_panel_opened = await open_participant_panel(page)
+                if participant_panel_opened:
+                    logger.info("Participant panel restored after %s.", reason)
+                else:
+                    logger.warning("Participant panel could not be restored after %s.", reason)
+                return participant_panel_opened
 
             if audio_recording_enabled and chunk_writer is not None:
-                started, audio_result, audio_error = await start_browser_audio_capture(page, chunk_writer)
+                started, audio_result, audio_error = await start_browser_audio_capture(page, chunk_writer, meeting_id)
                 if started:
                     audio_capture_started = True
+                    capture_started_at = datetime.utcnow().isoformat()
                     update_audio_status(meeting_id, AUDIO_STATUS_RECORDING, None)
+                    update_meeting_fields(meeting_id, audio_capture_started_at=capture_started_at)
                     register_audio_asset(
                         meeting_id,
                         str(get_meeting_master_audio_path(meeting_id, chunk_writer.format)),
                         chunk_writer.format,
                         AUDIO_STATUS_RECORDING,
+                    )
+                    register_audio_source(
+                        meeting_id,
+                        "meeting:master",
+                        "meeting_mixed_master",
+                        file_path=str(get_meeting_master_audio_path(meeting_id, chunk_writer.format)),
+                        fmt=chunk_writer.format,
+                        status=AUDIO_STATUS_RECORDING,
                     )
                     logger.info("Browser audio capture started: %s", audio_result)
                 else:
@@ -2043,72 +3164,24 @@ async def run_bot(meeting_url, meeting_id):
                     logger.warning("Browser audio capture could not start: %s", audio_capture_error)
                     update_audio_status(meeting_id, AUDIO_STATUS_FAILED, audio_capture_error)
                     audio_failure_notified = await send_chat_message(page, CHAT_AUDIO_FAILURE_MESSAGE)
+                    await restore_participant_panel("audio failure chat message")
 
-            logger.info("Starting caption monitoring...")
-            first_transcript_preview_captured = False
-            pending_captions = {}
-            caption_stream_sequence = 0
-            recent_caption_memory = deque(maxlen=512)
+            logger.info("Starting participant registry monitoring...")
             poll_count = 0
-            caption_discovery_done = False
-            caption_enable_attempts = 0
             chat_notice_sent = False
-            chat_language_help_sent = False
             chat_notice_attempts = 0
-            chat_language_help_attempts = 0
             known_chat_message_ids = set()
 
             if chat_notice_attempts < 3:
                 chat_notice_attempts += 1
                 chat_notice_sent = await send_chat_notice(page)
-            if chat_language_help_attempts < 3:
-                chat_language_help_attempts += 1
-                chat_language_help_sent = await send_chat_language_help_notice(page)
+                await restore_participant_panel("initial chat notice")
 
             for message in await get_chat_messages(page):
                 mid = message.get("mid")
                 if mid:
                     known_chat_message_ids.add(mid)
-
-            async def persist_caption_event(caption):
-                nonlocal caption_event_sequence, first_transcript_preview_captured
-
-                if not caption:
-                    return False
-
-                event_dt = caption.get("last_updated_at") or caption.get("first_seen") or datetime.utcnow()
-                action = save_caption_event(
-                    meeting_id,
-                    caption["speaker"],
-                    caption["text"],
-                    caption_event_sequence + 1,
-                    event_dt,
-                    caption.get("slot_index"),
-                    caption.get("revision_no", 0),
-                )
-                if action != "inserted":
-                    return False
-
-                caption_event_sequence += 1
-                _remember_recent_caption_event(recent_caption_memory, caption, event_dt)
-                log_event(
-                    logger,
-                    logging.INFO,
-                    "caption.event.saved",
-                    "Caption event persisted",
-                    slot_index=caption.get("slot_index"),
-                    revision_no=caption.get("revision_no", 0),
-                    speaker_known=normalize_caption_text(caption.get("speaker")).casefold() not in {"", "unknown"},
-                    **caption_metrics(caption.get("text")),
-                )
-                if not first_transcript_preview_captured:
-                    try:
-                        await page.screenshot(path=meeting_screenshot_path)
-                        first_transcript_preview_captured = True
-                        logger.info("Captured live meeting preview after first caption event.")
-                    except Exception as e:
-                        logger.warning("Failed to capture first transcript preview: %s", e)
-                return True
+            await restore_participant_panel("initial chat sync")
 
             while True:
                 try:
@@ -2120,170 +3193,22 @@ async def run_bot(meeting_url, meeting_id):
                         break
 
                     poll_count += 1
-                    now = datetime.now().timestamp()
+                    current_offset_ms = int(
+                        max(0.0, asyncio.get_running_loop().time() - (meeting_started_monotonic or asyncio.get_running_loop().time()))
+                        * 1000
+                    )
 
                     if poll_count % 120 == 0:
                         await dump_dom(page, "monitoring_debug_dom.html")
 
-                    if not caption_discovery_done and poll_count % 60 == 1:
-                        logger.info("Running caption element discovery scan...")
-                        discovery = await page.evaluate("""() => {
-                            const results = {};
-                            const patterns = [
-                                { name: 'data-tid caption', sel: '[data-tid*="caption"]' },
-                                { name: 'class caption', sel: '[class*="caption"]' },
-                                { name: 'role log', sel: '[role="log"]' },
-                                { name: 'data-tid closed-captions', sel: '[data-tid*="closed-captions"]' },
-                            ];
-                            for (const p of patterns) {
-                                const els = document.querySelectorAll(p.sel);
-                                if (els.length > 0) {
-                                    results[p.name] = {
-                                        count: els.length,
-                                        firstTag: els[0].tagName,
-                                        firstClass: String(els[0].className || '').substring(0, 80),
-                                        hasText: Boolean((els[0].innerText || '').trim()),
-                                    };
-                                }
-                            }
-                            return results;
-                        }""")
-                        if discovery:
-                            for pattern, info in discovery.items():
-                                logger.info("DISCOVERY [%s]: %s", pattern, info)
-                        else:
-                            logger.info("Discovery scan: No caption-related elements found yet.")
-                        if poll_count > 600:
-                            caption_discovery_done = True
-
-                    caption_items = await page.evaluate("""() => {
-                        const results = [];
-                        const maxVisibleCaptions = 8;
-                        const maxLogLines = 18;
-
-                        function domFingerprint(element, container) {
-                            if (!element) return '';
-                            const parts = [];
-                            let node = element;
-                            for (let depth = 0; depth < 4 && node && node !== container; depth += 1) {
-                                const tag = node.tagName || 'NODE';
-                                const tid = node.getAttribute?.('data-tid') || '';
-                                const key = node.getAttribute?.('data-key')
-                                    || node.getAttribute?.('data-item-key')
-                                    || node.getAttribute?.('aria-posinset')
-                                    || node.id
-                                    || '';
-                                const siblingIndex = node.parentElement
-                                    ? Array.from(node.parentElement.children).indexOf(node)
-                                    : 0;
-                                parts.push(`${tag}:${tid}:${key}:${siblingIndex}`);
-                                node = node.parentElement;
-                            }
-                            return parts.join('>');
-                        }
-
-                        function isVisibleInContainer(element, containerRect) {
-                            const rect = element.getBoundingClientRect();
-                            return rect.width > 0
-                                && rect.height > 0
-                                && rect.bottom >= containerRect.top - 2
-                                && rect.top <= containerRect.bottom + 2;
-                        }
-
-                        const wrapper = document.querySelector('[data-tid="closed-caption-renderer-wrapper"]');
-
-                        if (wrapper) {
-                            const wrapperRect = wrapper.getBoundingClientRect();
-                            const captionTexts = Array.from(wrapper.querySelectorAll('[data-tid="closed-caption-text"]'))
-                                .filter((textEl) => isVisibleInContainer(textEl, wrapperRect))
-                                .slice(-maxVisibleCaptions);
-                            const visibleCount = captionTexts.length;
-
-                            captionTexts.forEach((textEl, index) => {
-                                const text = textEl.innerText?.trim();
-                                if (!text) return;
-
-                                let speaker = 'Unknown';
-                                let node = textEl.parentElement;
-                                for (let i = 0; i < 8 && node && node !== wrapper; i++) {
-                                    const fullText = node.innerText?.trim() || '';
-                                    if (fullText.length > text.length) {
-                                        const lines = fullText.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-                                        const textIdx = lines.findIndex(l => l === text || text.startsWith(l) || l.startsWith(text));
-                                        if (textIdx > 0) {
-                                            const possibleSpeaker = lines[textIdx - 1];
-                                            if (possibleSpeaker && possibleSpeaker.length < 50 && possibleSpeaker !== text) {
-                                                speaker = possibleSpeaker;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    node = node.parentElement;
-                                }
-
-                                const container = textEl.closest('[data-tid*="closed-caption"]') || textEl.parentElement || textEl;
-                                results.push({
-                                    speaker,
-                                    text,
-                                    slot_hint: domFingerprint(container, wrapper),
-                                    visible_index: visibleCount - index - 1,
-                                });
-                            });
-                            return results;
-                        }
-
-                        const logs = Array.from(document.querySelectorAll('[role="log"]'));
-                        logs.forEach((log, logIndex) => {
-                            const lines = (log.innerText || '')
-                                .split('\\n')
-                                .map(line => line.trim())
-                                .filter(Boolean)
-                                .slice(-maxLogLines);
-                            if (lines.length < 2) {
-                                return;
-                            }
-
-                            const usableLines = lines.length % 2 === 0 ? lines : lines.slice(1);
-                            const pairCount = Math.floor(usableLines.length / 2);
-                            for (let i = 0; i < usableLines.length - 1; i += 2) {
-                                const speaker = usableLines[i];
-                                const text = usableLines[i + 1];
-                                if (!speaker || !text) continue;
-                                results.push({
-                                    speaker,
-                                    text,
-                                    slot_hint: `log:${logIndex}:${i / 2}`,
-                                    visible_index: pairCount - (i / 2) - 1,
-                                });
-                            }
-                        });
-
-                        return results.slice(-maxVisibleCaptions);
-                    }""")
-
-                    if not caption_items and caption_enable_attempts < 3 and poll_count >= 10 and poll_count % 60 == 10:
-                        caption_enable_attempts += 1
-                        enabled = await try_enable_live_captions(page)
-                        if enabled:
-                            logger.info("Live captions enabled in the bot session.")
-                        else:
-                            logger.warning("Live captions still not visible after enable attempt.")
-
                     if not chat_notice_sent and chat_notice_attempts < 3 and poll_count >= 20 and poll_count % 60 == 20:
                         chat_notice_attempts += 1
                         chat_notice_sent = await send_chat_notice(page)
-
-                    if (
-                        not chat_language_help_sent
-                        and chat_language_help_attempts < 3
-                        and poll_count >= 24
-                        and poll_count % 60 == 24
-                    ):
-                        chat_language_help_attempts += 1
-                        chat_language_help_sent = await send_chat_language_help_notice(page)
+                        await restore_participant_panel("chat notice retry")
 
                     if audio_recording_enabled and not audio_capture_started and not audio_failure_notified and poll_count % 20 == 0:
                         audio_failure_notified = await send_chat_message(page, CHAT_AUDIO_FAILURE_MESSAGE)
+                        await restore_participant_panel("audio failure notice")
 
                     if poll_count % 4 == 0:
                         exit_requested, known_chat_message_ids = await detect_exit_command(page, known_chat_message_ids)
@@ -2298,169 +3223,44 @@ async def run_bot(meeting_url, meeting_id):
                                 leave_attempted = True
                                 await leave_meeting_via_ui(page)
                             break
+                        await restore_participant_panel("exit command check")
 
-                    current_dt = datetime.utcnow()
-                    _prune_recent_caption_memory(recent_caption_memory, current_dt)
-                    replay_candidates = []
-                    normalized_caption_items = []
-                    for item in caption_items:
-                        text = normalize_caption_text(item.get("text", ""))
-                        speaker = normalize_caption_text(item.get("speaker", "Unknown")) or "Unknown"
-                        slot_hint = normalize_caption_text(item.get("slot_hint", "")) or None
-                        visible_index = item.get("visible_index")
-                        if visible_index is not None:
-                            try:
-                                visible_index = int(visible_index)
-                            except (TypeError, ValueError):
-                                visible_index = None
-                        if not text or len(text) < 2:
-                            continue
-                        if text in ("Captions are turned on.", "Captions are turned off."):
-                            continue
-                        recent_match = _find_recent_caption_memory_match(
-                            recent_caption_memory,
-                            speaker,
-                            text,
-                            current_dt,
-                        )
-                        normalized_item = {
-                            "speaker": speaker,
-                            "text": text,
-                            "slot_hint": slot_hint,
-                            "slot_index": visible_index,
-                            "recent_match": recent_match,
-                        }
-                        normalized_caption_items.append(normalized_item)
-                        if recent_match is not None and _find_pending_caption_key(pending_captions, speaker, text, slot_hint) is None:
-                            replay_candidates.append(normalized_item)
+                    if not participant_panel_opened or not await participant_panel_visible(page):
+                        if poll_count % 8 == 1:
+                            participant_panel_opened = await open_participant_panel(page)
+                            if participant_panel_opened:
+                                logger.info("Participant panel reopened.")
 
-                    replay_burst_detected = (
-                        len(replay_candidates) >= CAPTION_REPLAY_BURST_MIN_MATCHES
-                        and len(replay_candidates) >= max(CAPTION_REPLAY_BURST_MIN_MATCHES, len(normalized_caption_items) // 2)
-                    )
-                    if replay_burst_detected:
-                        log_event(
-                            logger,
-                            logging.INFO,
-                            "caption.replay_burst_detected",
-                            "Caption replay burst detected",
-                            replay_candidate_count=len(replay_candidates),
-                            sample_text_length=len(replay_candidates[0]["text"]) if replay_candidates else 0,
-                        )
-
-                    seen_caption_streams = set()
-                    if caption_items:
-                        for item in normalized_caption_items:
-                            text = item["text"]
-                            speaker = item["speaker"]
-                            slot_hint = item.get("slot_hint")
-                            slot_index = item.get("slot_index")
-
-                            stream_key = _find_pending_caption_key(pending_captions, speaker, text, slot_hint)
-                            if replay_burst_detected and stream_key is None and item.get("recent_match") is not None:
-                                log_event(
-                                    logger,
-                                    logging.INFO,
-                                    "caption.replay_skipped",
-                                    "Late caption replay skipped",
-                                    slot_hint=slot_hint,
-                                    **caption_metrics(text),
+                    if poll_count == 1 or poll_count % 4 == 0:
+                        observed_at = datetime.utcnow()
+                        participant_items = await collect_participant_registry_snapshot(page, observed_at)
+                        if not participant_items:
+                            restored = await restore_participant_panel("empty participant snapshot")
+                            if restored:
+                                await asyncio.sleep(0.4)
+                                participant_items = await collect_participant_registry_snapshot(page, observed_at)
+                        if DEBUG_ARTIFACTS_ENABLED and (poll_count == 1 or poll_count % 20 == 0 or not participant_items):
+                            debug_state = await collect_participant_debug_state(page)
+                            write_participant_snapshot_debug(meeting_id, observed_at, participant_items, debug_state)
+                        if participant_items:
+                            if poll_count == 1 or poll_count % 40 == 0:
+                                logger.info(
+                                    "Participant registry snapshot collected for meeting %s: %s participants",
+                                    meeting_id,
+                                    len(participant_items),
                                 )
-                                continue
-
-                            if stream_key is None:
-                                caption_stream_sequence += 1
-                                stream_key = f"caption-stream:{caption_stream_sequence}"
-
-                            seen_caption_streams.add(stream_key)
-                            previous = pending_captions.get(stream_key)
-                            if previous is None:
-                                pending_captions[stream_key] = {
-                                    "speaker": speaker,
-                                    "text": text,
-                                    "first_seen": current_dt,
-                                    "last_updated_at": current_dt,
-                                    "last_seen": now,
-                                    "missing_polls": 0,
-                                    "slot_index": slot_index,
-                                    "slot_hint": slot_hint,
-                                    "revision_no": 0,
-                                }
-                                await persist_caption_event(pending_captions[stream_key])
-                                continue
-
-                            same_caption_stream = (
-                                _compatible_speakers_for_merge(previous.get("speaker"), speaker)
-                                and _texts_should_merge(previous.get("text"), text)
+                            sync_speaker_activity(
+                                meeting_id,
+                                participant_items,
+                                active_speaker_state,
+                                current_offset_ms,
                             )
-                            if same_caption_stream:
-                                next_speaker = speaker
-                                if normalize_caption_text(next_speaker).casefold() in {"", "unknown"}:
-                                    next_speaker = previous.get("speaker") or speaker
-                                next_text = _choose_preferred_caption_text(previous.get("text"), text)
-                                previous_exact = make_caption_fingerprint(previous.get("speaker"), previous.get("text"))
-                                next_exact = make_caption_fingerprint(next_speaker, next_text)
-                                if previous_exact != next_exact:
-                                    previous["revision_no"] = previous.get("revision_no", 0) + 1
-                                    previous["speaker"] = next_speaker
-                                    previous["text"] = next_text
-                                    previous["last_updated_at"] = current_dt
-                                    previous["last_seen"] = now
-                                    previous["missing_polls"] = 0
-                                    previous["slot_index"] = slot_index if slot_index is not None else previous.get("slot_index")
-                                    previous["slot_hint"] = slot_hint or previous.get("slot_hint")
-                                    log_event(
-                                        logger,
-                                        logging.INFO,
-                                        "caption.revision_saved",
-                                        "Caption revision saved",
-                                        stream_key=stream_key,
-                                        revision_no=previous["revision_no"],
-                                        **caption_metrics(previous["text"]),
-                                    )
-                                    await persist_caption_event(previous)
-                                    continue
-                                previous["speaker"] = next_speaker
-                                previous["text"] = next_text
-                                previous["last_updated_at"] = current_dt
-                                previous["last_seen"] = now
-                                previous["missing_polls"] = 0
-                                previous["slot_index"] = slot_index if slot_index is not None else previous.get("slot_index")
-                                previous["slot_hint"] = slot_hint or previous.get("slot_hint")
-                                continue
-
-                            caption_stream_sequence += 1
-                            next_stream_key = f"caption-stream:{caption_stream_sequence}"
-                            seen_caption_streams.add(next_stream_key)
-                            pending_captions[next_stream_key] = {
-                                "speaker": speaker,
-                                "text": text,
-                                "first_seen": current_dt,
-                                "last_updated_at": current_dt,
-                                "last_seen": now,
-                                "missing_polls": 0,
-                                "slot_index": slot_index,
-                                "slot_hint": slot_hint,
-                                "revision_no": 0,
-                            }
-                            await persist_caption_event(pending_captions[next_stream_key])
-
-                    keys_to_remove = []
-                    for key, caption in pending_captions.items():
-                        if key not in seen_caption_streams:
-                            caption["missing_polls"] = caption.get("missing_polls", 0) + 1
-                        else:
-                            caption["missing_polls"] = 0
-
-                        if caption.get("missing_polls", 0) >= 3:
-                            keys_to_remove.append(key)
-                            continue
-
-                    for key in keys_to_remove:
-                        del pending_captions[key]
+                        elif poll_count % 40 == 0:
+                            logger.warning("Participant registry snapshot is empty for meeting %s.", meeting_id)
+                            await dump_dom(page, "participant_registry_empty_dom.html")
 
                 except Exception as e:
-                    logger.error("Error during caption polling: %s", e, exc_info=True)
+                    logger.error("Error during participant registry polling: %s", e, exc_info=True)
                     try:
                         await page.evaluate("1+1")
                     except Exception:
@@ -2475,10 +3275,15 @@ async def run_bot(meeting_url, meeting_id):
 
                 await asyncio.sleep(0.5)
 
-            logger.info("Caption monitoring loop ended.")
+            logger.info("Participant registry monitoring loop ended.")
         except Exception as e:
             logger.error("An error occurred during bot execution: %s", e, exc_info=True)
         finally:
+            if meeting_started_monotonic is not None:
+                current_offset_ms = int(
+                    max(0.0, asyncio.get_running_loop().time() - meeting_started_monotonic) * 1000
+                )
+                flush_speaker_activity(meeting_id, active_speaker_state, current_offset_ms)
             if "stop_screenshots" in locals():
                 stop_screenshots.set()
                 await screenshot_task
@@ -2517,12 +3322,23 @@ async def run_bot(meeting_url, meeting_id):
                         pcm_audio_path=str(pcm_audio_path) if pcm_audio_path else None,
                         postprocess_version="whisperx_global_v1",
                     )
+                    register_audio_source(
+                        meeting_id,
+                        "meeting:master",
+                        "meeting_mixed_master",
+                        file_path=str(master_audio_path),
+                        fmt=audio_format,
+                        status=AUDIO_STATUS_READY,
+                    )
+                    finalize_audio_sources(meeting_id, status=AUDIO_STATUS_READY)
                     update_audio_status(meeting_id, AUDIO_STATUS_READY, None)
                 except Exception as e:
                     audio_capture_error = str(e)
                     logger.error("Failed finalizing meeting audio for %s: %s", meeting_id, e)
+                    finalize_audio_sources(meeting_id, status=AUDIO_STATUS_FAILED)
                     update_audio_status(meeting_id, AUDIO_STATUS_FAILED, audio_capture_error)
             elif audio_recording_enabled and not audio_capture_started:
+                finalize_audio_sources(meeting_id, status=AUDIO_STATUS_FAILED)
                 update_audio_status(
                     meeting_id,
                     AUDIO_STATUS_FAILED,

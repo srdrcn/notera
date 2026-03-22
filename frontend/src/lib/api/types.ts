@@ -25,28 +25,42 @@ export type MeetingSummary = {
 
 export type Review = {
   id: number;
-  granularity: string;
+  review_type: string;
   confidence_label: string;
   current_text: string;
   suggested_text: string;
+  current_participant_id: number | null;
+  suggested_participant_id: number | null;
   audio_clip_url: string | null;
   has_audio_clip: boolean;
 };
 
-export type TranscriptEntry = {
+export type ParticipantEntry = {
   id: number;
+  display_name: string;
+  binding_state: string;
+  segment_count: number;
+  has_audio_asset: boolean;
+  is_bot: boolean;
+  join_state: string;
+};
+
+export type SegmentEntry = {
+  id: number;
+  participant_id: number | null;
   speaker: string;
   text: string;
-  teams_text: string;
+  raw_text: string;
   timestamp: string;
   start_sec: number | null;
   end_sec: number | null;
   initials: string;
   color: string;
+  assignment_method: string;
+  assignment_confidence: number;
+  needs_speaker_review: boolean;
+  overlap_group_id: string | null;
   resolution_status: string;
-  auto_corrected: boolean;
-  has_pending_review: boolean;
-  has_duplicate_merge_candidate: boolean;
   review: Review | null;
 };
 
@@ -58,7 +72,8 @@ export type MeetingSnapshot = {
   };
   summary: {
     speaker_count: number;
-    transcript_count: number;
+    segment_count: number;
+    pending_speaker_review_count: number;
   };
   audio: {
     status: string;
@@ -78,12 +93,11 @@ export type MeetingSnapshot = {
     image_url: string | null;
     label: string;
   };
-  transcripts: TranscriptEntry[];
+  participants: ParticipantEntry[];
+  segments: SegmentEntry[];
   actions: {
     pending_review_count: number;
-    duplicate_merge_candidate_count: number;
-    can_apply_all_reviews: boolean;
-    can_merge_duplicate_transcripts: boolean;
     can_stop_meeting: boolean;
+    can_manage_speakers: boolean;
   };
 };

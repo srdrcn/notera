@@ -56,7 +56,7 @@ export function LoginPage() {
           <p className="nt-eyebrow">Quiet intelligence for Teams calls</p>
           <h1 className="nt-auth-title">Toplantıyı bot yönetir, son metni sen netleştirirsin.</h1>
           <p className="nt-auth-desc">
-            Canlı caption, meeting audio, WhisperX doğrulaması ve inline review tek akışta.
+            Participant registry, meeting audio, speaker binding ve inline review tek akışta.
           </p>
           <div className="nt-auth-tabs">
             <button

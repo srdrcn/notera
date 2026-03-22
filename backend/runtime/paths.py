@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 
@@ -29,6 +30,14 @@ def get_meeting_audio_chunks_dir(meeting_id: int) -> Path:
     return _ensure_dir(get_meeting_audio_dir(meeting_id) / "chunks")
 
 
+def get_meeting_audio_sources_dir(meeting_id: int) -> Path:
+    return _ensure_dir(get_meeting_audio_dir(meeting_id) / "sources")
+
+
+def get_meeting_participant_audio_dir(meeting_id: int) -> Path:
+    return _ensure_dir(get_meeting_audio_dir(meeting_id) / "participants")
+
+
 def get_meeting_master_audio_path(meeting_id: int, ext: str = "webm") -> Path:
     sanitized_ext = ext.lstrip(".") or "webm"
     return get_meeting_audio_dir(meeting_id) / f"master.{sanitized_ext}"
@@ -54,6 +63,30 @@ def get_alignment_map_path(meeting_id: int) -> Path:
     return get_meeting_artifact_path(meeting_id, "alignment_map.json")
 
 
+def _sanitize_key_fragment(value: str | int) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._")
+    return sanitized or "item"
+
+
+def get_audio_source_capture_path(meeting_id: int, source_key: str, ext: str = "webm") -> Path:
+    sanitized_ext = ext.lstrip(".") or "webm"
+    return get_meeting_audio_sources_dir(meeting_id) / f"{_sanitize_key_fragment(source_key)}.{sanitized_ext}"
+
+
+def get_participant_audio_asset_path(
+    meeting_id: int,
+    participant_id: int | str,
+    start_offset_ms: int,
+    end_offset_ms: int,
+    ext: str = "wav",
+) -> Path:
+    sanitized_ext = ext.lstrip(".") or "wav"
+    return (
+        get_meeting_participant_audio_dir(meeting_id)
+        / f"participant_{_sanitize_key_fragment(participant_id)}_{start_offset_ms}_{end_offset_ms}.{sanitized_ext}"
+    )
+
+
 def live_preview_root() -> Path:
     return _ensure_dir(get_settings().live_preview_root)
 
@@ -76,6 +109,14 @@ def get_review_clip_filename(meeting_id: int, transcript_id: int, review_item_id
 
 def get_review_clip_path(meeting_id: int, transcript_id: int, review_item_id: int) -> Path:
     return review_clip_root() / get_review_clip_filename(meeting_id, transcript_id, review_item_id)
+
+
+def get_segment_review_clip_filename(meeting_id: int, segment_id: int, review_item_id: int) -> str:
+    return f"meeting_{meeting_id}_segment_{segment_id}_review_{review_item_id}.wav"
+
+
+def get_segment_review_clip_path(meeting_id: int, segment_id: int, review_item_id: int) -> Path:
+    return review_clip_root() / get_segment_review_clip_filename(meeting_id, segment_id, review_item_id)
 
 
 def remove_review_clips_for_meeting(meeting_id: int) -> None:

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.api.deps import owned_user
 from backend.db.session import get_db
-from backend.models import Meeting, MeetingAudioAsset, Transcript, TranscriptReviewItem
+from backend.models import Meeting, MeetingAudioAsset, ParticipantAudioAsset, Transcript, TranscriptReviewItem, TranscriptSegment
 from backend.runtime.paths import get_meeting_pcm_audio_path, preview_path, review_clip_root
 
 
@@ -48,14 +48,47 @@ def meeting_preview(meeting_id: int, user=Depends(owned_user), db: Session = Dep
     return FileResponse(image_path, headers={"Cache-Control": "no-store"})
 
 
+@router.get("/meetings/{meeting_id}/participants/{participant_id}/audio")
+def participant_audio(meeting_id: int, participant_id: int, user=Depends(owned_user), db: Session = Depends(get_db)):
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None or meeting.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
+    asset = db.scalar(
+        select(ParticipantAudioAsset)
+        .where(
+            ParticipantAudioAsset.meeting_id == meeting_id,
+            ParticipantAudioAsset.participant_id == participant_id,
+        )
+        .order_by(ParticipantAudioAsset.start_offset_ms, ParticipantAudioAsset.id)
+    )
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Konusmaci audio asset bulunamadi.")
+    file_path = Path(asset.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio dosyasi bulunamadi.")
+    return FileResponse(file_path)
+
+
 @router.get("/reviews/{review_id}/clip")
 def review_clip(review_id: int, user=Depends(owned_user), db: Session = Depends(get_db)):
     review = db.get(TranscriptReviewItem, review_id)
     if review is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review bulunamadı.")
-    transcript = db.get(Transcript, review.transcript_id)
-    meeting = db.get(Meeting, transcript.meeting_id) if transcript else None
-    if transcript is None or meeting is None or meeting.user_id != user.id:
+    transcript_segment = (
+        db.get(TranscriptSegment, review.transcript_segment_id)
+        if review.transcript_segment_id is not None
+        else None
+    )
+    transcript = db.get(Transcript, review.transcript_id) if review.transcript_id is not None else None
+    meeting_id = (
+        transcript_segment.meeting_id
+        if transcript_segment is not None
+        else transcript.meeting_id
+        if transcript is not None
+        else None
+    )
+    meeting = db.get(Meeting, meeting_id) if meeting_id is not None else None
+    if meeting is None or meeting.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review bulunamadı.")
     if not review.audio_clip_path:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio clip bulunamadı.")

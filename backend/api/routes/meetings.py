@@ -10,11 +10,12 @@ from backend.db.session import get_db
 from backend.orchestration.supervisor import supervisor
 from backend.runtime.logging import bind_context, log_event
 from backend.repositories.meetings import (
-    caption_events_for_meeting,
     get_owned_meeting,
     latest_audio_asset,
-    review_items_for_transcripts,
-    transcripts_for_meeting,
+    participant_audio_assets_for_meeting,
+    participants_for_meeting,
+    review_items_for_segments,
+    segments_for_meeting,
 )
 from backend.schemas.meeting import CreateMeetingRequest, MeetingSummaryOut
 from backend.schemas.transcript import MeetingSnapshotOut
@@ -167,9 +168,9 @@ def meeting_snapshot(meeting_id: int, user=Depends(owned_user), db: Session = De
     meeting = get_owned_meeting(db, user.id, meeting_id)
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
-    caption_events = caption_events_for_meeting(db, meeting_id)
-    transcripts = transcripts_for_meeting(db, meeting_id)
-    transcript_ids = [row.id for row in transcripts]
-    review_items = review_items_for_transcripts(db, transcript_ids, pending_only=True)
+    participants = participants_for_meeting(db, meeting_id)
+    segments = segments_for_meeting(db, meeting_id)
+    review_items = review_items_for_segments(db, [row.id for row in segments], pending_only=True)
     audio_asset = latest_audio_asset(db, meeting_id)
-    return build_snapshot(meeting, caption_events, transcripts, review_items, audio_asset)
+    participant_audio_assets = participant_audio_assets_for_meeting(db, meeting_id)
+    return build_snapshot(meeting, participants, segments, review_items, audio_asset, participant_audio_assets)

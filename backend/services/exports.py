@@ -7,13 +7,13 @@ from backend.schemas.transcript import MeetingSnapshotOut
 
 
 def export_txt(snapshot: MeetingSnapshotOut) -> str:
-    return "\n".join(f"[{row.timestamp}] {row.speaker}: {row.text}" for row in snapshot.transcripts)
+    return "\n".join(f"[{row.timestamp}] {row.speaker}: {row.text}" for row in snapshot.segments)
 
 
 def export_csv(snapshot: MeetingSnapshotOut) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Zaman", "Konuşmacı", "Metin"])
-    for row in snapshot.transcripts:
+    for row in snapshot.segments:
         writer.writerow([row.timestamp, row.speaker, row.text])
     return output.getvalue()

@@ -10,11 +10,12 @@ from backend.api.deps import owned_user
 from backend.db.session import get_db
 from backend.runtime.logging import bind_context, log_event
 from backend.repositories.meetings import (
-    caption_events_for_meeting,
     get_owned_meeting,
     latest_audio_asset,
-    review_items_for_transcripts,
-    transcripts_for_meeting,
+    participant_audio_assets_for_meeting,
+    participants_for_meeting,
+    review_items_for_segments,
+    segments_for_meeting,
 )
 from backend.services.exports import export_csv, export_txt
 from backend.services.transcript_logic import build_snapshot
@@ -29,11 +30,12 @@ def _snapshot_for_export(db: Session, user_id: int, meeting_id: int):
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
     bind_context(meeting_id=meeting.id)
-    caption_events = caption_events_for_meeting(db, meeting_id)
-    transcripts = transcripts_for_meeting(db, meeting_id)
-    review_items = review_items_for_transcripts(db, [row.id for row in transcripts], pending_only=True)
+    participants = participants_for_meeting(db, meeting_id)
+    segments = segments_for_meeting(db, meeting_id)
+    review_items = review_items_for_segments(db, [row.id for row in segments], pending_only=True)
     audio_asset = latest_audio_asset(db, meeting_id)
-    return build_snapshot(meeting, caption_events, transcripts, review_items, audio_asset)
+    participant_audio_assets = participant_audio_assets_for_meeting(db, meeting_id)
+    return build_snapshot(meeting, participants, segments, review_items, audio_asset, participant_audio_assets)
 
 
 @router.get("/{meeting_id}/export.txt")

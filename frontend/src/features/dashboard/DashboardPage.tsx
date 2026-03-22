@@ -112,13 +112,13 @@ function toneForStatus(status: string): "default" | "success" | "warning" | "dan
   if (status === "active" || status === "joining") {
     return "primary";
   }
-  if (status === "transcribing" || status === "aligning") {
+  if (["binding_sources", "transcribing_participants", "assembling_segments", "transcribing", "aligning"].includes(status)) {
     return "teal";
   }
   if (status === "failed") {
     return "danger";
   }
-  if (status === "queued" || status === "pending" || status === "canonicalizing" || status === "rebuilding") {
+  if (["queued", "pending", "materializing_audio", "canonicalizing", "rebuilding"].includes(status)) {
     return "warning";
   }
   return "default";
@@ -205,7 +205,7 @@ export function DashboardPage() {
   return (
     <AppShell
       title="Dashboard"
-      subtitle="Toplantılarını başlat, durumlarını takip et ve transcript'leri tek yerden yönet."
+      subtitle="Toplantılarını başlat, audio-first capture durumunu takip et ve transcript'leri tek yerden yönet."
       navSlot={
         <button className="nt-btn nt-btn-secondary nt-btn-sm" onClick={() => void session.logout()} type="button">
           Çıkış yap
@@ -218,7 +218,7 @@ export function DashboardPage() {
             <div>
               <p className="nt-card-label">Yeni toplantı</p>
               <h2 className="nt-section-title">Toplantı başlat</h2>
-              <p className="nt-card-hint">Toplantı adını ve gerçek Teams linkini gir, Notera botu toplantıya katılıp kaydı başlatsın.</p>
+              <p className="nt-card-hint">Toplantı adını ve gerçek Teams linkini gir, Notera botu participant registry ve audio capture akışını başlatsın.</p>
             </div>
           </div>
           <form className="nt-dashboard-composer-form" onSubmit={form.handleSubmit(onSubmit)}>

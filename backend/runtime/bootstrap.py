@@ -96,6 +96,7 @@ def ensure_runtime_schema(target_db: Path | None = None) -> Path:
             ("postprocess_progress_note", "ALTER TABLE meeting ADD COLUMN postprocess_progress_note TEXT"),
             ("joined_at", "ALTER TABLE meeting ADD COLUMN joined_at DATETIME"),
             ("ended_at", "ALTER TABLE meeting ADD COLUMN ended_at DATETIME"),
+            ("audio_capture_started_at", "ALTER TABLE meeting ADD COLUMN audio_capture_started_at DATETIME"),
             ("stop_requested", "ALTER TABLE meeting ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0"),
             ("active_bot_run_id", "ALTER TABLE meeting ADD COLUMN active_bot_run_id INTEGER"),
             ("active_postprocess_run_id", "ALTER TABLE meeting ADD COLUMN active_postprocess_run_id INTEGER"),
@@ -130,6 +131,30 @@ def ensure_runtime_schema(target_db: Path | None = None) -> Path:
             "transcriptreviewitem",
             "updated_at",
             "ALTER TABLE transcriptreviewitem ADD COLUMN updated_at DATETIME",
+        )
+        _ensure_column(
+            cursor,
+            "transcriptreviewitem",
+            "transcript_segment_id",
+            "ALTER TABLE transcriptreviewitem ADD COLUMN transcript_segment_id INTEGER REFERENCES transcriptsegment(id)",
+        )
+        _ensure_column(
+            cursor,
+            "transcriptreviewitem",
+            "review_type",
+            "ALTER TABLE transcriptreviewitem ADD COLUMN review_type TEXT NOT NULL DEFAULT 'text'",
+        )
+        _ensure_column(
+            cursor,
+            "transcriptreviewitem",
+            "current_participant_id",
+            "ALTER TABLE transcriptreviewitem ADD COLUMN current_participant_id INTEGER REFERENCES meetingparticipant(id)",
+        )
+        _ensure_column(
+            cursor,
+            "transcriptreviewitem",
+            "suggested_participant_id",
+            "ALTER TABLE transcriptreviewitem ADD COLUMN suggested_participant_id INTEGER REFERENCES meetingparticipant(id)",
         )
 
         review_item_created_at_default = _column_default(cursor, "transcriptreviewitem", "created_at")
@@ -199,6 +224,7 @@ def ensure_runtime_schema(target_db: Path | None = None) -> Path:
             """
             UPDATE transcriptreviewitem
             SET status = COALESCE(NULLIF(status, ''), ?),
+                review_type = COALESCE(NULLIF(review_type, ''), 'text'),
                 updated_at = COALESCE(updated_at, created_at)
             """,
             (REVIEW_STATUS_PENDING,),
@@ -209,6 +235,40 @@ def ensure_runtime_schema(target_db: Path | None = None) -> Path:
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS ix_review_transcript_status ON transcriptreviewitem(transcript_id, status)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_meetingparticipant_meeting_key ON meetingparticipant(meeting_id, participant_key)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_speakeractivityevent_meeting_participant_time "
+            "ON speakeractivityevent(meeting_id, participant_id, start_offset_ms, end_offset_ms)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_audiosource_meeting_key ON audiosource(meeting_id, source_key)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_audiosourcebinding_meeting_source_time "
+            "ON audiosourcebinding(meeting_id, audio_source_id, valid_from_ms, valid_to_ms)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_identityevidence_meeting_participant "
+            "ON identityevidence(meeting_id, participant_id, observed_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_participantaudioasset_meeting_participant "
+            "ON participantaudioasset(meeting_id, participant_id, start_offset_ms, end_offset_ms)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_transcriptsegment_meeting_seq "
+            "ON transcriptsegment(meeting_id, sequence_no, start_offset_ms, end_offset_ms)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_transcriptsegment_meeting_participant "
+            "ON transcriptsegment(meeting_id, participant_id, needs_speaker_review)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_review_segment_status "
+            "ON transcriptreviewitem(transcript_segment_id, status)"
         )
         conn.commit()
     finally:

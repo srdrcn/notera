@@ -3,115 +3,121 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.api.deps import owned_user
 from backend.db.session import get_db
-from backend.models import Meeting, Transcript, TranscriptReviewItem
+from backend.models import Meeting, TranscriptSegment
 from backend.runtime.logging import bind_context, log_event
-from backend.services.reviews import (
-    apply_all_reviews,
-    apply_review,
-    duplicate_merge_candidate_count,
-    keep_review,
-    merge_duplicate_transcripts,
+from backend.schemas.transcript import (
+    ParticipantMergeRequest,
+    ParticipantSplitRequest,
+    SegmentParticipantUpdateRequest,
 )
+from backend.services.reviews import merge_participants, reassign_segment_participant, split_participant
 
 
 router = APIRouter(tags=["reviews"])
 logger = logging.getLogger("notera.routes.reviews")
 
 
-def _owned_review(db: Session, user_id: int, review_id: int) -> tuple[TranscriptReviewItem, Meeting]:
-    review = db.scalar(select(TranscriptReviewItem).where(TranscriptReviewItem.id == review_id))
-    if review is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Düzeltme önerisi bulunamadı.")
-    transcript = db.get(Transcript, review.transcript_id)
-    meeting = db.get(Meeting, transcript.meeting_id) if transcript else None
-    if transcript is None or meeting is None or meeting.user_id != user_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Düzeltme önerisi bulunamadı.")
+def _owned_meeting(db: Session, user_id: int, meeting_id: int) -> Meeting:
+    meeting = db.get(Meeting, meeting_id)
+    if meeting is None or meeting.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
     bind_context(meeting_id=meeting.id)
-    return review, meeting
+    return meeting
 
 
-@router.post("/api/reviews/{review_id}/apply")
-def review_apply(review_id: int, user=Depends(owned_user), db: Session = Depends(get_db)):
-    review, meeting = _owned_review(db, user.id, review_id)
+@router.patch("/api/transcript-segments/{segment_id}/participant")
+def update_segment_participant(
+    segment_id: int,
+    payload: SegmentParticipantUpdateRequest,
+    user=Depends(owned_user),
+    db: Session = Depends(get_db),
+):
+    segment = db.get(TranscriptSegment, segment_id)
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transcript segment bulunamadı.")
+    meeting = _owned_meeting(db, user.id, segment.meeting_id)
     try:
-        apply_review(db, review_id)
+        reassign_segment_participant(db, segment_id, payload.participant_id)
         db.commit()
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     log_event(
         logger,
         logging.INFO,
-        "review.applied",
-        "Review applied",
-        review_id=review.id,
+        "segment.participant.updated",
+        "Transcript segment participant updated",
         meeting_id=meeting.id,
+        segment_id=segment_id,
+        participant_id=payload.participant_id,
         user_id=user.id,
     )
     return {"ok": True}
 
 
-@router.post("/api/reviews/{review_id}/keep")
-def review_keep(review_id: int, user=Depends(owned_user), db: Session = Depends(get_db)):
-    review, meeting = _owned_review(db, user.id, review_id)
+@router.post("/api/meetings/{meeting_id}/participants/merge")
+def merge_meeting_participants(
+    meeting_id: int,
+    payload: ParticipantMergeRequest,
+    user=Depends(owned_user),
+    db: Session = Depends(get_db),
+):
+    meeting = _owned_meeting(db, user.id, meeting_id)
     try:
-        keep_review(db, review_id)
+        moved_count = merge_participants(
+            db,
+            meeting_id,
+            payload.source_participant_id,
+            payload.target_participant_id,
+        )
         db.commit()
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     log_event(
         logger,
         logging.INFO,
-        "review.kept",
-        "Review kept",
-        review_id=review.id,
+        "participant.merged",
+        "Meeting participants merged",
         meeting_id=meeting.id,
+        source_participant_id=payload.source_participant_id,
+        target_participant_id=payload.target_participant_id,
+        moved_count=moved_count,
         user_id=user.id,
     )
-    return {"ok": True}
+    return {"ok": True, "moved_count": moved_count}
 
 
-@router.post("/api/meetings/{meeting_id}/reviews/apply-all")
-def apply_all_for_meeting(meeting_id: int, user=Depends(owned_user), db: Session = Depends(get_db)):
-    meeting = db.get(Meeting, meeting_id)
-    if meeting is None or meeting.user_id != user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
-    bind_context(meeting_id=meeting.id)
-    count = apply_all_reviews(db, meeting_id)
-    db.commit()
+@router.post("/api/meetings/{meeting_id}/participants/split")
+def split_meeting_participant(
+    meeting_id: int,
+    payload: ParticipantSplitRequest,
+    user=Depends(owned_user),
+    db: Session = Depends(get_db),
+):
+    meeting = _owned_meeting(db, user.id, meeting_id)
+    try:
+        participant = split_participant(
+            db,
+            meeting_id,
+            payload.participant_id,
+            payload.segment_ids,
+            payload.display_name,
+        )
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     log_event(
         logger,
         logging.INFO,
-        "review.apply_all.completed",
-        "All pending reviews applied",
+        "participant.split",
+        "Meeting participant split",
         meeting_id=meeting.id,
+        source_participant_id=payload.participant_id,
+        new_participant_id=participant.id,
+        moved_segment_count=len(payload.segment_ids),
         user_id=user.id,
-        applied_count=count,
     )
-    return {"ok": True, "applied_count": count}
-
-
-@router.post("/api/meetings/{meeting_id}/transcripts/merge-duplicates")
-def merge_duplicates(meeting_id: int, user=Depends(owned_user), db: Session = Depends(get_db)):
-    meeting = db.get(Meeting, meeting_id)
-    if meeting is None or meeting.user_id != user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
-    bind_context(meeting_id=meeting.id)
-    if duplicate_merge_candidate_count(db, meeting_id) <= 0:
-        return {"ok": True, "merged_count": 0}
-    merged_count = merge_duplicate_transcripts(db, meeting_id)
-    db.commit()
-    log_event(
-        logger,
-        logging.INFO,
-        "transcript.duplicates.merged",
-        "Duplicate transcripts merged",
-        meeting_id=meeting.id,
-        user_id=user.id,
-        merged_count=merged_count,
-    )
-    return {"ok": True, "merged_count": merged_count}
+    return {"ok": True, "participant_id": participant.id}

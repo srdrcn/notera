@@ -1,580 +1,33 @@
 from __future__ import annotations
 
 import hashlib
-import re
-from dataclasses import dataclass
-from datetime import datetime
-from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Optional
 
-from backend.models import Meeting, MeetingAudioAsset, TeamsCaptionEvent, Transcript, TranscriptReviewItem
-from backend.runtime.constants import (
-    AUDIO_STATUS_DISABLED,
-    AUDIO_STATUS_FAILED,
-    POSTPROCESS_STATUS_ALIGNING,
-    POSTPROCESS_STATUS_COMPLETED,
-    POSTPROCESS_STATUS_REVIEW_READY,
-    POSTPROCESS_STATUS_TRANSCRIBING,
+from backend.models import (
+    Meeting,
+    MeetingAudioAsset,
+    MeetingParticipant,
+    ParticipantAudioAsset,
+    TranscriptReviewItem,
+    TranscriptSegment,
 )
-from backend.runtime.paths import get_meeting_pcm_audio_path, preview_path
 from backend.schemas.transcript import (
     MeetingSnapshotOut,
+    ParticipantOut,
     ReviewOut,
+    SegmentEntryOut,
     SnapshotActionsOut,
     SnapshotAudioOut,
     SnapshotMeetingOut,
     SnapshotPostprocessOut,
     SnapshotPreviewOut,
     SnapshotSummaryOut,
-    TranscriptEntryOut,
 )
-
-
-def _normalize_transcript_text(value: str | None) -> str:
-    return " ".join((value or "").strip().split())
-
-
-def _tokenize_transcript_text(value: str | None) -> list[dict]:
-    tokens = []
-    for match in re.finditer(r"[\wçğıöşüÇĞİÖŞÜ'-]+", _normalize_transcript_text(value)):
-        token_text = match.group(0)
-        tokens.append(
-            {
-                "text": token_text,
-                "folded": token_text.casefold(),
-                "norm": token_text.casefold(),
-                "start": match.start(),
-                "end": match.end(),
-            }
-        )
-    return tokens
-
-
-def _transcript_tokens(value: str | None) -> list[str]:
-    return [token["folded"] for token in _tokenize_transcript_text(value)]
-
-
-def _transcript_token_match(left_token: str, right_token: str) -> bool:
-    if left_token == right_token:
-        return True
-    shorter_length = min(len(left_token), len(right_token))
-    if shorter_length >= 2 and (
-        left_token.startswith(right_token) or right_token.startswith(left_token)
-    ):
-        return True
-    if shorter_length >= 4 and SequenceMatcher(None, left_token, right_token).ratio() >= 0.82:
-        return True
-    return False
-
-
-def _fuzzy_common_prefix_token_count(left_tokens: list[str], right_tokens: list[str]) -> int:
-    count = 0
-    for left_token, right_token in zip(left_tokens, right_tokens):
-        if not _transcript_token_match(left_token, right_token):
-            break
-        count += 1
-    return count
-
-
-def _transcript_base_text(transcript: Transcript) -> str:
-    return _normalize_transcript_text(transcript.teams_text or transcript.text)
-
-
-def _transcript_revision_score(text: str | None) -> int:
-    normalized = _normalize_transcript_text(text)
-    if not normalized:
-        return -1
-    return len(_transcript_tokens(normalized)) * 100 + len(normalized)
-
-
-def _choose_preferred_transcript_text(existing_text: str | None, new_text: str | None) -> str:
-    existing_normalized = _normalize_transcript_text(existing_text)
-    new_normalized = _normalize_transcript_text(new_text)
-    if not existing_normalized:
-        return new_normalized
-    if not new_normalized:
-        return existing_normalized
-    existing_score = _transcript_revision_score(existing_normalized)
-    new_score = _transcript_revision_score(new_normalized)
-    if new_score > existing_score:
-        return new_normalized
-    return existing_normalized
-
-
-def _compatible_transcript_speakers(existing_speaker: str | None, new_speaker: str | None) -> bool:
-    existing_value = _normalize_transcript_text(existing_speaker).casefold()
-    new_value = _normalize_transcript_text(new_speaker).casefold()
-    if not existing_value or existing_value == "unknown":
-        return True
-    if not new_value or new_value == "unknown":
-        return True
-    return existing_value == new_value
-
-
-def _transcript_texts_should_merge(existing_text: str | None, new_text: str | None) -> bool:
-    old_text = _normalize_transcript_text(existing_text)
-    new_value = _normalize_transcript_text(new_text)
-    if not old_text or not new_value:
-        return False
-    old_fold = old_text.casefold()
-    new_fold = new_value.casefold()
-    if old_fold == new_fold:
-        return True
-    punctuation = ".,!?;:…"
-    if new_fold.rstrip(punctuation) == old_fold.rstrip(punctuation):
-        return True
-    old_tokens = _transcript_tokens(old_text)
-    new_tokens = _transcript_tokens(new_value)
-    if old_tokens and new_tokens:
-        shared_prefix = _fuzzy_common_prefix_token_count(old_tokens, new_tokens)
-        shorter_length = min(len(old_tokens), len(new_tokens))
-        if shared_prefix >= min(3, shorter_length) and shared_prefix / max(shorter_length, 1) >= 0.6:
-            return True
-    ratio = SequenceMatcher(None, old_fold, new_fold).ratio()
-    return ratio >= 0.82 and abs(len(new_fold) - len(old_fold)) <= 96
-
-
-def _transcript_sort_time(transcript: Transcript) -> datetime | None:
-    return transcript.caption_started_at or transcript.caption_finalized_at or transcript.timestamp
-
-
-def _find_transcript_suffix_prefix_merge(existing_text: str | None, new_text: str | None):
-    existing_tokens = _tokenize_transcript_text(existing_text)
-    new_tokens = _tokenize_transcript_text(new_text)
-    min_tokens = 4
-    if len(existing_tokens) < min_tokens or len(new_tokens) < min_tokens:
-        return None
-
-    normalized_existing = _normalize_transcript_text(existing_text)
-    normalized_new = _normalize_transcript_text(new_text)
-    max_overlap = min(len(existing_tokens), len(new_tokens))
-    for overlap_size in range(max_overlap, min_tokens - 1, -1):
-        existing_suffix = existing_tokens[-overlap_size:]
-        new_prefix = new_tokens[:overlap_size]
-        match_count = 0
-        exact_count = 0
-        for existing_token, new_token in zip(existing_suffix, new_prefix):
-            if not _transcript_token_match(existing_token["norm"], new_token["norm"]):
-                break
-            match_count += 1
-            if existing_token["norm"] == new_token["norm"]:
-                exact_count += 1
-        if match_count != overlap_size or exact_count < max(1, overlap_size - 1):
-            continue
-
-        suffix_remainder = normalized_new[new_prefix[-1]["end"] :].strip()
-        if (
-            suffix_remainder
-            and normalized_existing.endswith((".", "!", "?", "…"))
-            and suffix_remainder[0] in ".,!?;:…"
-        ):
-            suffix_remainder = suffix_remainder.lstrip(".,!?;:…").strip()
-        if not suffix_remainder:
-            return normalized_existing
-        return f"{normalized_existing} {suffix_remainder}".strip()
-    return None
-
-
-def _merge_transcript_text_pair(existing_text: str | None, new_text: str | None) -> str | None:
-    existing_normalized = _normalize_transcript_text(existing_text)
-    new_normalized = _normalize_transcript_text(new_text)
-    if not existing_normalized:
-        return new_normalized or None
-    if not new_normalized:
-        return existing_normalized
-    overlap_merge = _find_transcript_suffix_prefix_merge(existing_normalized, new_normalized)
-    if overlap_merge:
-        return overlap_merge
-
-    if _transcript_texts_should_merge(existing_normalized, new_normalized):
-        return _choose_preferred_transcript_text(existing_normalized, new_normalized)
-    return None
-
-
-TRANSCRIPT_DUPLICATE_MERGE_WINDOW_SECONDS = 12
-TRANSCRIPT_DUPLICATE_OVERLAP_WINDOW_SECONDS = 15
-SNAPSHOT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS = 180
-SNAPSHOT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS = 96
-LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS = 90
-LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS = 64
-
-
-def _merge_transcript_pair_if_candidate(
-    existing_text: str | None,
-    new_text: str | None,
-    delta_seconds: float,
-) -> str | None:
-    if delta_seconds < 0:
-        return None
-
-    overlap_merge = _find_transcript_suffix_prefix_merge(existing_text, new_text)
-    if overlap_merge:
-        if delta_seconds <= TRANSCRIPT_DUPLICATE_OVERLAP_WINDOW_SECONDS:
-            return overlap_merge
-        return None
-
-    if delta_seconds > TRANSCRIPT_DUPLICATE_MERGE_WINDOW_SECONDS:
-        return None
-
-    return _merge_transcript_text_pair(existing_text, new_text)
-
-
-def _transcript_equivalence_fingerprint(text: str | None) -> str:
-    return _normalize_transcript_text(text).casefold().rstrip(".,!?;:…")
-
-
-def _snapshot_transcript_score(transcript: Transcript) -> int:
-    score = _transcript_revision_score(transcript.text)
-    if transcript.resolution_status == "accepted":
-        score += 40
-    elif transcript.resolution_status == "auto_applied":
-        score += 20
-    if transcript.start_sec is not None and transcript.end_sec is not None:
-        score += 8
-    return score
-
-
-def _defensively_filter_visible_transcripts(transcripts: list[Transcript]) -> list[Transcript]:
-    kept: list[Transcript] = []
-    for transcript in transcripts:
-        fingerprint = _transcript_equivalence_fingerprint(transcript.text)
-        if not fingerprint:
-            kept.append(transcript)
-            continue
-
-        duplicate_index = None
-        for index in range(len(kept) - 1, max(-1, len(kept) - SNAPSHOT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS - 1), -1):
-            previous = kept[index]
-            if not _compatible_transcript_speakers(previous.speaker, transcript.speaker):
-                continue
-            if _transcript_equivalence_fingerprint(previous.text) != fingerprint:
-                continue
-            previous_time = _transcript_sort_time(previous)
-            current_time = _transcript_sort_time(transcript)
-            delta_seconds = (
-                abs((current_time - previous_time).total_seconds())
-                if previous_time is not None and current_time is not None
-                else 999.0
-            )
-            if delta_seconds <= SNAPSHOT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS:
-                duplicate_index = index
-                break
-
-        if duplicate_index is None:
-            kept.append(transcript)
-            continue
-
-        if _snapshot_transcript_score(transcript) > _snapshot_transcript_score(kept[duplicate_index]):
-            kept[duplicate_index] = transcript
-
-    return kept
-
-
-def _merge_datetime_min(*values: datetime | None) -> datetime | None:
-    filtered = [value for value in values if value is not None]
-    return min(filtered) if filtered else None
-
-
-def _merge_datetime_max(*values: datetime | None) -> datetime | None:
-    filtered = [value for value in values if value is not None]
-    return max(filtered) if filtered else None
-
-
-def _merge_float_min(*values: float | None) -> float | None:
-    filtered = [value for value in values if value is not None]
-    return min(filtered) if filtered else None
-
-
-def _merge_float_max(*values: float | None) -> float | None:
-    filtered = [value for value in values if value is not None]
-    return max(filtered) if filtered else None
-
-
-def _merge_resolution_status(left_status: str, right_status: str) -> str:
-    reviewed_statuses = {"accepted", "rejected"}
-    if left_status in reviewed_statuses or right_status in reviewed_statuses:
-        return "accepted"
-    if left_status == "auto_applied" or right_status == "auto_applied":
-        return "auto_applied"
-    return "original"
-
-
-def _collect_duplicate_transcript_merge_candidates(transcripts: list[Transcript]) -> tuple[int, set[int]]:
-    candidates: set[int] = set()
-    ordered = sorted(
-        transcripts,
-        key=lambda item: (
-            _transcript_sort_time(item) or datetime.min,
-            item.sequence_no if item.sequence_no is not None else item.id,
-            item.id,
-        ),
-    )
-    for previous, current in zip(ordered, ordered[1:]):
-        if not _compatible_transcript_speakers(previous.speaker, current.speaker):
-            continue
-        previous_time = previous.caption_finalized_at or previous.timestamp
-        current_time = current.caption_finalized_at or current.timestamp
-        delta_seconds = (
-            (current_time - previous_time).total_seconds()
-            if previous_time is not None and current_time is not None
-            else 999.0
-        )
-        if _merge_transcript_pair_if_candidate(previous.text, current.text, delta_seconds):
-            candidates.add(previous.id)
-            candidates.add(current.id)
-    return max(0, len(candidates) // 2), candidates
-
-
-def merge_duplicate_transcripts_after_reviews(
-    meeting: Meeting,
-    transcripts: list[Transcript],
-    review_items: list[TranscriptReviewItem],
-) -> int:
-    if meeting.postprocess_status not in {"review_ready", "completed"}:
-        return 0
-    if any(review_item.status == "pending" for review_item in review_items):
-        return 0
-    if len(transcripts) < 2:
-        return 0
-
-    review_items_by_transcript_id: dict[int, list[TranscriptReviewItem]] = {}
-    for review_item in review_items:
-        review_items_by_transcript_id.setdefault(review_item.transcript_id, []).append(review_item)
-
-    merged_count = 0
-    index = 1
-    while index < len(transcripts):
-        previous = transcripts[index - 1]
-        current = transcripts[index]
-        previous_time = previous.caption_finalized_at or previous.timestamp
-        current_time = current.caption_finalized_at or current.timestamp
-        delta_seconds = (
-            (current_time - previous_time).total_seconds()
-            if previous_time is not None and current_time is not None
-            else 999.0
-        )
-        if _compatible_transcript_speakers(previous.speaker, current.speaker):
-            merged_text = _merge_transcript_pair_if_candidate(previous.text, current.text, delta_seconds)
-            if merged_text:
-                merged_teams_text = _merge_transcript_text_pair(previous.teams_text, current.teams_text)
-                if not merged_teams_text:
-                    merged_teams_text = _choose_preferred_transcript_text(
-                        previous.teams_text or previous.text,
-                        current.teams_text or current.text,
-                    )
-
-                previous.speaker = (
-                    current.speaker
-                    if _normalize_transcript_text(current.speaker).casefold() != "unknown"
-                    else previous.speaker
-                )
-                previous.text = merged_text
-                previous.teams_text = merged_teams_text
-                previous.sequence_no = min(
-                    value for value in [previous.sequence_no, current.sequence_no] if value is not None
-                ) if previous.sequence_no is not None or current.sequence_no is not None else None
-                previous.start_sec = _merge_float_min(previous.start_sec, current.start_sec)
-                previous.end_sec = _merge_float_max(previous.end_sec, current.end_sec)
-                previous.caption_started_at = _merge_datetime_min(
-                    previous.caption_started_at,
-                    current.caption_started_at,
-                    previous.timestamp,
-                    current.timestamp,
-                )
-                previous.caption_finalized_at = _merge_datetime_max(
-                    previous.caption_finalized_at,
-                    current.caption_finalized_at,
-                    previous.timestamp,
-                    current.timestamp,
-                )
-                previous.timestamp = _merge_datetime_min(previous.timestamp, current.timestamp) or previous.timestamp
-                previous.resolution_status = _merge_resolution_status(
-                    previous.resolution_status,
-                    current.resolution_status,
-                )
-                previous.auto_corrected = previous.resolution_status == "auto_applied"
-
-                current_review_items = review_items_by_transcript_id.pop(current.id, [])
-                if current_review_items:
-                    previous_review_items = review_items_by_transcript_id.setdefault(previous.id, [])
-                    for review_item in current_review_items:
-                        review_item.transcript_id = previous.id
-                        previous_review_items.append(review_item)
-
-                transcripts.pop(index)
-                merged_count += 1
-                continue
-        index += 1
-
-    for sequence_no, transcript in enumerate(transcripts, start=1):
-        transcript.sequence_no = sequence_no
-
-    return merged_count
-
-
-@dataclass
-class LiveTranscriptRow:
-    id: int
-    speaker: str
-    text: str
-    timestamp: str
-    observed_at: datetime | None = None
-    slot_index: int | None = None
-    revision_no: int | None = None
-    start_sec: float | None = None
-    end_sec: float | None = None
-    resolution_status: str = "original"
-    auto_corrected: bool = False
-
-
-def _merge_live_rows(previous: LiveTranscriptRow, current: LiveTranscriptRow) -> None:
-    merged_text = _merge_transcript_text_pair(previous.text, current.text)
-    if merged_text:
-        previous_tokens = _transcript_tokens(previous.text)
-        current_tokens = _transcript_tokens(current.text)
-        shared_prefix = _fuzzy_common_prefix_token_count(previous_tokens, current_tokens) if previous_tokens and current_tokens else 0
-        if (
-            shared_prefix == min(len(previous_tokens), len(current_tokens))
-            and _transcript_revision_score(current.text) > _transcript_revision_score(merged_text)
-        ):
-            merged_text = _choose_preferred_transcript_text(merged_text, current.text)
-    previous.text = merged_text or _choose_preferred_transcript_text(
-        previous.text,
-        current.text,
-    )
-    previous.timestamp = current.timestamp or previous.timestamp
-    previous.id = current.id
-    previous.observed_at = current.observed_at or previous.observed_at
-    previous.slot_index = current.slot_index if current.slot_index is not None else previous.slot_index
-    previous.revision_no = current.revision_no if current.revision_no is not None else previous.revision_no
-
-
-def _is_prefix_style_live_revision(existing_text: str | None, new_text: str | None) -> bool:
-    existing_tokens = _transcript_tokens(existing_text)
-    new_tokens = _transcript_tokens(new_text)
-    if not existing_tokens or not new_tokens:
-        return False
-    shared_prefix = _fuzzy_common_prefix_token_count(existing_tokens, new_tokens)
-    shorter_length = min(len(existing_tokens), len(new_tokens))
-    return shorter_length >= 3 and shared_prefix == shorter_length
-
-
-def _find_live_row_merge_index(rows: list[LiveTranscriptRow], current: LiveTranscriptRow) -> int | None:
-    best_index = None
-    best_score = None
-    current_fingerprint = _transcript_equivalence_fingerprint(current.text)
-
-    for index in range(len(rows) - 1, max(-1, len(rows) - LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS - 1), -1):
-        previous = rows[index]
-        if not _compatible_transcript_speakers(previous.speaker, current.speaker):
-            continue
-
-        delta_seconds = (
-            abs((current.observed_at - previous.observed_at).total_seconds())
-            if previous.observed_at is not None and current.observed_at is not None
-            else 999.0
-        )
-        if delta_seconds > LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS:
-            continue
-
-        score = None
-        previous_fingerprint = _transcript_equivalence_fingerprint(previous.text)
-        merged_text = _merge_transcript_text_pair(previous.text, current.text)
-        same_slot = (
-            previous.slot_index is not None
-            and current.slot_index is not None
-            and previous.slot_index == current.slot_index
-        )
-        revision_continues = (
-            previous.revision_no is None
-            or current.revision_no is None
-            or current.revision_no >= previous.revision_no
-        )
-
-        if same_slot and revision_continues and merged_text:
-            score = 300
-        elif same_slot and revision_continues and previous_fingerprint == current_fingerprint:
-            score = 260
-        elif (
-            not same_slot
-            and _is_prefix_style_live_revision(previous.text, current.text)
-        ):
-            score = 160
-        elif (previous.slot_index is None or current.slot_index is None) and merged_text:
-            score = 180
-        elif previous_fingerprint == current_fingerprint:
-            score = 120
-
-        if score is None:
-            continue
-
-        if best_score is None or score > best_score:
-            best_index = index
-            best_score = score
-
-    return best_index
-
-
-def _defensively_filter_live_rows(rows: list[LiveTranscriptRow]) -> list[LiveTranscriptRow]:
-    kept: list[LiveTranscriptRow] = []
-    for row in rows:
-        fingerprint = _transcript_equivalence_fingerprint(row.text)
-        if not fingerprint:
-            kept.append(row)
-            continue
-
-        duplicate_index = None
-        for index in range(len(kept) - 1, max(-1, len(kept) - LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_LOOKBACK_ROWS - 1), -1):
-            previous = kept[index]
-            if not _compatible_transcript_speakers(previous.speaker, row.speaker):
-                continue
-            if _transcript_equivalence_fingerprint(previous.text) != fingerprint:
-                continue
-            delta_seconds = (
-                abs((row.observed_at - previous.observed_at).total_seconds())
-                if previous.observed_at is not None and row.observed_at is not None
-                else 999.0
-            )
-            if delta_seconds <= LIVE_TRANSCRIPT_DEFENSIVE_DUPLICATE_WINDOW_SECONDS:
-                duplicate_index = index
-                break
-
-        if duplicate_index is None:
-            kept.append(row)
-            continue
-
-        _merge_live_rows(kept[duplicate_index], row)
-
-    return kept
-
-
-def _collapse_live_caption_events(events: list[TeamsCaptionEvent]) -> list[LiveTranscriptRow]:
-    rows: list[LiveTranscriptRow] = []
-    for event in events:
-        normalized_text = _normalize_transcript_text(event.text)
-        if not normalized_text:
-            continue
-        timestamp = event.observed_at.strftime("%H:%M:%S") if event.observed_at else ""
-        row = LiveTranscriptRow(
-            id=event.id,
-            speaker=event.speaker_name,
-            text=normalized_text,
-            timestamp=timestamp,
-            observed_at=event.observed_at,
-            slot_index=getattr(event, "slot_index", None),
-            revision_no=getattr(event, "revision_no", None),
-        )
-        merge_index = _find_live_row_merge_index(rows, row)
-        if merge_index is not None:
-            _merge_live_rows(rows[merge_index], row)
-            continue
-        rows.append(row)
-    return _defensively_filter_live_rows(rows)
+from backend.runtime.paths import get_meeting_pcm_audio_path, preview_path
 
 
 def speaker_initials(name: str) -> str:
-    parts = [p for p in name.split() if p]
+    parts = [p for p in (name or "").split() if p]
     if not parts:
         return "?"
     if len(parts) == 1:
@@ -607,13 +60,12 @@ def _build_audio_payload(meeting: Meeting, audio_asset: MeetingAudioAsset | None
     pcm_audio = get_meeting_pcm_audio_path(meeting.id)
     if pcm_audio.exists():
         preferred_path = pcm_audio
-    label = "Toplantı kaydı"
     return SnapshotAudioOut(
         status=meeting.audio_status,
         error=meeting.audio_error,
-        has_audio=True,
-        audio_url=f"/api/media/meetings/{meeting.id}/audio",
-        label=label,
+        has_audio=preferred_path.exists(),
+        audio_url=f"/api/media/meetings/{meeting.id}/audio" if preferred_path.exists() else None,
+        label="Toplantı kaydı",
     )
 
 
@@ -628,97 +80,100 @@ def _build_preview_payload(meeting: Meeting) -> SnapshotPreviewOut:
             image_url=f"/api/media/meetings/{meeting.id}/preview?v={version}",
             label="Son canlı kare",
         )
-    label = "İlk kare henüz gelmedi." if meeting.status in {"joining", "active"} else ""
+    label = "Canlı önizleme toplantı sırasında görünür." if meeting.status in {"joining", "active"} else ""
     return SnapshotPreviewOut(has_preview=False, image_url=None, label=label)
+
+
+def participant_binding_state(
+    participant: MeetingParticipant,
+    segments: list[TranscriptSegment],
+) -> str:
+    participant_segments = [segment for segment in segments if segment.participant_id == participant.id]
+    if not participant_segments:
+        return "unknown"
+    if any(segment.needs_speaker_review for segment in participant_segments):
+        return "provisional"
+    return "confirmed"
 
 
 def build_snapshot(
     meeting: Meeting,
-    caption_events: list[TeamsCaptionEvent],
-    transcripts: list[Transcript],
+    participants: list[MeetingParticipant],
+    segments: list[TranscriptSegment],
     review_items: list[TranscriptReviewItem],
     audio_asset: MeetingAudioAsset | None,
+    participant_audio_assets: list[ParticipantAudioAsset],
 ) -> MeetingSnapshotOut:
-    review_map = {item.transcript_id: item for item in review_items}
-    duplicate_count = 0
-    duplicate_ids: set[int] = set()
+    participant_map = {participant.id: participant for participant in participants}
+    review_map = {item.transcript_segment_id: item for item in review_items if item.transcript_segment_id}
+    asset_participant_ids = {asset.participant_id for asset in participant_audio_assets if asset.participant_id is not None}
 
-    visible_transcripts = sorted(
-        transcripts,
-        key=lambda item: (
-            _transcript_sort_time(item) or datetime.min,
-            item.sequence_no if item.sequence_no is not None else item.id,
-            item.id,
-        ),
-    )
-    if meeting.status not in {"joining", "active"}:
-        visible_transcripts = _defensively_filter_visible_transcripts(visible_transcripts)
-    live_rows = _collapse_live_caption_events(caption_events)
-    if meeting.postprocess_status in {POSTPROCESS_STATUS_REVIEW_READY, POSTPROCESS_STATUS_COMPLETED} and not review_items:
-        duplicate_count, duplicate_ids = _collect_duplicate_transcript_merge_candidates(visible_transcripts)
-
-    if meeting.status in {"joining", "active"} or not visible_transcripts:
-        transcript_rows = [
-            TranscriptEntryOut(
-                id=row.id,
-                speaker=row.speaker,
-                text=row.text,
-                teams_text=row.text,
-                timestamp=row.timestamp,
-                start_sec=row.start_sec,
-                end_sec=row.end_sec,
-                initials=speaker_initials(row.speaker),
-                color=speaker_color(meeting.id, row.speaker),
-                resolution_status=row.resolution_status,
-                auto_corrected=row.auto_corrected,
-                has_pending_review=False,
-                has_duplicate_merge_candidate=False,
-                review=None,
+    segment_rows = []
+    for segment in segments:
+        participant = participant_map.get(segment.participant_id) if segment.participant_id is not None else None
+        speaker = participant.display_name if participant is not None else "Unknown"
+        review_item = review_map.get(segment.id)
+        end_ms = segment.end_offset_ms if segment.end_offset_ms is not None else segment.start_offset_ms
+        total_seconds = int(round((end_ms or 0) / 1000))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        timestamp = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        segment_rows.append(
+            SegmentEntryOut(
+                id=segment.id,
+                participant_id=segment.participant_id,
+                speaker=speaker,
+                text=segment.text,
+                raw_text=segment.raw_text,
+                timestamp=timestamp,
+                start_sec=(segment.start_offset_ms / 1000.0) if segment.start_offset_ms is not None else None,
+                end_sec=(segment.end_offset_ms / 1000.0) if segment.end_offset_ms is not None else None,
+                initials=speaker_initials(speaker),
+                color=speaker_color(meeting.id, speaker),
+                assignment_method=segment.assignment_method,
+                assignment_confidence=segment.assignment_confidence,
+                needs_speaker_review=segment.needs_speaker_review,
+                overlap_group_id=segment.overlap_group_id,
+                resolution_status=segment.resolution_status,
+                review=(
+                    ReviewOut(
+                        id=review_item.id,
+                        review_type=review_item.review_type,
+                        confidence_label=f"%{int(round(review_item.confidence * 100))}",
+                        current_text=review_item.current_text,
+                        suggested_text=review_item.suggested_text,
+                        current_participant_id=review_item.current_participant_id,
+                        suggested_participant_id=review_item.suggested_participant_id,
+                        audio_clip_url=review_audio_url(review_item),
+                        has_audio_clip=bool(review_item.audio_clip_path),
+                    )
+                    if review_item
+                    else None
+                ),
             )
-            for row in live_rows
-        ]
-    else:
-        transcript_rows = []
-        for transcript in visible_transcripts:
-            review_item = review_map.get(transcript.id)
-            timestamp_value = transcript.caption_finalized_at or transcript.timestamp
-            transcript_rows.append(
-                TranscriptEntryOut(
-                    id=transcript.id,
-                    speaker=transcript.speaker,
-                    text=transcript.text,
-                    teams_text=transcript.teams_text or transcript.text,
-                    timestamp=timestamp_value.strftime("%H:%M:%S") if timestamp_value else "",
-                    start_sec=transcript.start_sec,
-                    end_sec=transcript.end_sec,
-                    initials=speaker_initials(transcript.speaker),
-                    color=speaker_color(meeting.id, transcript.speaker),
-                    resolution_status=transcript.resolution_status,
-                    auto_corrected=transcript.auto_corrected,
-                    has_pending_review=review_item is not None,
-                    has_duplicate_merge_candidate=transcript.id in duplicate_ids,
-                    review=(
-                        ReviewOut(
-                            id=review_item.id,
-                            granularity=review_item.granularity,
-                            confidence_label=f"%{int(round(review_item.confidence * 100))}",
-                            current_text=review_item.current_text,
-                            suggested_text=review_item.suggested_text,
-                            audio_clip_url=review_audio_url(review_item),
-                            has_audio_clip=bool(review_item.audio_clip_path),
-                        )
-                        if review_item
-                        else None
-                    ),
-                )
-            )
+        )
 
-    pending_review_count = sum(1 for row in transcript_rows if row.has_pending_review)
+    participant_rows = [
+        ParticipantOut(
+            id=participant.id,
+            display_name=participant.display_name,
+            binding_state=participant_binding_state(participant, segments),
+            segment_count=sum(1 for segment in segments if segment.participant_id == participant.id),
+            has_audio_asset=participant.id in asset_participant_ids,
+            is_bot=participant.is_bot,
+            join_state=participant.join_state,
+        )
+        for participant in participants
+        if not participant.is_bot and participant.join_state != "merged"
+    ]
+    pending_review_count = sum(1 for segment in segments if segment.needs_speaker_review)
     return MeetingSnapshotOut(
         meeting=SnapshotMeetingOut(id=meeting.id, title=meeting.title, status=meeting.status),
         summary=SnapshotSummaryOut(
-            speaker_count=len({row.speaker for row in transcript_rows}),
-            transcript_count=len(transcript_rows),
+            speaker_count=len({row.speaker for row in segment_rows}),
+            segment_count=len(segment_rows),
+            pending_speaker_review_count=pending_review_count,
         ),
         audio=_build_audio_payload(meeting, audio_asset),
         postprocess=SnapshotPostprocessOut(
@@ -728,16 +183,11 @@ def build_snapshot(
             progress_note=meeting.postprocess_progress_note,
         ),
         preview=_build_preview_payload(meeting),
-        transcripts=transcript_rows,
+        participants=participant_rows,
+        segments=segment_rows,
         actions=SnapshotActionsOut(
             pending_review_count=pending_review_count,
-            duplicate_merge_candidate_count=duplicate_count,
-            can_apply_all_reviews=pending_review_count > 0,
-            can_merge_duplicate_transcripts=(
-                meeting.postprocess_status in {POSTPROCESS_STATUS_REVIEW_READY, POSTPROCESS_STATUS_COMPLETED}
-                and pending_review_count == 0
-                and duplicate_count > 0
-            ),
             can_stop_meeting=meeting.status in {"joining", "active"},
+            can_manage_speakers=bool(segment_rows),
         ),
     )

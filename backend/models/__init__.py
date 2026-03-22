@@ -1,23 +1,37 @@
 from backend.models.base import Base
 from backend.models.entities import (
+    AudioSource,
+    AudioSourceBinding,
     AuthSession,
+    IdentityEvidence,
     Meeting,
     MeetingAudioAsset,
+    MeetingParticipant,
+    ParticipantAudioAsset,
+    SpeakerActivityEvent,
     TeamsCaptionEvent,
     Transcript,
     TranscriptReviewItem,
+    TranscriptSegment,
     User,
     WorkerRun,
 )
 
 __all__ = [
+    "AudioSource",
+    "AudioSourceBinding",
     "AuthSession",
     "Base",
+    "IdentityEvidence",
     "Meeting",
     "MeetingAudioAsset",
+    "MeetingParticipant",
+    "ParticipantAudioAsset",
+    "SpeakerActivityEvent",
     "TeamsCaptionEvent",
     "Transcript",
     "TranscriptReviewItem",
+    "TranscriptSegment",
     "User",
     "WorkerRun",
 ]

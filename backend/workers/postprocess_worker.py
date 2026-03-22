@@ -21,14 +21,21 @@ if str(REPO_ROOT) not in sys.path:
 from backend.runtime.bootstrap import ensure_runtime_schema  # noqa: E402
 from backend.runtime.logging import bind_context, configure_logging, log_event, reset_context  # noqa: E402
 from backend.runtime.constants import (  # noqa: E402
+    ASSIGNMENT_STATUS_CONFIRMED,
+    ASSIGNMENT_STATUS_PROVISIONAL,
+    ASSIGNMENT_STATUS_UNKNOWN,
     AUDIO_STATUS_READY,
+    POSTPROCESS_STATUS_ASSEMBLING_SEGMENTS,
+    POSTPROCESS_STATUS_BINDING_SOURCES,
     POSTPROCESS_STATUS_ALIGNING,
     POSTPROCESS_STATUS_CANONICALIZING,
     POSTPROCESS_STATUS_COMPLETED,
     POSTPROCESS_STATUS_FAILED,
+    POSTPROCESS_STATUS_MATERIALIZING_AUDIO,
     POSTPROCESS_STATUS_QUEUED,
     POSTPROCESS_STATUS_REBUILDING,
     POSTPROCESS_STATUS_REVIEW_READY,
+    POSTPROCESS_STATUS_TRANSCRIBING_PARTICIPANTS,
     POSTPROCESS_STATUS_TRANSCRIBING,
     REVIEW_STATUS_PENDING,
     TRANSCRIPT_STATUS_AUTO_APPLIED,
@@ -38,9 +45,12 @@ from backend.runtime.constants import (  # noqa: E402
 from backend.runtime.paths import (  # noqa: E402
     get_alignment_map_path,
     db_path as get_db_path,
+    get_participant_audio_asset_path,
     get_meeting_pcm_audio_path,
     get_review_clip_filename,
     get_review_clip_path,
+    get_segment_review_clip_filename,
+    get_segment_review_clip_path,
     get_teams_canonical_path,
     get_whisperx_result_path,
     remove_review_clips_for_meeting,
@@ -282,6 +292,124 @@ def fetch_meeting_audio_asset(meeting_id: int) -> sqlite3.Row | None:
         conn.close()
 
 
+def fetch_audio_sources(meeting_id: int) -> list[sqlite3.Row]:
+    conn = db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT id, meeting_id, source_key, source_kind, track_id, stream_id, file_path, format,
+                   sample_rate_hz, channel_count, first_seen_at, last_seen_at, status
+            FROM audiosource
+            WHERE meeting_id = ?
+            ORDER BY id
+            """,
+            (meeting_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def upsert_mixed_audio_source(
+    meeting_id: int,
+    file_path: str,
+    fmt: str | None,
+    status: str = AUDIO_STATUS_READY,
+) -> int:
+    conn = db_connection()
+    try:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM audiosource
+            WHERE meeting_id = ? AND source_key = 'meeting:master'
+            LIMIT 1
+            """,
+            (meeting_id,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE audiosource
+                SET file_path = ?, format = ?, status = ?, last_seen_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (file_path, fmt, status, existing["id"]),
+            )
+            conn.commit()
+            return int(existing["id"])
+        cursor = conn.execute(
+            """
+            INSERT INTO audiosource (
+                meeting_id,
+                source_key,
+                source_kind,
+                file_path,
+                format,
+                status,
+                first_seen_at,
+                last_seen_at,
+                created_at
+            ) VALUES (?, 'meeting:master', 'meeting_mixed_master', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (meeting_id, file_path, fmt, status),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+    finally:
+        conn.close()
+
+
+def fetch_meeting_participants(meeting_id: int) -> list[sqlite3.Row]:
+    conn = db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT id, meeting_id, participant_key, platform_identity, display_name, normalized_name,
+                   role, is_bot, join_state, merged_into_participant_id, first_seen_at, last_seen_at
+            FROM meetingparticipant
+            WHERE meeting_id = ?
+            ORDER BY display_name, id
+            """,
+            (meeting_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def fetch_speaker_activity_events(meeting_id: int) -> list[sqlite3.Row]:
+    conn = db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT id, meeting_id, participant_id, start_offset_ms, end_offset_ms, source, confidence, metadata_json
+            FROM speakeractivityevent
+            WHERE meeting_id = ?
+            ORDER BY start_offset_ms, end_offset_ms, id
+            """,
+            (meeting_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def fetch_participant_audio_assets(meeting_id: int) -> list[sqlite3.Row]:
+    conn = db_connection()
+    try:
+        return conn.execute(
+            """
+            SELECT id, meeting_id, participant_id, audio_source_id, asset_type, file_path, format,
+                   sample_rate_hz, channel_count, duration_ms, start_offset_ms, end_offset_ms, status,
+                   derivation_method, confidence
+            FROM participantaudioasset
+            WHERE meeting_id = ?
+            ORDER BY participant_id, start_offset_ms, id
+            """,
+            (meeting_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
 def update_audio_asset_paths(
     asset_id: int,
     pcm_audio_path: str | None = None,
@@ -346,12 +474,27 @@ def clear_previous_outputs(meeting_id: int):
                 (meeting_id,),
             ).fetchall()
         ]
+        segment_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM transcriptsegment WHERE meeting_id = ?",
+                (meeting_id,),
+            ).fetchall()
+        ]
         if transcript_ids:
             placeholders = ",".join("?" for _ in transcript_ids)
             conn.execute(
                 f"DELETE FROM transcriptreviewitem WHERE transcript_id IN ({placeholders})",
                 transcript_ids,
             )
+        if segment_ids:
+            placeholders = ",".join("?" for _ in segment_ids)
+            conn.execute(
+                f"DELETE FROM transcriptreviewitem WHERE transcript_segment_id IN ({placeholders})",
+                segment_ids,
+            )
+        conn.execute("DELETE FROM transcriptsegment WHERE meeting_id = ?", (meeting_id,))
+        conn.execute("DELETE FROM participantaudioasset WHERE meeting_id = ?", (meeting_id,))
         conn.execute("DELETE FROM transcript WHERE meeting_id = ?", (meeting_id,))
         conn.commit()
     finally:
@@ -1443,6 +1586,621 @@ def create_audio_clip(
     return get_review_clip_filename(meeting_id, transcript_id, review_item_id)
 
 
+def create_segment_audio_clip(
+    source_audio_path: Path,
+    meeting_id: int,
+    segment_id: int,
+    review_item_id: int,
+    clip_start_sec: float,
+    clip_end_sec: float,
+) -> str | None:
+    output_path = get_segment_review_clip_path(meeting_id, segment_id, review_item_id)
+    duration = max(clip_end_sec - clip_start_sec, 1.0)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{max(clip_start_sec, 0.0):.3f}",
+        "-i",
+        str(source_audio_path),
+        "-t",
+        f"{duration:.3f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.warning("Failed to create segment review clip (ffmpeg_return_code=%s)", result.returncode)
+        return None
+    return get_segment_review_clip_filename(meeting_id, segment_id, review_item_id)
+
+
+def insert_participant_audio_asset(
+    conn: sqlite3.Connection,
+    meeting_id: int,
+    participant_id: int | None,
+    audio_source_id: int | None,
+    asset_type: str,
+    file_path: str,
+    fmt: str | None,
+    start_offset_ms: int,
+    end_offset_ms: int | None,
+    derivation_method: str,
+    confidence: float,
+    duration_ms: int | None = None,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO participantaudioasset (
+            meeting_id,
+            participant_id,
+            audio_source_id,
+            asset_type,
+            file_path,
+            format,
+            sample_rate_hz,
+            channel_count,
+            duration_ms,
+            start_offset_ms,
+            end_offset_ms,
+            status,
+            derivation_method,
+            confidence,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            meeting_id,
+            participant_id,
+            audio_source_id,
+            asset_type,
+            file_path,
+            fmt,
+            16000 if fmt == "wav" else None,
+            1 if fmt == "wav" else None,
+            duration_ms,
+            start_offset_ms,
+            end_offset_ms,
+            AUDIO_STATUS_READY,
+            derivation_method,
+            confidence,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def build_participant_lookup(rows: list[sqlite3.Row]) -> dict[int, dict]:
+    lookup: dict[int, dict] = {}
+    for row in rows:
+        lookup[int(row["id"])] = dict(row)
+    return lookup
+
+
+def build_activity_windows(activity_rows: list[sqlite3.Row]) -> list[dict]:
+    windows_by_participant: dict[int, list[dict]] = {}
+    for row in activity_rows:
+        participant_id = row["participant_id"]
+        if participant_id is None:
+            continue
+        start_offset_ms = int(row["start_offset_ms"] or 0)
+        end_offset_ms = int(row["end_offset_ms"] or 0)
+        if end_offset_ms <= start_offset_ms:
+            continue
+        windows_by_participant.setdefault(int(participant_id), []).append(
+            {
+                "participant_id": int(participant_id),
+                "start_offset_ms": start_offset_ms,
+                "end_offset_ms": end_offset_ms,
+                "confidence": float(row["confidence"] or 0.0),
+            }
+        )
+
+    merged: list[dict] = []
+    for participant_id, windows in windows_by_participant.items():
+        ordered = sorted(windows, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"]))
+        current = None
+        for window in ordered:
+            if current is None:
+                current = dict(window)
+                continue
+            if window["start_offset_ms"] <= current["end_offset_ms"] + 800:
+                current["end_offset_ms"] = max(current["end_offset_ms"], window["end_offset_ms"])
+                current["confidence"] = max(current["confidence"], window["confidence"])
+                continue
+            if current["end_offset_ms"] - current["start_offset_ms"] >= 700:
+                merged.append(current)
+            current = dict(window)
+        if current and current["end_offset_ms"] - current["start_offset_ms"] >= 700:
+            merged.append(current)
+
+    return sorted(merged, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"], item["participant_id"]))
+
+
+def trim_audio_window(source_audio_path: Path, output_path: Path, start_offset_ms: int, end_offset_ms: int) -> bool:
+    duration_ms = max(end_offset_ms - start_offset_ms, 1000)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{max(start_offset_ms, 0) / 1000:.3f}",
+        "-i",
+        str(source_audio_path),
+        "-t",
+        f"{duration_ms / 1000:.3f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    return result.returncode == 0 and output_path.exists()
+
+
+def materialize_participant_audio_assets(
+    meeting_id: int,
+    source_audio_path: Path,
+    audio_source_id: int | None,
+    activity_rows: list[sqlite3.Row],
+) -> list[sqlite3.Row]:
+    conn = db_connection()
+    try:
+        windows = build_activity_windows(activity_rows)
+        for window in windows:
+            output_path = get_participant_audio_asset_path(
+                meeting_id,
+                window["participant_id"],
+                window["start_offset_ms"],
+                window["end_offset_ms"],
+            )
+            if not trim_audio_window(
+                source_audio_path,
+                output_path,
+                window["start_offset_ms"],
+                window["end_offset_ms"],
+            ):
+                continue
+            insert_participant_audio_asset(
+                conn,
+                meeting_id,
+                window["participant_id"],
+                audio_source_id,
+                "activity_interval_clip",
+                str(output_path),
+                "wav",
+                window["start_offset_ms"],
+                window["end_offset_ms"],
+                "speaker_activity_trim",
+                max(0.0, min(1.0, window["confidence"])),
+                duration_ms=window["end_offset_ms"] - window["start_offset_ms"],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return fetch_participant_audio_assets(meeting_id)
+
+
+def build_segments_from_whisper_result(
+    result: dict,
+    participant_id: int | None,
+    participant_audio_asset_id: int | None,
+    audio_source_id: int | None,
+    base_offset_ms: int,
+    assignment_method: str,
+    assignment_confidence: float,
+    needs_speaker_review: bool,
+    source_audio_path: Path,
+) -> list[dict]:
+    segments: list[dict] = []
+    for segment in result.get("segments", []):
+        text = normalize_text(segment.get("text") or "")
+        if not text:
+            continue
+        start_sec = float(segment.get("start") or 0.0)
+        end_sec = float(segment.get("end") or start_sec)
+        if end_sec <= start_sec:
+            end_sec = start_sec + 0.5
+        segments.append(
+            {
+                "participant_id": participant_id,
+                "participant_audio_asset_id": participant_audio_asset_id,
+                "audio_source_id": audio_source_id,
+                "raw_text": text,
+                "text": text,
+                "language": DEFAULT_SPOKEN_LANGUAGE,
+                "start_offset_ms": max(0, int(round(base_offset_ms + (start_sec * 1000)))),
+                "end_offset_ms": max(0, int(round(base_offset_ms + (end_sec * 1000)))),
+                "asr_confidence": None,
+                "assignment_method": assignment_method,
+                "assignment_confidence": assignment_confidence,
+                "needs_speaker_review": needs_speaker_review,
+                "resolution_status": (
+                    TRANSCRIPT_STATUS_PENDING_REVIEW if needs_speaker_review else TRANSCRIPT_STATUS_ORIGINAL
+                ),
+                "source_audio_path": source_audio_path,
+                "overlap_group_id": None,
+            }
+        )
+    return segments
+
+
+def transcribe_participant_assets(
+    meeting_id: int,
+    asset_rows: list[sqlite3.Row],
+) -> list[dict]:
+    segments: list[dict] = []
+    for asset in asset_rows:
+        file_path = Path(asset["file_path"])
+        if not file_path.exists():
+            continue
+        result = load_whisperx_result(file_path, meeting_id)
+        segments.extend(
+            build_segments_from_whisper_result(
+                result,
+                participant_id=asset["participant_id"],
+                participant_audio_asset_id=asset["id"],
+                audio_source_id=asset["audio_source_id"],
+                base_offset_ms=int(asset["start_offset_ms"] or 0),
+                assignment_method="activity_bound_asset",
+                assignment_confidence=max(0.0, min(1.0, float(asset["confidence"] or 0.0))),
+                needs_speaker_review=float(asset["confidence"] or 0.0) < 0.85,
+                source_audio_path=file_path,
+            )
+        )
+    return segments
+
+
+def pick_mixed_segment_assignment(segment_start_ms: int, segment_end_ms: int, activity_rows: list[sqlite3.Row]) -> tuple[int | None, str, float, bool]:
+    duration_ms = max(segment_end_ms - segment_start_ms, 1)
+    overlap_by_participant: dict[int, int] = {}
+    for row in activity_rows:
+        participant_id = row["participant_id"]
+        if participant_id is None:
+            continue
+        overlap_start = max(segment_start_ms, int(row["start_offset_ms"] or 0))
+        overlap_end = min(segment_end_ms, int(row["end_offset_ms"] or 0))
+        if overlap_end <= overlap_start:
+            continue
+        overlap_by_participant[int(participant_id)] = overlap_by_participant.get(int(participant_id), 0) + (
+            overlap_end - overlap_start
+        )
+
+    if not overlap_by_participant:
+        return None, "mixed_overlap_ambiguous", 0.0, True
+
+    ranked = sorted(overlap_by_participant.items(), key=lambda item: item[1], reverse=True)
+    best_participant_id, best_overlap = ranked[0]
+    best_ratio = best_overlap / duration_ms
+    second_ratio = ranked[1][1] / duration_ms if len(ranked) > 1 else 0.0
+    if best_ratio >= 0.65 and (best_ratio - second_ratio) >= 0.20:
+        return best_participant_id, "mixed_overlap", best_ratio, False
+    if best_ratio > 0:
+        return best_participant_id, "mixed_overlap_provisional", best_ratio, True
+    return None, "mixed_overlap_ambiguous", 0.0, True
+
+
+def transcribe_mixed_fallback(
+    meeting_id: int,
+    source_audio_path: Path,
+    audio_source_id: int | None,
+    activity_rows: list[sqlite3.Row],
+) -> list[dict]:
+    result = load_whisperx_result(source_audio_path, meeting_id)
+    segments: list[dict] = []
+    for item in build_segments_from_whisper_result(
+        result,
+        participant_id=None,
+        participant_audio_asset_id=None,
+        audio_source_id=audio_source_id,
+        base_offset_ms=0,
+        assignment_method="mixed_fallback",
+        assignment_confidence=0.0,
+        needs_speaker_review=True,
+        source_audio_path=source_audio_path,
+    ):
+        participant_id, assignment_method, assignment_confidence, needs_review = pick_mixed_segment_assignment(
+            item["start_offset_ms"],
+            item["end_offset_ms"],
+            activity_rows,
+        )
+        item["participant_id"] = participant_id
+        item["assignment_method"] = assignment_method
+        item["assignment_confidence"] = assignment_confidence
+        item["needs_speaker_review"] = needs_review
+        item["resolution_status"] = (
+            TRANSCRIPT_STATUS_PENDING_REVIEW if needs_review else TRANSCRIPT_STATUS_ORIGINAL
+        )
+        segments.append(item)
+    return segments
+
+
+def annotate_overlap_groups(segments: list[dict]) -> None:
+    ordered = sorted(segments, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"]))
+    active: list[dict] = []
+    group_index = 0
+    for segment in ordered:
+        active = [item for item in active if item["end_offset_ms"] > segment["start_offset_ms"]]
+        overlaps = [item for item in active if item["participant_id"] != segment["participant_id"]]
+        if overlaps:
+            group_index += 1
+            group_id = f"overlap-{group_index}"
+            segment["overlap_group_id"] = group_id
+            for overlap in overlaps:
+                overlap["overlap_group_id"] = overlap.get("overlap_group_id") or group_id
+        active.append(segment)
+
+
+def build_transcript_segments(participant_segments: list[dict], mixed_segments: list[dict]) -> list[dict]:
+    segments = participant_segments if participant_segments else mixed_segments
+    deduped: list[dict] = []
+    for segment in sorted(segments, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"], item["text"])):
+        if not deduped:
+            deduped.append(segment)
+            continue
+        previous = deduped[-1]
+        if (
+            previous["participant_id"] == segment["participant_id"]
+            and previous["text"].casefold() == segment["text"].casefold()
+            and abs(previous["start_offset_ms"] - segment["start_offset_ms"]) <= 800
+        ):
+            previous["end_offset_ms"] = max(previous["end_offset_ms"], segment["end_offset_ms"])
+            previous["needs_speaker_review"] = previous["needs_speaker_review"] or segment["needs_speaker_review"]
+            previous["assignment_confidence"] = max(previous["assignment_confidence"], segment["assignment_confidence"])
+            continue
+        deduped.append(segment)
+    annotate_overlap_groups(deduped)
+    for index, segment in enumerate(deduped, start=1):
+        segment["sequence_no"] = index
+    return deduped
+
+
+def create_segment_review_item(
+    conn: sqlite3.Connection,
+    transcript_id: int,
+    transcript_segment_id: int,
+    current_text: str,
+    suggested_text: str,
+    confidence: float,
+    current_participant_id: int | None,
+    suggested_participant_id: int | None,
+    clip_start_ms: int,
+    clip_end_ms: int,
+) -> int:
+    created_at = datetime.utcnow().isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO transcriptreviewitem (
+            transcript_id,
+            transcript_segment_id,
+            review_type,
+            granularity,
+            current_text,
+            suggested_text,
+            confidence,
+            current_participant_id,
+            suggested_participant_id,
+            status,
+            clip_start_ms,
+            clip_end_ms,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            transcript_id,
+            transcript_segment_id,
+            "speaker_assignment",
+            "speaker",
+            current_text,
+            suggested_text,
+            confidence,
+            current_participant_id,
+            suggested_participant_id,
+            REVIEW_STATUS_PENDING,
+            clip_start_ms,
+            clip_end_ms,
+            created_at,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def persist_transcript_segments(
+    meeting_id: int,
+    segments: list[dict],
+    participant_lookup: dict[int, dict],
+) -> int:
+    conn = db_connection()
+    pending_reviews = 0
+    try:
+        for segment in segments:
+            participant = participant_lookup.get(segment["participant_id"]) if segment.get("participant_id") else None
+            speaker = normalize_text(participant.get("display_name") if participant else "Unknown") or "Unknown"
+            timestamp = datetime.utcnow().isoformat()
+            transcript_cursor = conn.execute(
+                """
+                INSERT INTO transcript (
+                    meeting_id,
+                    sequence_no,
+                    speaker,
+                    teams_text,
+                    text,
+                    start_sec,
+                    end_sec,
+                    caption_started_at,
+                    caption_finalized_at,
+                    resolution_status,
+                    auto_corrected,
+                    timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    meeting_id,
+                    segment["sequence_no"],
+                    speaker,
+                    segment["raw_text"],
+                    segment["text"],
+                    segment["start_offset_ms"] / 1000.0,
+                    segment["end_offset_ms"] / 1000.0,
+                    None,
+                    None,
+                    segment["resolution_status"],
+                    0,
+                    timestamp,
+                ),
+            )
+            transcript_id = int(transcript_cursor.lastrowid)
+            cursor = conn.execute(
+                """
+                INSERT INTO transcriptsegment (
+                    meeting_id,
+                    participant_id,
+                    participant_audio_asset_id,
+                    audio_source_id,
+                    sequence_no,
+                    raw_text,
+                    text,
+                    language,
+                    start_offset_ms,
+                    end_offset_ms,
+                    asr_confidence,
+                    assignment_method,
+                    assignment_confidence,
+                    overlap_group_id,
+                    needs_speaker_review,
+                    resolution_status,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    meeting_id,
+                    segment.get("participant_id"),
+                    segment.get("participant_audio_asset_id"),
+                    segment.get("audio_source_id"),
+                    segment["sequence_no"],
+                    segment["raw_text"],
+                    segment["text"],
+                    segment.get("language"),
+                    segment["start_offset_ms"],
+                    segment["end_offset_ms"],
+                    segment.get("asr_confidence"),
+                    segment["assignment_method"],
+                    segment["assignment_confidence"],
+                    segment.get("overlap_group_id"),
+                    1 if segment["needs_speaker_review"] else 0,
+                    segment["resolution_status"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            transcript_segment_id = int(cursor.lastrowid)
+            if not segment["needs_speaker_review"]:
+                continue
+            clip_start_sec = max((segment["start_offset_ms"] / 1000.0) - 1.0, 0.0)
+            clip_end_sec = max((segment["end_offset_ms"] / 1000.0) + 1.0, clip_start_sec + 1.0)
+            review_item_id = create_segment_review_item(
+                conn,
+                transcript_id,
+                transcript_segment_id,
+                segment["text"],
+                speaker,
+                max(0.0, min(1.0, segment["assignment_confidence"])),
+                segment.get("participant_id"),
+                segment.get("participant_id"),
+                int(clip_start_sec * 1000),
+                int(clip_end_sec * 1000),
+            )
+            source_audio_path = segment.get("source_audio_path")
+            if isinstance(source_audio_path, Path) and source_audio_path.exists():
+                clip_filename = create_segment_audio_clip(
+                    source_audio_path,
+                    meeting_id,
+                    transcript_segment_id,
+                    review_item_id,
+                    clip_start_sec,
+                    clip_end_sec,
+                )
+                if clip_filename:
+                    update_review_item_clip_path(conn, review_item_id, clip_filename)
+            pending_reviews += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return pending_reviews
+
+
+def fetch_participant_context(meeting_id: int) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row]]:
+    return (
+        fetch_meeting_participants(meeting_id),
+        fetch_speaker_activity_events(meeting_id),
+        fetch_audio_sources(meeting_id),
+    )
+
+
+def compute_source_vad(source_audio_path: Path, activity_rows: list[sqlite3.Row]) -> list[dict]:
+    # v1 uses observed speaker activity as the initial speech mask until per-source VAD lands.
+    if not source_audio_path.exists():
+        return []
+    return build_activity_windows(activity_rows)
+
+
+def bind_audio_sources(
+    meeting_id: int,
+    audio_source_rows: list[sqlite3.Row],
+    activity_rows: list[sqlite3.Row],
+) -> None:
+    conn = db_connection()
+    try:
+        conn.execute("DELETE FROM audiosourcebinding WHERE meeting_id = ?", (meeting_id,))
+        activity_windows = build_activity_windows(activity_rows)
+        for source_row in audio_source_rows:
+            if source_row["source_kind"] != "meeting_mixed_master":
+                continue
+            for window in activity_windows:
+                confidence = max(0.0, min(1.0, float(window["confidence"] or 0.0)))
+                binding_status = (
+                    ASSIGNMENT_STATUS_CONFIRMED if confidence >= 0.85
+                    else ASSIGNMENT_STATUS_PROVISIONAL if confidence >= 0.65
+                    else ASSIGNMENT_STATUS_UNKNOWN
+                )
+                conn.execute(
+                    """
+                    INSERT INTO audiosourcebinding (
+                        meeting_id,
+                        audio_source_id,
+                        participant_id,
+                        valid_from_ms,
+                        valid_to_ms,
+                        binding_status,
+                        binding_method,
+                        confidence,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        meeting_id,
+                        source_row["id"],
+                        window["participant_id"],
+                        window["start_offset_ms"],
+                        window["end_offset_ms"],
+                        binding_status,
+                        "activity_overlap",
+                        confidence,
+                        datetime.utcnow().isoformat(),
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def persist_final_outputs(
     meeting_id: int,
     rows: list[dict],
@@ -1590,87 +2348,89 @@ def process_meeting(meeting_id: int):
 
     update_meeting_postprocess_status(
         meeting_id,
-        POSTPROCESS_STATUS_CANONICALIZING,
+        POSTPROCESS_STATUS_BINDING_SOURCES,
         None,
         None,
-        "Teams transcript temizleniyor",
+        "Participant registry ve speaker activity baglaniyor",
     )
-    caption_events = fetch_caption_events(meeting_id)
-    if not caption_events:
-        caption_events = build_events_from_legacy_transcripts(fetch_legacy_transcripts(meeting_id))
-    canonical_rows = canonicalize_caption_events(caption_events)
-    persist_json(get_teams_canonical_path(meeting_id), canonical_rows)
+    participant_rows, activity_rows, audio_source_rows = fetch_participant_context(meeting_id)
+    persist_json(
+        get_teams_canonical_path(meeting_id),
+        {
+            "participants": [dict(row) for row in participant_rows],
+            "speaker_activity": [dict(row) for row in activity_rows],
+            "audio_sources": [dict(row) for row in audio_source_rows],
+        },
+    )
 
-    whisper_result = None
-    whisper_tokens: list[dict] = []
-    whisper_segments: list[dict] = []
     source_audio_path: Path | None = None
-
+    mixed_source_id: int | None = None
     if audio_ready and asset is not None:
-        update_meeting_postprocess_status(
-            meeting_id,
-            POSTPROCESS_STATUS_TRANSCRIBING,
-            None,
-            None,
-            "WhisperX modeli yükleniyor",
-        )
         master_audio_path = Path(asset["master_audio_path"])
         pcm_audio_path = Path(asset["pcm_audio_path"]) if asset["pcm_audio_path"] else None
         if not pcm_audio_path or not pcm_audio_path.exists():
             pcm_audio_path = convert_audio_to_pcm(master_audio_path, meeting_id)
         update_audio_asset_paths(asset["id"], str(pcm_audio_path), POSTPROCESS_VERSION)
         source_audio_path = pcm_audio_path
-        whisper_result = load_whisperx_result(pcm_audio_path, meeting_id)
-        persist_json(get_whisperx_result_path(meeting_id), whisper_result)
-        whisper_tokens, whisper_segments = build_whisper_tokens(whisper_result)
+        mixed_source_id = upsert_mixed_audio_source(meeting_id, str(pcm_audio_path), "wav")
+        participant_rows, activity_rows, audio_source_rows = fetch_participant_context(meeting_id)
+        if source_audio_path.exists():
+            bind_audio_sources(meeting_id, audio_source_rows, activity_rows)
+            persist_json(get_alignment_map_path(meeting_id), compute_source_vad(source_audio_path, activity_rows))
 
     update_meeting_postprocess_status(
         meeting_id,
-        POSTPROCESS_STATUS_ALIGNING,
+        POSTPROCESS_STATUS_MATERIALIZING_AUDIO,
         None,
         None,
-        "Teams ve WhisperX transcriptleri eşleniyor" if audio_ready else None,
-    )
-    teams_tokens = build_teams_tokens(canonical_rows)
-    for index, token in enumerate(teams_tokens):
-        token["global_index"] = index
-    for index, token in enumerate(whisper_tokens):
-        token["global_index"] = index
-
-    if whisper_tokens:
-        teams_to_whisper, whisper_to_teams, anchors = align_token_streams(teams_tokens, whisper_tokens)
-    else:
-        teams_to_whisper, whisper_to_teams, anchors = {}, {}, []
-
-    final_rows, alignment_debug, canonical_debug = build_final_rows(
-        canonical_rows,
-        teams_tokens,
-        whisper_tokens,
-        whisper_segments,
-        teams_to_whisper,
-        whisper_to_teams,
-    )
-    final_rows = defensively_filter_final_rows(final_rows)
-    alignment_payload = {
-        "anchors": anchors,
-        "teams_token_count": len(teams_tokens),
-        "whisper_token_count": len(whisper_tokens),
-        "mapped_team_tokens": len(teams_to_whisper),
-        "mapped_whisper_tokens": len(whisper_to_teams),
-        "rows": alignment_debug,
-        "canonical_rows": canonical_debug,
-    }
-    persist_json(get_alignment_map_path(meeting_id), alignment_payload)
-
-    update_meeting_postprocess_status(
-        meeting_id,
-        POSTPROCESS_STATUS_REBUILDING,
-        None,
-        None,
-        "Final transcript hazırlanıyor",
+        "Participant audio assetleri uretiliyor",
     )
     clear_previous_outputs(meeting_id)
-    pending_reviews = persist_final_outputs(meeting_id, final_rows, source_audio_path)
+    participant_audio_assets: list[sqlite3.Row] = []
+    if source_audio_path is not None and source_audio_path.exists():
+        participant_audio_assets = materialize_participant_audio_assets(
+            meeting_id,
+            source_audio_path,
+            mixed_source_id,
+            activity_rows,
+        )
+
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_TRANSCRIBING_PARTICIPANTS,
+        None,
+        None,
+        "Participant bazli ASR calisiyor" if participant_audio_assets else "Mixed fallback ASR calisiyor",
+    )
+    participant_lookup = build_participant_lookup(fetch_meeting_participants(meeting_id))
+    participant_segments = transcribe_participant_assets(meeting_id, participant_audio_assets)
+    mixed_segments: list[dict] = []
+    if not participant_segments and source_audio_path is not None and source_audio_path.exists():
+        mixed_segments = transcribe_mixed_fallback(
+            meeting_id,
+            source_audio_path,
+            mixed_source_id,
+            activity_rows,
+        )
+    final_segments = build_transcript_segments(participant_segments, mixed_segments)
+    persist_json(
+        get_whisperx_result_path(meeting_id),
+        {
+            "participant_asset_count": len(participant_audio_assets),
+            "participant_segment_count": len(participant_segments),
+            "mixed_segment_count": len(mixed_segments),
+            "final_segment_count": len(final_segments),
+        },
+    )
+
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_ASSEMBLING_SEGMENTS,
+        None,
+        None,
+        "Transcript segmentleri yaziliyor",
+    )
+    pending_reviews = persist_transcript_segments(meeting_id, final_segments, participant_lookup)
     if pending_reviews:
         update_meeting_postprocess_status(
             meeting_id,

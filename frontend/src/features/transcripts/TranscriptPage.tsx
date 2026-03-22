@@ -6,16 +6,14 @@ import { AppShell } from "../../components/AppShell";
 import { LoadingView } from "../../components/LoadingView";
 import { StatusPill } from "../../components/StatusPill";
 import { buildApiUrl } from "../../lib/api/client";
-import type { TranscriptEntry } from "../../lib/api/types";
+import type { ParticipantEntry, SegmentEntry } from "../../lib/api/types";
 import {
-  useApplyAllReviews,
-  useApplyReview,
-  useKeepReview,
   useMeetingSnapshot,
-  useMergeDuplicates,
+  useMergeParticipants,
+  useSplitParticipant,
   useStopTranscriptMeeting,
+  useUpdateSegmentParticipant,
 } from "./useMeetingSnapshot";
-
 
 function toneForStatus(status: string): "default" | "success" | "warning" | "danger" | "teal" | "primary" {
   if (status === "completed" || status === "review_ready") {
@@ -27,15 +25,24 @@ function toneForStatus(status: string): "default" | "success" | "warning" | "dan
   if (["joining", "active"].includes(status)) {
     return "primary";
   }
-  if (["transcribing", "aligning"].includes(status)) {
+  if (["transcribing_participants", "binding_sources", "assembling_segments"].includes(status)) {
     return "teal";
   }
-  if (["queued", "pending", "canonicalizing", "rebuilding"].includes(status)) {
+  if (["queued", "pending", "materializing_audio"].includes(status)) {
     return "warning";
   }
   return "default";
 }
 
+function toneForBindingState(bindingState: string): "default" | "success" | "warning" | "danger" | "teal" | "primary" {
+  if (bindingState === "confirmed") {
+    return "success";
+  }
+  if (bindingState === "provisional") {
+    return "warning";
+  }
+  return "default";
+}
 
 const BackIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -43,9 +50,9 @@ const BackIcon = () => (
   </svg>
 );
 
-
 type TranscriptRowProps = {
-  row: TranscriptEntry;
+  row: SegmentEntry;
+  canManageSpeakers: boolean;
   isOpen: boolean;
   isAudioActive: boolean;
   isAudioPlaying: boolean;
@@ -55,9 +62,9 @@ type TranscriptRowProps = {
   registerRowElement: (rowId: number, node: HTMLElement | null) => void;
 };
 
-
 function TranscriptRow({
   row,
+  canManageSpeakers,
   isOpen,
   isAudioActive,
   isAudioPlaying,
@@ -66,136 +73,76 @@ function TranscriptRow({
   onSeekToTime,
   registerRowElement,
 }: TranscriptRowProps) {
-  const review = row.review;
-  const isClickable = Boolean(review);
+  const isClickable = canManageSpeakers;
   const seekTimeSec = audioSeekEnabled ? row.start_sec ?? row.end_sec ?? null : null;
-
   const classNames = [
     "nt-stream-item",
     isClickable ? "is-clickable" : "",
     isOpen ? "is-open" : "",
     isAudioActive ? "is-audio-active" : "",
-    row.has_pending_review ? "is-review-pending" : "",
-    row.has_duplicate_merge_candidate ? "is-merge-candidate" : "",
+    row.needs_speaker_review ? "is-review-pending" : "",
   ]
     .filter(Boolean)
     .join(" ");
 
-  const openReview = () => {
-    if (review) {
-      onOpen(row.id);
-    }
-  };
-
-  const seekTranscriptAudio = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (seekTimeSec === null) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    onSeekToTime(Math.max(0, seekTimeSec));
-  };
+  const rowContent = (
+    <div className="nt-stream-row-layout">
+      <div className="nt-timeline-col">
+        <span className={`nt-avatar nt-speaker-badge nt-avatar-${row.color}`}>{row.initials}</span>
+        <span className="nt-timeline-line" />
+      </div>
+      <div className="nt-stream-content">
+        <div className="nt-stream-meta-row">
+          <div className="nt-stream-meta-stack">
+            <strong className="nt-stream-speaker">{row.speaker}</strong>
+            <span className="nt-stream-time">{row.timestamp}</span>
+          </div>
+          <div className="nt-transcript-pills">
+            {isAudioPlaying ? <span className="nt-stream-live-indicator">Şu an oynatılıyor</span> : null}
+            <StatusPill tone={toneForBindingState(row.needs_speaker_review ? "provisional" : "confirmed")}>
+              {row.needs_speaker_review ? "Speaker review" : row.assignment_method}
+            </StatusPill>
+            <StatusPill tone="teal">{`%${Math.round(row.assignment_confidence * 100)}`}</StatusPill>
+            {row.overlap_group_id ? <StatusPill tone="warning">Overlap</StatusPill> : null}
+          </div>
+        </div>
+        <div
+          className={[
+            "nt-stream-bubble",
+            seekTimeSec !== null ? "is-seekable" : "",
+            row.needs_speaker_review ? "is-review-pending" : "",
+          ]
+            .filter(Boolean)
+            .join(" ")}
+          onClick={(event) => {
+            if (seekTimeSec === null) {
+              return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            onSeekToTime(Math.max(0, seekTimeSec));
+          }}
+        >
+          <p className="nt-stream-text">{row.text}</p>
+        </div>
+      </div>
+    </div>
+  );
 
   return (
     <article className={classNames} ref={(node) => registerRowElement(row.id, node)}>
       {isClickable ? (
-        <button
-          className="nt-stream-item-trigger"
-          onClick={openReview}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              openReview();
-            }
-          }}
-          type="button"
-        >
-          <div className="nt-stream-row-layout">
-            <div className="nt-timeline-col">
-              <span className={`nt-avatar nt-speaker-badge nt-avatar-${row.color}`}>{row.initials}</span>
-              <span className="nt-timeline-line" />
-            </div>
-            <div className="nt-stream-content">
-              <div className="nt-stream-meta-row">
-                <div className="nt-stream-meta-stack">
-                  <strong className="nt-stream-speaker">{row.speaker}</strong>
-                  <span className="nt-stream-time">{row.timestamp}</span>
-                </div>
-                <div className="nt-transcript-pills">
-                  {isAudioPlaying ? <span className="nt-stream-live-indicator">Şu an oynatılıyor</span> : null}
-                  {row.auto_corrected ? <StatusPill tone="success">Auto corrected</StatusPill> : null}
-                  {row.has_duplicate_merge_candidate ? (
-                    <StatusPill tone="warning">Duplicate adayı</StatusPill>
-                  ) : null}
-                  {row.has_pending_review ? (
-                    <StatusPill tone="primary">Review bekliyor</StatusPill>
-                  ) : (
-                    <StatusPill tone={row.resolution_status === "accepted" ? "success" : "default"}>
-                      {row.resolution_status}
-                    </StatusPill>
-                  )}
-                </div>
-              </div>
-              <div
-                className={[
-                  "nt-stream-bubble",
-                  seekTimeSec !== null ? "is-seekable" : "",
-                  row.has_pending_review ? "is-review-pending" : "",
-                  row.has_duplicate_merge_candidate ? "is-merge-candidate" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                onClick={seekTranscriptAudio}
-              >
-                <p className="nt-stream-text">{row.text}</p>
-              </div>
-            </div>
-          </div>
+        <button className="nt-stream-item-trigger" onClick={() => onOpen(row.id)} type="button">
+          {rowContent}
         </button>
       ) : (
-        <div className="nt-stream-row-layout">
-          <div className="nt-timeline-col">
-            <span className={`nt-avatar nt-speaker-badge nt-avatar-${row.color}`}>{row.initials}</span>
-            <span className="nt-timeline-line" />
-          </div>
-          <div className="nt-stream-content">
-              <div className="nt-stream-meta-row">
-                <div className="nt-stream-meta-stack">
-                  <strong className="nt-stream-speaker">{row.speaker}</strong>
-                  <span className="nt-stream-time">{row.timestamp}</span>
-                </div>
-                <div className="nt-transcript-pills">
-                {isAudioPlaying ? <span className="nt-stream-live-indicator">Şu an oynatılıyor</span> : null}
-                {row.auto_corrected ? <StatusPill tone="success">Auto corrected</StatusPill> : null}
-                {row.has_duplicate_merge_candidate ? (
-                  <StatusPill tone="warning">Duplicate adayı</StatusPill>
-                ) : null}
-                <StatusPill tone={row.resolution_status === "accepted" ? "success" : "default"}>
-                  {row.resolution_status}
-                </StatusPill>
-              </div>
-            </div>
-            <div
-              className={[
-                "nt-stream-bubble",
-                seekTimeSec !== null ? "is-seekable" : "",
-                row.has_duplicate_merge_candidate ? "is-merge-candidate" : "",
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              onClick={seekTranscriptAudio}
-            >
-              <p className="nt-stream-text">{row.text}</p>
-            </div>
-          </div>
-        </div>
+        rowContent
       )}
     </article>
   );
 }
 
-
-function findActiveTranscriptId(rows: TranscriptEntry[], currentTime: number) {
+function findActiveSegmentId(rows: SegmentEntry[], currentTime: number) {
   const timedRows = rows
     .filter((row) => row.start_sec !== null || row.end_sec !== null)
     .sort((left, right) => {
@@ -206,9 +153,6 @@ function findActiveTranscriptId(rows: TranscriptEntry[], currentTime: number) {
       }
       return left.id - right.id;
     });
-  if (timedRows.length === 0) {
-    return null;
-  }
 
   for (let index = 0; index < timedRows.length; index += 1) {
     const row = timedRows[index];
@@ -225,8 +169,7 @@ function findActiveTranscriptId(rows: TranscriptEntry[], currentTime: number) {
   return null;
 }
 
-
-function hasReliableTranscriptAudioSync(rows: TranscriptEntry[], durationSec: number) {
+function hasReliableTranscriptAudioSync(rows: SegmentEntry[], durationSec: number) {
   if (!Number.isFinite(durationSec) || durationSec <= 0) {
     return true;
   }
@@ -264,146 +207,186 @@ function hasReliableTranscriptAudioSync(rows: TranscriptEntry[], durationSec: nu
   return true;
 }
 
-
-type TranscriptReviewModalProps = {
-  row: TranscriptEntry;
-  reviewBusy: boolean;
-  onApply: (reviewId: number) => void;
-  onKeep: (reviewId: number) => void;
+type SpeakerModalProps = {
+  row: SegmentEntry;
+  participants: ParticipantEntry[];
+  busy: boolean;
+  onAssign: (participantId: number | null) => void;
+  onSplit: (displayName: string) => void;
   onClose: () => void;
 };
 
+function SpeakerModal({ row, participants, busy, onAssign, onSplit, onClose }: SpeakerModalProps) {
+  const [selectedParticipantId, setSelectedParticipantId] = useState<string>(
+    row.participant_id === null ? "" : String(row.participant_id),
+  );
+  const [splitName, setSplitName] = useState(row.speaker === "Unknown" ? "" : `${row.speaker} alt akisi`);
 
-function TranscriptReviewModal({
-  row,
-  reviewBusy,
-  onApply,
-  onKeep,
-  onClose,
-}: TranscriptReviewModalProps) {
+  useEffect(() => {
+    setSelectedParticipantId(row.participant_id === null ? "" : String(row.participant_id));
+    setSplitName(row.speaker === "Unknown" ? "" : `${row.speaker} alt akisi`);
+  }, [row.id, row.participant_id, row.speaker]);
+
   const review = row.review;
 
-  if (!review) {
-    return null;
-  }
-
   return (
-    <div
-      className="nt-review-modal-shell"
-      onClick={onClose}
-      role="presentation"
-    >
+    <div className="nt-review-modal-shell" onClick={onClose} role="presentation">
       <div
         className="nt-review-modal nt-inline-review-popover"
         onClick={(event) => event.stopPropagation()}
         role="dialog"
         aria-modal="true"
-        aria-labelledby={`review-modal-title-${review.id}`}
+        aria-labelledby={`speaker-modal-title-${row.id}`}
       >
         <div className="nt-review-head">
           <div>
-            <strong id={`review-modal-title-${review.id}`}>{row.speaker}</strong>
+            <strong id={`speaker-modal-title-${row.id}`}>{row.speaker}</strong>
             <span>{row.timestamp}</span>
           </div>
-            <div className="nt-review-head-actions">
-              <div className="nt-transcript-pills">
-                <StatusPill tone="primary">{review.granularity}</StatusPill>
-                <StatusPill tone="teal">{review.confidence_label}</StatusPill>
-              </div>
+          <div className="nt-review-head-actions">
+            <div className="nt-transcript-pills">
+              <StatusPill tone="primary">{row.assignment_method}</StatusPill>
+              <StatusPill tone="teal">{`%${Math.round(row.assignment_confidence * 100)}`}</StatusPill>
+            </div>
             <button className="nt-btn nt-btn-ghost nt-btn-sm" onClick={onClose} type="button">
               Kapat
             </button>
           </div>
         </div>
+
         <div className="nt-review-block">
-          <span>Mevcut caption</span>
-          <p>{review.current_text}</p>
+          <span>Transcript</span>
+          <p>{row.text}</p>
         </div>
-        <div className="nt-review-block">
-          <span>WhisperX metni</span>
-          <p>{review.suggested_text}</p>
-        </div>
-        <div className="nt-review-block">
-          <span>Ses klibi</span>
-          {review.has_audio_clip && review.audio_clip_url ? (
-            <div className="nt-audio-section nt-audio-section-compact">
-              <div className="nt-audio-meta">
-                <span className="nt-audio-kicker">Ses klibi</span>
-                <strong>Review karşılaştırması</strong>
-                <span>Önerilen düzeltmeyi dinleyin.</span>
-              </div>
-              <AudioPlayer
-                compact
-                preload="none"
-                src={buildApiUrl(review.audio_clip_url)}
-              />
+
+        {review ? (
+          <>
+            <div className="nt-review-block">
+              <span>Mevcut speaker sinyali</span>
+              <p>{review.current_text || "Mevcut suggestion yok."}</p>
             </div>
-          ) : (
-            <p>Bu öneri için ses klibi üretilemedi.</p>
-          )}
+            <div className="nt-review-block">
+              <span>Önerilen düzeltme</span>
+              <p>{review.suggested_text || "Yeni suggestion yok."}</p>
+            </div>
+          </>
+        ) : null}
+
+        <div className="nt-review-block">
+          <span>Speaker ataması</span>
+          <select
+            className="nt-input"
+            disabled={busy}
+            value={selectedParticipantId}
+            onChange={(event) => setSelectedParticipantId(event.target.value)}
+          >
+            <option value="">Unknown olarak bırak</option>
+            {participants.map((participant) => (
+              <option key={participant.id} value={participant.id}>
+                {participant.display_name}
+              </option>
+            ))}
+          </select>
         </div>
+
+        {review?.has_audio_clip && review.audio_clip_url ? (
+          <div className="nt-review-block">
+            <span>Ses klibi</span>
+            <div className="nt-audio-section nt-audio-section-compact">
+              <AudioPlayer compact preload="none" src={buildApiUrl(review.audio_clip_url)} />
+            </div>
+          </div>
+        ) : null}
+
+        {row.participant_id !== null ? (
+          <div className="nt-review-block">
+            <span>Split participant</span>
+            <input
+              className="nt-input"
+              disabled={busy}
+              placeholder="Yeni participant adı"
+              value={splitName}
+              onChange={(event) => setSplitName(event.target.value)}
+            />
+          </div>
+        ) : null}
+
         <div className="nt-inline-actions">
           <button
             className="nt-btn nt-btn-primary"
-            disabled={reviewBusy}
-            onClick={() => onApply(review.id)}
+            disabled={busy}
+            onClick={() => onAssign(selectedParticipantId ? Number(selectedParticipantId) : null)}
             type="button"
           >
-            Uygula
+            {busy ? "Kaydediliyor" : "Atamayı kaydet"}
           </button>
-          <button
-            className="nt-btn nt-btn-secondary"
-            disabled={reviewBusy}
-            onClick={() => onKeep(review.id)}
-            type="button"
-          >
-            Koru
-          </button>
+          {row.participant_id !== null ? (
+            <button
+              className="nt-btn nt-btn-secondary"
+              disabled={busy || splitName.trim().length < 2}
+              onClick={() => onSplit(splitName.trim())}
+              type="button"
+            >
+              Yeni participant olarak ayır
+            </button>
+          ) : null}
         </div>
       </div>
     </div>
   );
 }
 
-
 export function TranscriptPage() {
   const params = useParams();
   const meetingId = Number(params.meetingId);
-  const [openReviewRowId, setOpenReviewRowId] = useState<number | null>(null);
+  const [openRowId, setOpenRowId] = useState<number | null>(null);
   const [activeAudioRowId, setActiveAudioRowId] = useState<number | null>(null);
   const [isAudioPlaying, setIsAudioPlaying] = useState(false);
   const [audioDurationSec, setAudioDurationSec] = useState(0);
   const [stopRequested, setStopRequested] = useState(false);
+  const [mergeSourceId, setMergeSourceId] = useState<string>("");
+  const [mergeTargetId, setMergeTargetId] = useState<string>("");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const streamBodyRef = useRef<HTMLDivElement | null>(null);
   const transcriptRowElementsRef = useRef(new Map<number, HTMLElement>());
 
   const snapshot = useMeetingSnapshot(meetingId);
-  const applyReview = useApplyReview(meetingId);
-  const keepReview = useKeepReview(meetingId);
-  const applyAllReviews = useApplyAllReviews(meetingId);
-  const mergeDuplicates = useMergeDuplicates(meetingId);
+  const updateSegmentParticipant = useUpdateSegmentParticipant(meetingId);
+  const mergeParticipants = useMergeParticipants(meetingId);
+  const splitParticipant = useSplitParticipant(meetingId);
   const stopMeeting = useStopTranscriptMeeting(meetingId);
   const snapshotData = snapshot.data ?? null;
-  const activeReviewRow =
-    openReviewRowId === null || !snapshotData
-      ? null
-      : snapshotData.transcripts.find((row) => row.id === openReviewRowId && row.review) ?? null;
+  const participants = snapshotData?.participants ?? [];
+  const segments = snapshotData?.segments ?? [];
+  const activeRow =
+    openRowId === null || !snapshotData ? null : snapshotData.segments.find((row) => row.id === openRowId) ?? null;
 
   useEffect(() => {
-    if (openReviewRowId !== null && !activeReviewRow) {
-      setOpenReviewRowId(null);
+    if (openRowId !== null && !activeRow) {
+      setOpenRowId(null);
     }
-  }, [activeReviewRow, openReviewRowId]);
+  }, [activeRow, openRowId]);
 
   useEffect(() => {
-    if (openReviewRowId === null) {
+    const availableParticipants = participants.filter((participant) => participant.join_state !== "merged");
+    const sourceExists = availableParticipants.some((participant) => String(participant.id) === mergeSourceId);
+    const targetExists = availableParticipants.some((participant) => String(participant.id) === mergeTargetId);
+    if (!sourceExists) {
+      setMergeSourceId(availableParticipants[0] ? String(availableParticipants[0].id) : "");
+    }
+    if (!targetExists) {
+      setMergeTargetId(availableParticipants[1] ? String(availableParticipants[1].id) : "");
+    }
+  }, [mergeSourceId, mergeTargetId, participants]);
+
+  useEffect(() => {
+    if (openRowId === null) {
       return undefined;
     }
     const previousOverflow = document.body.style.overflow;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setOpenReviewRowId(null);
+        setOpenRowId(null);
       }
     };
     document.body.style.overflow = "hidden";
@@ -412,7 +395,7 @@ export function TranscriptPage() {
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [openReviewRowId]);
+  }, [openRowId]);
 
   useEffect(() => {
     setAudioDurationSec(0);
@@ -425,12 +408,12 @@ export function TranscriptPage() {
       setIsAudioPlaying(false);
       return;
     }
-    if (!hasReliableTranscriptAudioSync(snapshotData.transcripts, audioDurationSec || audioElement.duration)) {
+    if (!hasReliableTranscriptAudioSync(snapshotData.segments, audioDurationSec || audioElement.duration)) {
       setActiveAudioRowId(null);
       setIsAudioPlaying(!audioElement.paused && !audioElement.ended);
       return;
     }
-    const nextActiveRowId = findActiveTranscriptId(snapshotData.transcripts, audioElement.currentTime);
+    const nextActiveRowId = findActiveSegmentId(snapshotData.segments, audioElement.currentTime);
     setActiveAudioRowId((currentValue) => (currentValue === nextActiveRowId ? currentValue : nextActiveRowId));
     setIsAudioPlaying(!audioElement.paused && !audioElement.ended);
   }, [audioDurationSec, snapshotData]);
@@ -486,34 +469,32 @@ export function TranscriptPage() {
           </Link>
         }
       >
-        <div className="nt-alert">
-          {snapshot.error?.message ?? "Bilinmeyen hata"}
-        </div>
+        <div className="nt-alert">{snapshot.error?.message ?? "Bilinmeyen hata"}</div>
       </AppShell>
     );
   }
 
   const data = snapshot.data;
-
   const progressActive =
-    ["transcribing", "aligning"].includes(data.postprocess.status) &&
-    data.postprocess.progress_pct !== null;
-  const hasSummaryActions =
-    data.actions.can_apply_all_reviews || data.actions.can_merge_duplicate_transcripts;
+    ["binding_sources", "materializing_audio", "transcribing_participants", "assembling_segments"].includes(
+      data.postprocess.status,
+    ) && data.postprocess.progress_pct !== null;
   const stopButtonBusy = stopRequested || stopMeeting.isPending;
-  const isTranscriptAudioSyncReliable = hasReliableTranscriptAudioSync(data.transcripts, audioDurationSec);
+  const isTranscriptAudioSyncReliable = hasReliableTranscriptAudioSync(data.segments, audioDurationSec);
   const effectiveActiveAudioRowId = isTranscriptAudioSyncReliable ? activeAudioRowId : null;
   const audioSyncNotice =
     audioDurationSec > 0 && !isTranscriptAudioSyncReliable
       ? "Bu kayıtta ses süresi transcript zamanlarıyla örtüşmüyor. Satır vurgusu ve satırdan oynatma kapatıldı."
       : null;
+  const mergeBusy = mergeParticipants.isPending;
+  const manageableParticipants = participants.filter((participant) => participant.join_state !== "merged");
 
   function syncAudioTranscript(currentTime: number) {
     if (!isTranscriptAudioSyncReliable) {
       setActiveAudioRowId(null);
       return;
     }
-    const nextActiveRowId = findActiveTranscriptId(data.transcripts, currentTime);
+    const nextActiveRowId = findActiveSegmentId(data.segments, currentTime);
     setActiveAudioRowId((currentValue) => (currentValue === nextActiveRowId ? currentValue : nextActiveRowId));
   }
 
@@ -567,10 +548,24 @@ export function TranscriptPage() {
     });
   }
 
+  function requestMergeParticipants() {
+    const sourceParticipantId = Number(mergeSourceId);
+    const targetParticipantId = Number(mergeTargetId);
+    if (!sourceParticipantId || !targetParticipantId || sourceParticipantId === targetParticipantId) {
+      return;
+    }
+    void mergeParticipants
+      .mutateAsync({ sourceParticipantId, targetParticipantId })
+      .then(() => {
+        setOpenRowId(null);
+      })
+      .catch(() => undefined);
+  }
+
   return (
     <AppShell
       title={data.meeting.title}
-      subtitle="Transcript'i gözden geçir, canlı önizlemeyi kontrol et ve çıktıları tek yerden yönet."
+      subtitle="Transcript'i participant registry, audio binding ve speaker review akışıyla yönet."
       aboveTitle={
         <Link className="nt-page-backlink" to="/dashboard">
           <BackIcon />
@@ -607,11 +602,11 @@ export function TranscriptPage() {
                 <div className="nt-transcript-summary-value">
                   <StatusPill tone={toneForStatus(data.meeting.status)}>{data.meeting.status}</StatusPill>
                 </div>
-                <p className="nt-card-hint">{`${data.summary.speaker_count} konuşmacı · ${data.summary.transcript_count} satır`}</p>
+                <p className="nt-card-hint">{`${data.summary.speaker_count} participant · ${data.summary.segment_count} segment`}</p>
               </div>
 
               <div className="nt-transcript-summary-item">
-                <span className="nt-card-label">WhisperX</span>
+                <span className="nt-card-label">Postprocess</span>
                 <div className="nt-transcript-summary-value">
                   {progressActive ? (
                     <strong className="nt-transcript-summary-number">%{data.postprocess.progress_pct}</strong>
@@ -620,49 +615,16 @@ export function TranscriptPage() {
                   )}
                 </div>
                 <p className="nt-card-hint">{data.postprocess.progress_note ?? data.postprocess.error ?? "Worker idle"}</p>
-                {progressActive ? (
-                  <div className="nt-progress-shell">
-                    <div
-                      className="nt-progress-bar"
-                      style={{ width: `${data.postprocess.progress_pct ?? 0}%` }}
-                    />
-                  </div>
-                ) : null}
               </div>
 
               <div className="nt-transcript-summary-item">
-                <span className="nt-card-label">Review</span>
+                <span className="nt-card-label">Speaker review</span>
                 <div className="nt-transcript-summary-value">
                   <strong className="nt-transcript-summary-number">{data.actions.pending_review_count}</strong>
                 </div>
-                <p className="nt-card-hint">{`${data.actions.duplicate_merge_candidate_count} duplicate aday`}</p>
+                <p className="nt-card-hint">{`${participants.length} registry kaydı`}</p>
               </div>
             </div>
-
-            {hasSummaryActions ? (
-              <div className="nt-inline-actions nt-transcript-summary-actions">
-                {data.actions.can_apply_all_reviews ? (
-                  <button
-                    className="nt-btn nt-btn-primary nt-btn-sm"
-                    disabled={applyAllReviews.isPending}
-                    onClick={() => void applyAllReviews.mutateAsync()}
-                    type="button"
-                  >
-                    {applyAllReviews.isPending ? "Uygulanıyor" : "Tümünü uygula"}
-                  </button>
-                ) : null}
-                {data.actions.can_merge_duplicate_transcripts ? (
-                  <button
-                    className="nt-btn nt-btn-secondary nt-btn-sm"
-                    disabled={mergeDuplicates.isPending}
-                    onClick={() => void mergeDuplicates.mutateAsync()}
-                    type="button"
-                  >
-                    {mergeDuplicates.isPending ? "Birleştiriliyor" : "Duplicate kayıtları birleştir"}
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
           </article>
 
           <article className="nt-card nt-card-padded nt-audio-card">
@@ -717,6 +679,83 @@ export function TranscriptPage() {
               </div>
             )}
           </article>
+
+          <article className="nt-card nt-card-padded">
+            <div className="nt-card-head">
+              <div>
+                <p className="nt-card-label">Participant registry</p>
+                <h2 className="nt-section-title">Konuşmacılar</h2>
+                <p className="nt-card-hint">Binding durumu ve participant audio asset erişimi burada görünür.</p>
+              </div>
+            </div>
+            {manageableParticipants.length === 0 ? (
+              <div className="nt-empty-state">
+                <strong>Henüz participant yok</strong>
+                <span>Bot roster panelinden participant registry toplamaya başladığında burada listelenecek.</span>
+              </div>
+            ) : (
+              <div className="nt-stream-track">
+                {manageableParticipants.map((participant) => (
+                  <div className="nt-stream-item" key={participant.id}>
+                    <div className="nt-stream-row-layout">
+                      <div className="nt-timeline-col">
+                        <span className="nt-avatar nt-speaker-badge nt-avatar-blue">
+                          {participant.display_name.slice(0, 2).toUpperCase()}
+                        </span>
+                        <span className="nt-timeline-line" />
+                      </div>
+                      <div className="nt-stream-content">
+                        <div className="nt-stream-meta-row">
+                          <div className="nt-stream-meta-stack">
+                            <strong className="nt-stream-speaker">{participant.display_name}</strong>
+                            <span className="nt-stream-time">{participant.join_state}</span>
+                          </div>
+                          <div className="nt-transcript-pills">
+                            <StatusPill tone={toneForBindingState(participant.binding_state)}>{participant.binding_state}</StatusPill>
+                            <StatusPill tone="teal">{`${participant.segment_count} segment`}</StatusPill>
+                            {participant.has_audio_asset ? (
+                              <a
+                                className="nt-btn nt-btn-secondary nt-btn-sm"
+                                href={buildApiUrl(`/api/media/meetings/${meetingId}/participants/${participant.id}/audio`)}
+                              >
+                                Audio
+                              </a>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {data.actions.can_manage_speakers && manageableParticipants.length > 1 ? (
+              <div className="nt-inline-actions nt-transcript-summary-actions">
+                <select className="nt-input" value={mergeSourceId} onChange={(event) => setMergeSourceId(event.target.value)}>
+                  {manageableParticipants.map((participant) => (
+                    <option key={`source-${participant.id}`} value={participant.id}>
+                      {participant.display_name}
+                    </option>
+                  ))}
+                </select>
+                <select className="nt-input" value={mergeTargetId} onChange={(event) => setMergeTargetId(event.target.value)}>
+                  {manageableParticipants.map((participant) => (
+                    <option key={`target-${participant.id}`} value={participant.id}>
+                      {participant.display_name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="nt-btn nt-btn-secondary nt-btn-sm"
+                  disabled={mergeBusy || !mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId}
+                  onClick={requestMergeParticipants}
+                  type="button"
+                >
+                  {mergeBusy ? "Birleştiriliyor" : "Participant merge"}
+                </button>
+              </div>
+            ) : null}
+          </article>
         </div>
 
         <div className="nt-top-preview-col">
@@ -749,60 +788,71 @@ export function TranscriptPage() {
         <div className="nt-stream-header">
           <div>
             <p className="nt-card-label">Transcript</p>
-            <h2 className="nt-section-title">Inline review akışı</h2>
+            <h2 className="nt-section-title">Segment listesi</h2>
             <p className="nt-review-helper is-muted">
-              Vurgulu satırlara tıklayarak review yapabilirsiniz. Duplicate adayları da aynı akışta işaretlenir.
+              Satıra tıklayarak speaker ataması yapabilir, gerektiğinde Unknown bırakabilir veya tek satırı yeni participant'a ayırabilirsiniz.
             </p>
           </div>
           <div className="nt-stream-actions">
-             <a className="nt-btn nt-btn-primary nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.txt`)}>
-               TXT indir
-             </a>
-             <a className="nt-btn nt-btn-primary nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.csv`)}>
-               CSV indir
-             </a>
+            <a className="nt-btn nt-btn-primary nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.txt`)}>
+              TXT indir
+            </a>
+            <a className="nt-btn nt-btn-primary nt-btn-sm" href={buildApiUrl(`/api/meetings/${meetingId}/export.csv`)}>
+              CSV indir
+            </a>
           </div>
         </div>
-        {applyReview.error ? (
-          <div className="nt-alert">{applyReview.error.message}</div>
-        ) : null}
-        {keepReview.error ? (
-          <div className="nt-alert">{keepReview.error.message}</div>
-        ) : null}
-        {mergeDuplicates.error ? (
-          <div className="nt-alert">{mergeDuplicates.error.message}</div>
-        ) : null}
+        {updateSegmentParticipant.error ? <div className="nt-alert">{updateSegmentParticipant.error.message}</div> : null}
+        {mergeParticipants.error ? <div className="nt-alert">{mergeParticipants.error.message}</div> : null}
+        {splitParticipant.error ? <div className="nt-alert">{splitParticipant.error.message}</div> : null}
         <div className="nt-stream-body" ref={streamBodyRef}>
           <div className="nt-stream-track nt-transcript-list">
-          {data.transcripts.length === 0 ? (
-            <div className="nt-empty-state">
-              <strong>Henüz transcript yok</strong>
-              <span>Toplantı aktifse canlı caption akışı birazdan burada görünür.</span>
-            </div>
-          ) : null}
-          {data.transcripts.map((row) => (
-            <TranscriptRow
-              key={row.id}
-              audioSeekEnabled={isTranscriptAudioSyncReliable}
-              isAudioActive={row.id === effectiveActiveAudioRowId}
-              isAudioPlaying={isAudioPlaying && row.id === effectiveActiveAudioRowId}
-              isOpen={row.id === openReviewRowId}
-              onOpen={setOpenReviewRowId}
-              onSeekToTime={seekAudioToTime}
-              registerRowElement={registerTranscriptRowElement}
-              row={row}
-            />
-          ))}
+            {segments.length === 0 ? (
+              <div className="nt-empty-state">
+                <strong>Henüz transcript segmenti yok</strong>
+                <span>Audio-first postprocess tamamlandığında participant bazlı transcript burada görünecek.</span>
+              </div>
+            ) : null}
+            {segments.map((row) => (
+              <TranscriptRow
+                key={row.id}
+                audioSeekEnabled={isTranscriptAudioSyncReliable}
+                canManageSpeakers={data.actions.can_manage_speakers}
+                isAudioActive={row.id === effectiveActiveAudioRowId}
+                isAudioPlaying={isAudioPlaying && row.id === effectiveActiveAudioRowId}
+                isOpen={row.id === openRowId}
+                onOpen={setOpenRowId}
+                onSeekToTime={seekAudioToTime}
+                registerRowElement={registerTranscriptRowElement}
+                row={row}
+              />
+            ))}
           </div>
         </div>
       </section>
-      {activeReviewRow ? (
-        <TranscriptReviewModal
-          row={activeReviewRow}
-          reviewBusy={applyReview.isPending || keepReview.isPending}
-          onApply={(reviewId) => void applyReview.mutateAsync(reviewId).then(() => setOpenReviewRowId(null))}
-          onClose={() => setOpenReviewRowId(null)}
-          onKeep={(reviewId) => void keepReview.mutateAsync(reviewId).then(() => setOpenReviewRowId(null))}
+
+      {activeRow ? (
+        <SpeakerModal
+          busy={updateSegmentParticipant.isPending || splitParticipant.isPending}
+          onAssign={(participantId) =>
+            void updateSegmentParticipant
+              .mutateAsync({ segmentId: activeRow.id, participantId })
+              .then(() => setOpenRowId(null))
+              .catch(() => undefined)
+          }
+          onClose={() => setOpenRowId(null)}
+          onSplit={(displayName) =>
+            void splitParticipant
+              .mutateAsync({
+                participantId: activeRow.participant_id ?? 0,
+                segmentIds: [activeRow.id],
+                displayName,
+              })
+              .then(() => setOpenRowId(null))
+              .catch(() => undefined)
+          }
+          participants={manageableParticipants}
+          row={activeRow}
         />
       ) : null}
     </AppShell>

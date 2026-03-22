@@ -72,6 +72,7 @@ class Meeting(Base):
     active_postprocess_run_id: Mapped[int | None] = mapped_column(Integer)
     joined_at: Mapped[datetime | None] = mapped_column(DateTime)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    audio_capture_started_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
     )
@@ -117,6 +118,165 @@ class MeetingAudioAsset(Base):
     )
 
 
+class MeetingParticipant(Base):
+    __tablename__ = "meetingparticipant"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("meeting.id"), index=True, nullable=False)
+    participant_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    platform_identity: Mapped[str | None] = mapped_column(String(255), index=True)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    role: Mapped[str | None] = mapped_column(String(64))
+    is_bot: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    join_state: Mapped[str] = mapped_column(String(32), default="present", nullable=False)
+    merged_into_participant_id: Mapped[int | None] = mapped_column(ForeignKey("meetingparticipant.id"))
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        server_default=func.current_timestamp(),
+        onupdate=datetime.utcnow,
+    )
+
+
+class SpeakerActivityEvent(Base):
+    __tablename__ = "speakeractivityevent"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("meeting.id"), index=True, nullable=False)
+    participant_id: Mapped[int] = mapped_column(ForeignKey("meetingparticipant.id"), index=True, nullable=False)
+    start_offset_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_offset_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    metadata_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+
+
+class AudioSource(Base):
+    __tablename__ = "audiosource"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("meeting.id"), index=True, nullable=False)
+    source_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    track_id: Mapped[str | None] = mapped_column(String(255))
+    stream_id: Mapped[str | None] = mapped_column(String(255))
+    file_path: Mapped[str | None] = mapped_column(Text)
+    format: Mapped[str | None] = mapped_column(String(32))
+    sample_rate_hz: Mapped[int | None] = mapped_column(Integer)
+    channel_count: Mapped[int | None] = mapped_column(Integer)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+
+
+class AudioSourceBinding(Base):
+    __tablename__ = "audiosourcebinding"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("meeting.id"), index=True, nullable=False)
+    audio_source_id: Mapped[int] = mapped_column(ForeignKey("audiosource.id"), index=True, nullable=False)
+    participant_id: Mapped[int | None] = mapped_column(ForeignKey("meetingparticipant.id"), index=True)
+    valid_from_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    valid_to_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    binding_status: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    binding_method: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        server_default=func.current_timestamp(),
+        onupdate=datetime.utcnow,
+    )
+
+
+class IdentityEvidence(Base):
+    __tablename__ = "identityevidence"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("meeting.id"), index=True, nullable=False)
+    participant_id: Mapped[int | None] = mapped_column(ForeignKey("meetingparticipant.id"), index=True)
+    audio_source_id: Mapped[int | None] = mapped_column(ForeignKey("audiosource.id"), index=True)
+    evidence_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_value: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    payload_json: Mapped[str | None] = mapped_column(Text)
+
+
+class ParticipantAudioAsset(Base):
+    __tablename__ = "participantaudioasset"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("meeting.id"), index=True, nullable=False)
+    participant_id: Mapped[int | None] = mapped_column(ForeignKey("meetingparticipant.id"), index=True)
+    audio_source_id: Mapped[int | None] = mapped_column(ForeignKey("audiosource.id"), index=True)
+    asset_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    format: Mapped[str | None] = mapped_column(String(32))
+    sample_rate_hz: Mapped[int | None] = mapped_column(Integer)
+    channel_count: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    start_offset_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    end_offset_ms: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    derivation_method: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+
+
+class TranscriptSegment(Base):
+    __tablename__ = "transcriptsegment"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(ForeignKey("meeting.id"), index=True, nullable=False)
+    participant_id: Mapped[int | None] = mapped_column(ForeignKey("meetingparticipant.id"), index=True)
+    participant_audio_asset_id: Mapped[int | None] = mapped_column(ForeignKey("participantaudioasset.id"), index=True)
+    audio_source_id: Mapped[int | None] = mapped_column(ForeignKey("audiosource.id"), index=True)
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[str | None] = mapped_column(String(16))
+    start_offset_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    end_offset_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    asr_confidence: Mapped[float | None] = mapped_column(Float)
+    assignment_method: Mapped[str] = mapped_column(String(64), nullable=False)
+    assignment_confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    overlap_group_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    needs_speaker_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    resolution_status: Mapped[str] = mapped_column(String(32), default="original", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class Transcript(Base):
     __tablename__ = "transcript"
 
@@ -143,10 +303,14 @@ class TranscriptReviewItem(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     transcript_id: Mapped[int] = mapped_column(ForeignKey("transcript.id"), index=True, nullable=False)
+    transcript_segment_id: Mapped[int | None] = mapped_column(ForeignKey("transcriptsegment.id"), index=True)
+    review_type: Mapped[str] = mapped_column(String(32), default="text", nullable=False)
     granularity: Mapped[str] = mapped_column(String(32), nullable=False)
     current_text: Mapped[str] = mapped_column(Text, nullable=False)
     suggested_text: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    current_participant_id: Mapped[int | None] = mapped_column(ForeignKey("meetingparticipant.id"), index=True)
+    suggested_participant_id: Mapped[int | None] = mapped_column(ForeignKey("meetingparticipant.id"), index=True)
     audio_clip_path: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     clip_start_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
