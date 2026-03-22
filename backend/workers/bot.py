@@ -846,6 +846,8 @@ class MeetingAudioChunkWriter:
         duration_ms = probe_audio_duration_ms(pcm_path) if pcm_path.exists() else None
         if duration_ms is None:
             duration_ms = probe_audio_duration_ms(master_path)
+        if master_path.exists() and (pcm_path.exists() or duration_ms is not None):
+            self._cleanup_temporary_audio_parts()
         return master_path, pcm_path if pcm_path.exists() else None, self.format, duration_ms
 
     def stop_accepting_writes(self):
@@ -927,6 +929,14 @@ class MeetingAudioChunkWriter:
             capture_output=True,
             text=True,
         )
+
+    def _cleanup_temporary_audio_parts(self):
+        if DEBUG_ARTIFACTS_ENABLED:
+            return
+        for stale_chunk in self.chunk_dir.glob("chunk_*"):
+            stale_chunk.unlink(missing_ok=True)
+        (self.chunk_dir / "concat_inputs.txt").unlink(missing_ok=True)
+        self.aggregate_path.unlink(missing_ok=True)
 
     def _master_transcode_args(self):
         if self.format == "wav":

@@ -90,6 +90,11 @@ def meeting_snapshot(meeting_id: int, user=Depends(owned_user), db: Session = De
     meeting = get_owned_meeting(db, user.id, meeting_id)
     if meeting is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
+    supervisor.ensure_postprocess(meeting_id)
+    db.expire_all()
+    meeting = get_owned_meeting(db, user.id, meeting_id)
+    if meeting is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Toplantı bulunamadı.")
     caption_events = caption_events_for_meeting(db, meeting_id)
     transcripts = transcripts_for_meeting(db, meeting_id)
     transcript_ids = [row.id for row in transcripts]

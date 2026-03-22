@@ -14,11 +14,19 @@ from sqlalchemy import select
 from backend.config import get_settings
 from backend.db.session import db_session
 from backend.models import Meeting, WorkerRun
-from backend.runtime.constants import POSTPROCESS_STATUS_FAILED, POSTPROCESS_STATUS_PENDING
+from backend.runtime.constants import (
+    POSTPROCESS_STATUS_FAILED,
+    POSTPROCESS_STATUS_PENDING,
+    POSTPROCESS_STATUS_QUEUED,
+)
 
 
 logger = logging.getLogger("notera.supervisor")
 settings = get_settings()
+RECOVERABLE_POSTPROCESS_STATUSES = {
+    POSTPROCESS_STATUS_PENDING,
+    POSTPROCESS_STATUS_QUEUED,
+}
 
 
 def _is_process_running(pid: int | None) -> bool:
@@ -115,6 +123,7 @@ class MeetingSupervisor:
 
     def _watch_process(self, process: subprocess.Popen[str], meeting_id: int, worker_type: str, run_id: int) -> None:
         exit_code = process.wait()
+        should_recover_postprocess = False
         with db_session() as db:
             run = db.get(WorkerRun, run_id)
             meeting = db.get(Meeting, meeting_id)
@@ -128,14 +137,19 @@ class MeetingSupervisor:
                     if meeting.active_bot_run_id == run_id:
                         meeting.active_bot_run_id = None
                     meeting.bot_pid = None
+                    should_recover_postprocess = (
+                        meeting.status == "completed"
+                        and meeting.postprocess_status in RECOVERABLE_POSTPROCESS_STATUSES
+                        and not meeting.active_postprocess_run_id
+                    )
                 else:
                     if meeting.active_postprocess_run_id == run_id:
                         meeting.active_postprocess_run_id = None
                 db.add(meeting)
 
-        if worker_type == "bot" and exit_code == 0:
+        if worker_type == "bot" and (exit_code == 0 or should_recover_postprocess):
             try:
-                self.start_postprocess(meeting_id)
+                self.ensure_postprocess(meeting_id)
             except Exception:
                 logger.exception("Failed starting postprocess for meeting %s after bot exit", meeting_id)
 
@@ -206,6 +220,36 @@ class MeetingSupervisor:
                     if run and _is_process_running(run.pid):
                         return run.id
                 meeting.postprocess_status = meeting.postprocess_status or POSTPROCESS_STATUS_PENDING
+                meeting.postprocess_error = None
+                meeting.updated_at = datetime.utcnow()
+                db.add(meeting)
+            return self._spawn(
+                meeting_id,
+                "postprocess",
+                [
+                    settings.bot_python_bin,
+                    "-u",
+                    "-m",
+                    settings.postprocess_entrypoint,
+                    str(meeting_id),
+                ],
+            )
+
+    def ensure_postprocess(self, meeting_id: int) -> int | None:
+        with self._lock:
+            with db_session() as db:
+                meeting = db.get(Meeting, meeting_id)
+                if meeting is None:
+                    raise ValueError("Toplantı bulunamadı.")
+                if meeting.status != "completed":
+                    return None
+                if meeting.postprocess_status not in RECOVERABLE_POSTPROCESS_STATUSES:
+                    return None
+                if meeting.active_postprocess_run_id:
+                    run = db.get(WorkerRun, meeting.active_postprocess_run_id)
+                    if run and _is_process_running(run.pid):
+                        return run.id
+                    meeting.active_postprocess_run_id = None
                 meeting.postprocess_error = None
                 meeting.updated_at = datetime.utcnow()
                 db.add(meeting)
