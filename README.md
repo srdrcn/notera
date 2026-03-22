@@ -5,35 +5,40 @@ Notera, Microsoft Teams toplantılarına bot ile katılıp canlı caption, ses k
 ## Mimari
 
 ```mermaid
-flowchart TD
-    U[User / Browser] --> F[Frontend\nReact + Vite]
-    F -->|HTTP / API| A[Backend API\nFastAPI]
-    A -->|SQLAlchemy| D[(SQLite\nnotera.db)]
-    A --> S[Meeting Supervisor]
+sequenceDiagram
+    actor U as User
+    participant F as Frontend
+    participant A as Backend API
+    participant S as Meeting Supervisor
+    participant B as Bot Worker
+    participant T as Teams Meeting
+    participant X as SQLite + Artifacts
+    participant P as Postprocess Worker
 
-    S -->|spawn| B[Bot Worker\nPlaywright + Teams]
-    S -->|spawn| P[Postprocess Worker\nWhisperX]
-
-    B -->|join / monitor| T[Microsoft Teams Meeting]
-    B -->|caption events / status| D
-    B -->|audio / preview artifacts| M[(data/meeting_audio\n+ live_previews)]
-
-    P -->|read captions + audio| D
-    P -->|read audio| M
-    P -->|transcript / review outputs| D
-    P -->|canonical / alignment / clips| R[(review_clips\n+ json artifacts)]
-
-    F -->|poll snapshot / actions / exports| A
-    A -->|snapshot / exports| F
+    U->>F: Meeting oluştur / transcript ekranını aç
+    F->>A: HTTP request
+    A->>X: Meeting kaydını oku / yaz
+    A->>S: Bot worker başlat
+    S->>B: Process spawn
+    B->>T: Toplantıya katıl ve izle
+    B->>X: Caption, audio, preview ve status yaz
+    B-->>S: Bot süreci biter
+    S->>P: Postprocess worker başlat
+    P->>X: Caption + audio artefact'larını oku
+    P->>X: Final transcript, review ve export verilerini yaz
+    F->>A: Snapshot / review / export istekleri
+    A->>X: Son verileri oku
+    A-->>F: Transcript ve meeting durumu dön
 ```
 
 Kısa akış:
 
-1. Frontend, meeting oluşturma ve transcript ekranı için Backend API ile konuşur.
-2. Backend, meeting lifecycle'ını ve worker süreçlerini `MeetingSupervisor` üzerinden yönetir.
-3. Bot worker Teams toplantısına katılır; canlı caption, ses kaydı ve önizleme üretir.
-4. Postprocess worker toplantı sonrası caption ve audio artefact'larını işleyip final transcript ve review kayıtlarını oluşturur.
-5. Frontend dashboard, transcript, review ve export ekranlarını bu veriler üzerinden sunar.
+1. Frontend kullanıcı aksiyonlarını Backend API'ye gönderir.
+2. Backend meeting kaydını açar ve `MeetingSupervisor` üzerinden bot worker başlatır.
+3. Bot worker Teams toplantısına katılır; canlı caption, ses ve önizleme üretip runtime verisine yazar.
+4. Bot tamamlanınca supervisor postprocess worker başlatır.
+5. Postprocess worker toplanan veriyi işleyip final transcript ve review kayıtlarını üretir.
+6. Frontend dashboard ve transcript ekranları bu son durumu API üzerinden okur.
 
 ## Özellikler
 
