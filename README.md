@@ -5,6 +5,7 @@ Notera, Microsoft Teams toplantılarına bot ile katılıp canlı caption, ses k
 ## Mimari
 
 ```mermaid
+%%{init: { "sequence": { "mirrorActors": false } } }%%
 sequenceDiagram
     actor U as User
     participant F as Frontend
