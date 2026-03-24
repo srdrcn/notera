@@ -119,6 +119,26 @@ def ensure_runtime_schema(target_db: Path | None = None) -> Path:
         for column_name, statement in transcript_alters:
             _ensure_column(cursor, "transcript", column_name, statement)
 
+        speaker_activity_alters = [
+            ("event_type", "ALTER TABLE speakeractivityevent ADD COLUMN event_type TEXT NOT NULL DEFAULT 'active'"),
+            ("signal_kind", "ALTER TABLE speakeractivityevent ADD COLUMN signal_kind TEXT"),
+            ("event_confidence", "ALTER TABLE speakeractivityevent ADD COLUMN event_confidence REAL"),
+            ("ui_observed_at", "ALTER TABLE speakeractivityevent ADD COLUMN ui_observed_at DATETIME"),
+            ("relative_offset_ms", "ALTER TABLE speakeractivityevent ADD COLUMN relative_offset_ms INTEGER"),
+            ("source_session_id", "ALTER TABLE speakeractivityevent ADD COLUMN source_session_id TEXT"),
+        ]
+        for column_name, statement in speaker_activity_alters:
+            _ensure_column(cursor, "speakeractivityevent", column_name, statement)
+
+        transcript_segment_alters = [
+            (
+                "speaker_resolution_status",
+                "ALTER TABLE transcriptsegment ADD COLUMN speaker_resolution_status TEXT NOT NULL DEFAULT 'unknown'",
+            ),
+        ]
+        for column_name, statement in transcript_segment_alters:
+            _ensure_column(cursor, "transcriptsegment", column_name, statement)
+
         _ensure_column(cursor, "meetingaudioasset", "pcm_audio_path", "ALTER TABLE meetingaudioasset ADD COLUMN pcm_audio_path TEXT")
         _ensure_column(
             cursor,
@@ -166,26 +186,37 @@ def ensure_runtime_schema(target_db: Path | None = None) -> Path:
                 CREATE TABLE transcriptreviewitem (
                     id INTEGER NOT NULL PRIMARY KEY,
                     transcript_id INTEGER NOT NULL,
+                    transcript_segment_id INTEGER,
+                    review_type TEXT NOT NULL DEFAULT 'text',
                     granularity TEXT NOT NULL,
                     current_text TEXT NOT NULL,
                     suggested_text TEXT NOT NULL,
                     confidence REAL NOT NULL DEFAULT 0,
+                    current_participant_id INTEGER,
+                    suggested_participant_id INTEGER,
                     audio_clip_path TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     clip_start_ms INTEGER NOT NULL DEFAULT 0,
                     clip_end_ms INTEGER NOT NULL DEFAULT 0,
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME,
-                    FOREIGN KEY(transcript_id) REFERENCES transcript (id)
+                    FOREIGN KEY(transcript_id) REFERENCES transcript (id),
+                    FOREIGN KEY(transcript_segment_id) REFERENCES transcriptsegment (id),
+                    FOREIGN KEY(current_participant_id) REFERENCES meetingparticipant (id),
+                    FOREIGN KEY(suggested_participant_id) REFERENCES meetingparticipant (id)
                 )
                 """,
                 [
                     "id",
                     "transcript_id",
+                    "transcript_segment_id",
+                    "review_type",
                     "granularity",
                     "current_text",
                     "suggested_text",
                     "confidence",
+                    "current_participant_id",
+                    "suggested_participant_id",
                     "audio_clip_path",
                     "status",
                     "clip_start_ms",
@@ -228,6 +259,20 @@ def ensure_runtime_schema(target_db: Path | None = None) -> Path:
                 updated_at = COALESCE(updated_at, created_at)
             """,
             (REVIEW_STATUS_PENDING,),
+        )
+        cursor.execute(
+            """
+            UPDATE speakeractivityevent
+            SET event_type = COALESCE(NULLIF(event_type, ''), 'active'),
+                event_confidence = COALESCE(event_confidence, confidence),
+                relative_offset_ms = COALESCE(relative_offset_ms, end_offset_ms)
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE transcriptsegment
+            SET speaker_resolution_status = COALESCE(NULLIF(speaker_resolution_status, ''), 'unknown')
+            """
         )
         cursor.execute("CREATE INDEX IF NOT EXISTS ix_meeting_user_created ON meeting(user_id, created_at)")
         cursor.execute(

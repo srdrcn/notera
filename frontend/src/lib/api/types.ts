@@ -58,6 +58,7 @@ export type SegmentEntry = {
   color: string;
   assignment_method: string;
   assignment_confidence: number;
+  speaker_resolution_status: string;
   needs_speaker_review: boolean;
   overlap_group_id: string | null;
   resolution_status: string;

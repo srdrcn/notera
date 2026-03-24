@@ -18,7 +18,6 @@ from backend.workers.bot_store import (
 
 
 logger = logging.getLogger("notera.worker.bot")
-DEBUG_ARTIFACTS_ENABLED = os.getenv("NOTERA_DEBUG_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "on"}
 PARTICIPANT_REGISTRY_CONFIG = {
     "version": 5,
     "panel_selectors": [
@@ -716,33 +715,6 @@ async def collect_participant_debug_state(page) -> dict[str, Any]:
     try:
         return await page.evaluate(
             """(config) => {
-              const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-              const lower = (value) => normalize(value).toLowerCase();
-              const isVisible = (node) => {
-                if (!node) return false;
-                const style = window.getComputedStyle(node);
-                const rect = node.getBoundingClientRect();
-                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-              };
-              const summarize = (node) => ({
-                tag: node.tagName,
-                data_tid: node.getAttribute('data-tid') || '',
-                role: node.getAttribute('role') || '',
-                aria_label: node.getAttribute('aria-label') || '',
-                title: node.getAttribute('title') || '',
-                class_name: String(node.className || '').slice(0, 200),
-                text: normalize(node.innerText || '').slice(0, 300),
-              });
-              const visibleButtons = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"]'))
-                .filter((node) => isVisible(node))
-                .map((node) => summarize(node))
-                .filter((item) => /participant|people|roster|katılımc|kisi|kişi/.test(lower([item.aria_label, item.title, item.text, item.data_tid].join(' '))))
-                .slice(0, 20);
-              const visiblePanels = Array.from(document.querySelectorAll('[role="dialog"], aside, [role="complementary"], section, div'))
-                .filter((node) => isVisible(node))
-                .map((node) => summarize(node))
-                .filter((item) => /participant|people|roster|katılımc|kisi|kişi/.test(lower([item.aria_label, item.title, item.text, item.data_tid].join(' '))))
-                .slice(0, 20);
               let rowCount = 0;
               for (const selector of config?.row_selectors || []) {
                 try {
@@ -778,8 +750,6 @@ async def collect_participant_debug_state(page) -> dict[str, Any]:
               return {
                 observer_installed: Boolean(window.__noteraParticipantRegistry?.observer),
                 snapshot_count: (window.__noteraParticipantRegistry?.lastSnapshot || []).length,
-                visible_buttons: visibleButtons,
-                visible_panels: visiblePanels,
                 row_selector_match_count: rowCount,
                 tile_selector_match_count: tileCount,
                 video_surface_match_count: videoSurfaceCount,
@@ -798,21 +768,7 @@ def write_participant_snapshot_debug(
     participant_items: list[dict[str, Any]],
     debug_state: dict[str, Any] | None = None,
 ) -> None:
-    if not DEBUG_ARTIFACTS_ENABLED:
-        return
-    try:
-        payload = {
-            "meeting_id": meeting_id,
-            "observed_at": observed_at.isoformat() if observed_at else None,
-            "participant_count": len(participant_items or []),
-            "items": participant_items or [],
-            "debug_state": debug_state or {},
-        }
-        path = Path(__file__).resolve().parent / f"participant_snapshot_meeting_{meeting_id}.json"
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
-    except Exception as exc:
-        logger.debug("Could not write participant snapshot debug for meeting %s: %s", meeting_id, exc)
+    return None
 
 
 def sync_speaker_activity(

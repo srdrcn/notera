@@ -20,7 +20,6 @@ from backend.workers.bot_store import register_audio_source
 
 
 logger = logging.getLogger("notera.worker.bot")
-DEBUG_ARTIFACTS_ENABLED = os.getenv("NOTERA_DEBUG_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "on"}
 REMOTE_AUDIO_ATTRIBUTE = "data-notera-remote-audio"
 
 
@@ -273,8 +272,6 @@ class MeetingAudioChunkWriter:
         )
 
     def _cleanup_temporary_audio_parts(self) -> None:
-        if DEBUG_ARTIFACTS_ENABLED:
-            return
         for stale_chunk in self.chunk_dir.glob("chunk_*"):
             stale_chunk.unlink(missing_ok=True)
         (self.chunk_dir / "concat_inputs.txt").unlink(missing_ok=True)

@@ -168,6 +168,7 @@ def build_snapshot(
                 color=speaker_color(meeting.id, speaker),
                 assignment_method=segment.assignment_method,
                 assignment_confidence=segment.assignment_confidence,
+                speaker_resolution_status=segment.speaker_resolution_status,
                 needs_speaker_review=segment.needs_speaker_review,
                 overlap_group_id=segment.overlap_group_id,
                 resolution_status=segment.resolution_status,

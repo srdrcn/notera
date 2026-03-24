@@ -358,6 +358,18 @@ def append_speaker_activity_interval(
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     try:
+        normalized_metadata = metadata or {}
+        raw_signal_kind = str(normalized_metadata.get("signal_kind") or normalized_metadata.get("source_kind") or "").strip().lower()
+        signal_kind_map = {
+            "voice_signal": "teams_ui_outline",
+            "participant_panel": "teams_ui_polling",
+            "video_surface": "teams_dom_mutation",
+            "video_tile": "teams_dom_mutation",
+        }
+        signal_kind = signal_kind_map.get(raw_signal_kind, "fallback")
+        source_session_id = normalized_metadata.get("source_session_id")
+        source_session_id = str(source_session_id).strip() if source_session_id else None
+        observed_at = datetime.utcnow().isoformat()
         cursor.execute(
             """
             INSERT INTO speakeractivityevent (
@@ -366,10 +378,16 @@ def append_speaker_activity_interval(
                 start_offset_ms,
                 end_offset_ms,
                 source,
+                event_type,
+                signal_kind,
+                event_confidence,
+                ui_observed_at,
+                relative_offset_ms,
+                source_session_id,
                 confidence,
                 metadata_json,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 meeting_id,
@@ -377,9 +395,15 @@ def append_speaker_activity_interval(
                 int(start_offset_ms),
                 int(end_offset_ms),
                 source,
+                "active",
+                signal_kind,
                 confidence,
-                json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
-                datetime.utcnow().isoformat(),
+                observed_at,
+                int(end_offset_ms),
+                source_session_id,
+                confidence,
+                json.dumps(normalized_metadata, ensure_ascii=False) if metadata is not None else None,
+                observed_at,
             ),
         )
         conn.commit()

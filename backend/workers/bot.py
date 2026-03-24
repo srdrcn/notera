@@ -39,13 +39,11 @@ from backend.workers.bot_audio import (  # noqa: E402
     stop_browser_audio_capture,
 )
 from backend.workers.bot_participants import (  # noqa: E402
-    collect_participant_debug_state,
     collect_participant_registry_snapshot,
     flush_speaker_activity,
     install_participant_registry_hook,
     normalize_caption_text,
     sync_speaker_activity,
-    write_participant_snapshot_debug,
 )
 from backend.workers.bot_store import (  # noqa: E402
     finalize_audio_sources,
@@ -66,7 +64,6 @@ from backend.workers.bot_ui import (  # noqa: E402
     complete_prejoin_join,
     delete_live_meeting_screenshot,
     detect_exit_command,
-    dump_dom,
     get_chat_messages,
     get_live_meeting_screenshot_path,
     launch_teams_browser,
@@ -82,7 +79,6 @@ from backend.workers.bot_ui import (  # noqa: E402
 
 configure_logging()
 logger = logging.getLogger("notera.worker.bot")
-DEBUG_ARTIFACTS_ENABLED = os.getenv("NOTERA_DEBUG_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "on"}
 CAPTION_RECENT_SCAN_LIMIT = 24
 CAPTION_SLOT_DEDUPE_WINDOW_SECONDS = 20.0
 CAPTION_MEETING_DEDUPE_WINDOW_SECONDS = 6.0
@@ -489,7 +485,6 @@ async def _join_meeting_session(page, meeting_url: str, state: BotRunState) -> b
 
 
 async def _prepare_participant_monitoring(page, state: BotRunState) -> None:
-    await dump_dom(page, "initial_join_dom.html")
     await install_participant_registry_hook(page)
     state.participant_panel_opened = await open_participant_panel(page)
     if state.participant_panel_opened:
@@ -568,9 +563,6 @@ async def _monitor_meeting(page, state: BotRunState) -> None:
             poll_count += 1
             current_offset_ms = _current_offset_ms(state)
 
-            if poll_count % 120 == 0:
-                await dump_dom(page, "monitoring_debug_dom.html")
-
             if not chat_notice_sent and chat_notice_attempts < 3 and poll_count >= 20 and poll_count % 60 == 20:
                 chat_notice_attempts += 1
                 chat_notice_sent = await send_chat_notice(page)
@@ -614,9 +606,6 @@ async def _monitor_meeting(page, state: BotRunState) -> None:
                     if restored:
                         await asyncio.sleep(0.4)
                         participant_items = await collect_participant_registry_snapshot(page, observed_at)
-                if DEBUG_ARTIFACTS_ENABLED and (poll_count == 1 or poll_count % 20 == 0 or not participant_items):
-                    debug_state = await collect_participant_debug_state(page)
-                    write_participant_snapshot_debug(state.meeting_id, observed_at, participant_items, debug_state)
                 if participant_items:
                     if poll_count == 1 or poll_count % 40 == 0:
                         logger.info(
@@ -630,9 +619,17 @@ async def _monitor_meeting(page, state: BotRunState) -> None:
                         state.active_speaker_state,
                         current_offset_ms,
                     )
+                    if poll_count == 1 or poll_count % 40 == 0:
+                        active_claim_count = sum(1 for item in participant_items if item.get("is_speaking"))
+                        logger.info(
+                            "Participant telemetry meeting=%s participant_count=%s active_claim_count=%s observer_attached=%s",
+                            state.meeting_id,
+                            len(participant_items),
+                            active_claim_count,
+                            True,
+                        )
                 elif poll_count % 40 == 0:
                     logger.warning("Participant registry snapshot is empty for meeting %s.", state.meeting_id)
-                    await dump_dom(page, "participant_registry_empty_dom.html")
 
         except Exception as exc:
             logger.error("Error during participant registry polling: %s", exc, exc_info=True)
@@ -640,10 +637,6 @@ async def _monitor_meeting(page, state: BotRunState) -> None:
                 await page.evaluate("1+1")
             except Exception:
                 logger.error("Page disconnected! Meeting may have ended.")
-                try:
-                    await page.screenshot(path=str(Path(__file__).resolve().parent / "exit_screenshot.png"))
-                except Exception:
-                    pass
                 break
 
         await asyncio.sleep(0.5)

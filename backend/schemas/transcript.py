@@ -38,6 +38,7 @@ class SegmentEntryOut(BaseModel):
     color: str
     assignment_method: str
     assignment_confidence: float
+    speaker_resolution_status: str
     needs_speaker_review: bool
     overlap_group_id: str | None
     resolution_status: str

@@ -15,7 +15,6 @@ from backend.workers.bot_store import resolve_meeting_owner_user_id
 
 logger = logging.getLogger("notera.worker.bot")
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEBUG_ARTIFACTS_ENABLED = os.getenv("NOTERA_DEBUG_ARTIFACTS", "1").strip().lower() in {"1", "true", "yes", "on"}
 CHAT_NOTICE_MESSAGE = (
     "Konuşmaları kayıt altına almaya başladım. "
     "Beni toplantıdan çıkarmak için chat'e sadece 'bot ok' yazabilirsiniz."
@@ -424,8 +423,6 @@ async def wait_for_join_name_input(page, timeout_ms: int = 60000):
         await page.wait_for_selector("input", timeout=timeout_ms)
     except Exception as exc:
         logger.error("Page did not load any input within 60s: %s", exc)
-        screenshot_path = get_bot_debug_path(f"timeout_input_{datetime.now().strftime('%H%M%S')}.png")
-        await page.screenshot(path=screenshot_path)
         return None
 
     for selector in selectors:
@@ -462,9 +459,7 @@ async def click_join_now_button(page, audio_recording_enabled: bool) -> bool:
                 continue
         await asyncio.sleep(1)
 
-    screenshot_path = get_bot_debug_path(f"timeout_join_{datetime.now().strftime('%H%M%S')}.png")
-    await page.screenshot(path=screenshot_path)
-    logger.error("Could not find a Join button after 45s. Taking screenshot.")
+    logger.error("Could not find a Join button after 45s.")
     return False
 
 
@@ -859,29 +854,4 @@ async def collect_debug_summary(page) -> dict[str, object]:
 
 
 async def dump_dom(page, filename: str = "debug_dom.html") -> bool:
-    if not DEBUG_ARTIFACTS_ENABLED:
-        return False
-    try:
-        content = await page.content()
-        screenshot_bytes = await page.screenshot(type="png")
-        summary = await collect_debug_summary(page)
-        summary["captured_at"] = datetime.now().isoformat()
-
-        archive_filename = build_timestamped_debug_filename(filename)
-        targets = [filename, archive_filename]
-        for target in targets:
-            html_path = get_bot_debug_path(target)
-            stem, _ = os.path.splitext(html_path)
-            png_path = f"{stem}.png"
-            json_path = f"{stem}.json"
-            with open(html_path, "w", encoding="utf-8") as handle:
-                handle.write(content)
-            with open(png_path, "wb") as handle:
-                handle.write(screenshot_bytes)
-            with open(json_path, "w", encoding="utf-8") as handle:
-                json.dump(summary, handle, ensure_ascii=False, indent=2)
-        logger.info("Debug artifacts written for bot session inspection.")
-        return True
-    except Exception as exc:
-        logger.error("Failed to dump debug artifacts: %s", exc)
-        return False
+    return False

@@ -45,7 +45,7 @@ from backend.runtime.constants import (  # noqa: E402
     TRANSCRIPT_STATUS_ORIGINAL,
     TRANSCRIPT_STATUS_PENDING_REVIEW,
 )
-from backend.runtime.participant_names import is_roster_heading_name  # noqa: E402
+from backend.runtime.participant_names import is_roster_heading_name, normalize_participant_name  # noqa: E402
 from backend.runtime.paths import (  # noqa: E402
     get_alignment_map_path,
     get_meeting_artifact_path,
@@ -118,6 +118,64 @@ CLUSTER_IMPURE_COVERAGE_MS = 8000
 CLUSTER_SPLIT_CHILD_SIMILARITY = 0.82
 CLUSTER_SPLIT_MIN_COVERAGE_MS = 2500
 CLUSTER_SPLIT_MIN_TURNS = 2
+HYBRID_SEED_MIN_DURATION_MS = 1500
+HYBRID_SEED_MIN_SPEECH_RATIO = 0.60
+HYBRID_SEED_MIN_AUDIO_IDENTITY_SCORE = 0.68
+HYBRID_SEED_MIN_UI_ACTIVITY_SCORE = 0.78
+HYBRID_SEED_MIN_AUDIO_MARGIN = 0.15
+HYBRID_SEED_MIN_UI_MARGIN = 0.18
+HYBRID_CONFIRMED_FINAL_SCORE_FLOOR = 0.72
+HYBRID_PROVISIONAL_FINAL_SCORE_FLOOR = 0.58
+HYBRID_CONFIRMED_AUDIO_SCORE_FLOOR = 0.62
+HYBRID_CONFIRMED_UI_SCORE_FLOOR = 0.68
+HYBRID_CONFIRMED_AUDIO_MARGIN_FLOOR = 0.14
+HYBRID_CONFIRMED_UI_MARGIN_FLOOR = 0.16
+HYBRID_PROVISIONAL_AUDIO_MARGIN_FLOOR = 0.12
+HYBRID_PROVISIONAL_UI_MARGIN_FLOOR = 0.14
+HYBRID_STRONG_PROVISIONAL_REFRESH_FLOOR = 0.66
+HYBRID_NO_SIGNAL_PRIMARY_FLOOR = 0.20
+HYBRID_STRONG_CONFLICT_PRIMARY_FLOOR = 0.60
+HYBRID_STRONG_CONFLICT_MARGIN_FLOOR = 0.10
+HYBRID_TEMPORAL_NEUTRAL_BASE = 0.15
+HYBRID_TEMPORAL_NEIGHBOR_GAP_MS = 1200
+HYBRID_CAPTION_FUZZY_UNIQUE_FLOOR = 0.60
+HYBRID_CAPTION_FUZZY_SEPARATION_MARGIN = 0.10
+HYBRID_UI_MERGE_GAP_MS = 700
+HYBRID_UI_MIN_PULSE_MS = 300
+HYBRID_UI_CONFIDENCE_CAP = 0.95
+HYBRID_UI_SIGNAL_RELIABILITY = {
+    "teams_ui_outline": 1.00,
+    "teams_dom_mutation": 0.90,
+    "teams_ui_polling": 0.75,
+    "fallback": 0.60,
+}
+HYBRID_ASSIGNMENT_METHOD_CONFIRMED = "hybrid_ui_audio_confirmed"
+HYBRID_ASSIGNMENT_METHOD_UI_PROVISIONAL = "hybrid_ui_led_provisional"
+HYBRID_ASSIGNMENT_METHOD_AUDIO_PROVISIONAL = "hybrid_audio_led_provisional"
+HYBRID_ASSIGNMENT_METHOD_CONFLICTED = "hybrid_conflicted_review"
+HYBRID_ASSIGNMENT_METHOD_UNKNOWN_NO_SIGNAL = "hybrid_unknown_no_signal"
+HYBRID_ASSIGNMENT_METHOD_UNKNOWN_LOW_EVIDENCE = "hybrid_unknown_low_evidence"
+HYBRID_SPEAKER_STATUS_CONFIRMED = "confirmed"
+HYBRID_SPEAKER_STATUS_UI_PROVISIONAL = "provisional_ui_led"
+HYBRID_SPEAKER_STATUS_AUDIO_PROVISIONAL = "provisional_audio_led"
+HYBRID_SPEAKER_STATUS_CONFLICTED = "conflicted"
+HYBRID_SPEAKER_STATUS_UNKNOWN = "unknown"
+HYBRID_CAPTION_MATCH_TYPES = {"exact", "fuzzy", "ambiguous", "none"}
+HYBRID_REASON_CODE_UI_AUDIO_CONFLICT = "ui_audio_conflict"
+HYBRID_REASON_CODE_UI_CAPTION_CONFLICT = "ui_caption_conflict"
+HYBRID_REASON_CODE_CAPTION_AUDIO_CONFLICT = "caption_audio_conflict"
+HYBRID_REASON_CODE_MULTI_ACTIVE = "multi_active_claim"
+HYBRID_REASON_CODE_NO_SIGNAL = "no_signal"
+HYBRID_REASON_CODE_LOW_EVIDENCE = "low_evidence"
+HYBRID_REASON_CODE_WEAK_AUDIO_MARGIN = "weak_audio_margin"
+HYBRID_REASON_CODE_WEAK_UI_MARGIN = "weak_ui_margin"
+HYBRID_REASON_CODE_TEMPORAL_CONFLICT = "temporal_conflict"
+HYBRID_REASON_CODE_CAPTION_AMBIGUOUS = "caption_ambiguous"
+HYBRID_REVIEW_TYPE_MULTI_ACTIVE = "speaker_multi_active_claim"
+HYBRID_REVIEW_TYPE_UI_AUDIO_CONFLICT = "speaker_conflict_ui_audio"
+HYBRID_REVIEW_TYPE_UI_CAPTION_CONFLICT = "speaker_conflict_ui_caption"
+HYBRID_REVIEW_TYPE_CAPTION_AUDIO_CONFLICT = "speaker_conflict_caption_audio"
+HYBRID_REVIEW_TYPE_LOW_EVIDENCE = "speaker_low_evidence"
 
 def configure_runtime_environment():
     os.environ.setdefault("MPLCONFIGDIR", str(runtime_cache_dir("matplotlib")))
@@ -318,7 +376,7 @@ def fetch_meeting(meeting_id: int) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT id, status, audio_status, joined_at, ended_at
+            SELECT id, status, audio_status, joined_at, ended_at, audio_capture_started_at
             FROM meeting
             WHERE id = ?
             """,
@@ -435,7 +493,9 @@ def fetch_speaker_activity_events(meeting_id: int) -> list[sqlite3.Row]:
     try:
         return conn.execute(
             """
-            SELECT id, meeting_id, participant_id, start_offset_ms, end_offset_ms, source, confidence, metadata_json
+            SELECT id, meeting_id, participant_id, start_offset_ms, end_offset_ms, source,
+                   event_type, signal_kind, event_confidence, ui_observed_at, relative_offset_ms,
+                   source_session_id, confidence, metadata_json
             FROM speakeractivityevent
             WHERE meeting_id = ?
             ORDER BY start_offset_ms, end_offset_ms, id
@@ -1734,44 +1794,139 @@ def build_participant_lookup(rows: list[sqlite3.Row]) -> dict[int, dict]:
     return lookup
 
 
-def build_activity_windows(activity_rows: list[sqlite3.Row]) -> list[dict]:
-    windows_by_participant: dict[int, list[dict]] = {}
+def _event_row_value(row: sqlite3.Row | dict, key: str, default=None):
+    if isinstance(row, sqlite3.Row):
+        return row[key] if key in row.keys() else default
+    return row.get(key, default)
+
+
+def ui_signal_reliability(signal_kind: str | None) -> float:
+    return float(HYBRID_UI_SIGNAL_RELIABILITY.get(normalize_text(signal_kind).casefold(), HYBRID_UI_SIGNAL_RELIABILITY["fallback"]))
+
+
+def normalize_speaker_activity_events(activity_rows: list[sqlite3.Row]) -> list[dict]:
+    grouped_events: dict[int, list[dict]] = defaultdict(list)
     for row in activity_rows:
-        participant_id = row["participant_id"]
+        participant_id = _event_row_value(row, "participant_id")
         if participant_id is None:
             continue
-        start_offset_ms = int(row["start_offset_ms"] or 0)
-        end_offset_ms = int(row["end_offset_ms"] or 0)
+        event_type = normalize_text(_event_row_value(row, "event_type", "active")).casefold() or "active"
+        if event_type != "active":
+            continue
+        start_offset_ms = int(_event_row_value(row, "start_offset_ms", 0) or 0)
+        end_offset_ms = int(_event_row_value(row, "end_offset_ms", 0) or 0)
         if end_offset_ms <= start_offset_ms:
             continue
-        windows_by_participant.setdefault(int(participant_id), []).append(
+        metadata = parse_metadata_json(_event_row_value(row, "metadata_json"))
+        source_value = normalize_text(_event_row_value(row, "source")).casefold()
+        inferred_signal_kind = metadata.get("signal_kind") or metadata.get("source_kind")
+        if not inferred_signal_kind and source_value == "roster_speaking_indicator":
+            inferred_signal_kind = "teams_ui_outline"
+        signal_kind = normalize_text(_event_row_value(row, "signal_kind") or inferred_signal_kind or "fallback")
+        base_confidence = float(
+            _event_row_value(row, "event_confidence", _event_row_value(row, "confidence", 0.0)) or 0.0
+        )
+        grouped_events[int(participant_id)].append(
             {
                 "participant_id": int(participant_id),
                 "start_offset_ms": start_offset_ms,
                 "end_offset_ms": end_offset_ms,
-                "confidence": float(row["confidence"] or 0.0),
+                "signal_kind": signal_kind or "fallback",
+                "base_confidence": clamp_score(base_confidence),
+                "effective_confidence": clamp_score(base_confidence * ui_signal_reliability(signal_kind)),
+                "conflicted_claim": bool(metadata.get("conflicted_claim")),
             }
         )
 
-    merged: list[dict] = []
-    for participant_id, windows in windows_by_participant.items():
-        ordered = sorted(windows, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"]))
-        current = None
-        for window in ordered:
+    merged_windows: list[dict] = []
+    for participant_id, events in grouped_events.items():
+        current: dict | None = None
+        for event in sorted(events, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"])):
             if current is None:
-                current = dict(window)
+                current = {
+                    "participant_id": participant_id,
+                    "start_offset_ms": event["start_offset_ms"],
+                    "end_offset_ms": event["end_offset_ms"],
+                    "support_count": 1,
+                    "signal_kinds": {event["signal_kind"]},
+                    "confidence_sum": float(event["effective_confidence"]),
+                    "base_confidence_sum": float(event["base_confidence"]),
+                    "conflicted_claim": bool(event["conflicted_claim"]),
+                }
                 continue
-            if window["start_offset_ms"] <= current["end_offset_ms"] + 800:
-                current["end_offset_ms"] = max(current["end_offset_ms"], window["end_offset_ms"])
-                current["confidence"] = max(current["confidence"], window["confidence"])
+            if event["start_offset_ms"] <= int(current["end_offset_ms"]) + HYBRID_UI_MERGE_GAP_MS:
+                current["end_offset_ms"] = max(int(current["end_offset_ms"]), event["end_offset_ms"])
+                current["support_count"] = int(current["support_count"]) + 1
+                current["signal_kinds"].add(event["signal_kind"])
+                current["confidence_sum"] = float(current["confidence_sum"]) + float(event["effective_confidence"])
+                current["base_confidence_sum"] = float(current["base_confidence_sum"]) + float(event["base_confidence"])
+                current["conflicted_claim"] = bool(current["conflicted_claim"]) or bool(event["conflicted_claim"])
                 continue
-            if current["end_offset_ms"] - current["start_offset_ms"] >= 700:
-                merged.append(current)
-            current = dict(window)
-        if current and current["end_offset_ms"] - current["start_offset_ms"] >= 700:
-            merged.append(current)
+            duration_ms = int(current["end_offset_ms"]) - int(current["start_offset_ms"])
+            if duration_ms >= HYBRID_UI_MIN_PULSE_MS:
+                merged_windows.append(current)
+            current = {
+                "participant_id": participant_id,
+                "start_offset_ms": event["start_offset_ms"],
+                "end_offset_ms": event["end_offset_ms"],
+                "support_count": 1,
+                "signal_kinds": {event["signal_kind"]},
+                "confidence_sum": float(event["effective_confidence"]),
+                "base_confidence_sum": float(event["base_confidence"]),
+                "conflicted_claim": bool(event["conflicted_claim"]),
+            }
+        if current is not None:
+            duration_ms = int(current["end_offset_ms"]) - int(current["start_offset_ms"])
+            if duration_ms >= HYBRID_UI_MIN_PULSE_MS:
+                merged_windows.append(current)
 
-    return sorted(merged, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"], item["participant_id"]))
+    normalized_windows: list[dict] = []
+    for window in merged_windows:
+        support_count = max(int(window["support_count"]), 1)
+        signal_kinds = sorted(window["signal_kinds"])
+        boost = 0.0
+        if len(signal_kinds) >= 2:
+            boost += 0.08
+        if len(signal_kinds) >= 3:
+            boost += 0.04
+        confidence = clamp_score((float(window["confidence_sum"]) / support_count) + boost)
+        normalized_windows.append(
+            {
+                "participant_id": int(window["participant_id"]),
+                "start_offset_ms": int(window["start_offset_ms"]),
+                "end_offset_ms": int(window["end_offset_ms"]),
+                "confidence": min(HYBRID_UI_CONFIDENCE_CAP, confidence),
+                "support_count": support_count,
+                "signal_kinds": signal_kinds,
+                "conflicted_claim": bool(window["conflicted_claim"]),
+            }
+        )
+
+    for index, window in enumerate(normalized_windows):
+        for other in normalized_windows[index + 1 :]:
+            if window["participant_id"] == other["participant_id"]:
+                continue
+            overlap_ms = interval_overlap_ms(
+                window["start_offset_ms"],
+                window["end_offset_ms"],
+                other["start_offset_ms"],
+                other["end_offset_ms"],
+            )
+            if overlap_ms < 250:
+                continue
+            window["conflicted_claim"] = True
+            other["conflicted_claim"] = True
+            window["confidence"] = clamp_score(float(window["confidence"]) - 0.20)
+            other["confidence"] = clamp_score(float(other["confidence"]) - 0.20)
+
+    return sorted(
+        normalized_windows,
+        key=lambda item: (item["start_offset_ms"], item["end_offset_ms"], item["participant_id"]),
+    )
+
+
+def build_activity_windows(activity_rows: list[sqlite3.Row]) -> list[dict]:
+    return normalize_speaker_activity_events(activity_rows)
 
 
 def trim_audio_window(source_audio_path: Path, output_path: Path, start_offset_ms: int, end_offset_ms: int) -> bool:
@@ -1902,6 +2057,7 @@ def build_segments_from_whisper_result(
             )
         segments.append(
             {
+                "segment_id": f"seg-{segment_index}-0",
                 "participant_id": participant_id,
                 "participant_audio_asset_id": participant_audio_asset_id,
                 "audio_source_id": audio_source_id,
@@ -1913,6 +2069,7 @@ def build_segments_from_whisper_result(
                 "asr_confidence": None,
                 "assignment_method": assignment_method,
                 "assignment_confidence": assignment_confidence,
+                "speaker_resolution_status": HYBRID_SPEAKER_STATUS_UNKNOWN,
                 "needs_speaker_review": needs_speaker_review,
                 "resolution_status": (
                     TRANSCRIPT_STATUS_PENDING_REVIEW if needs_speaker_review else TRANSCRIPT_STATUS_ORIGINAL
@@ -2029,12 +2186,6 @@ def build_cluster_prototypes(turns: list[dict]) -> dict[str, dict]:
             for turn in prototype_turns
             if turn.get("embedding")
         ]
-        cluster_dom_support: dict[int, float] = defaultdict(float)
-        for turn in label_turns:
-            duration_ms = max(int(turn.get("duration_ms") or 0), 1)
-            for participant_id, prior in (turn.get("local_dom_prior_by_participant") or {}).items():
-                cluster_dom_support[int(participant_id)] += float(prior) * duration_ms
-        cluster_dom_prior = normalize_score_map(dict(cluster_dom_support))
         coverage_ms = sum(int(turn.get("duration_ms") or 0) for turn in label_turns)
         purity = (sum(similarities) / len(similarities)) if similarities else 0.0
         prototypes[label] = {
@@ -2044,8 +2195,6 @@ def build_cluster_prototypes(turns: list[dict]) -> dict[str, dict]:
             "coverage_ms": coverage_ms,
             "turn_count": len(label_turns),
             "prototype_turn_ids": [turn["turn_id"] for turn in prototype_turns],
-            "cluster_dom_prior": cluster_dom_prior,
-            "dom_margin": score_margin(cluster_dom_prior),
             "base_label": label.split("#", 1)[0],
             "split_applied": "#" in label,
             "impure": False,
@@ -2128,10 +2277,7 @@ def refine_impure_clusters(turns: list[dict]) -> tuple[list[dict], dict[str, dic
         prototype = base_prototypes.get(label, {})
         impure = (
             float(prototype.get("purity") or 0.0) < CLUSTER_IMPURE_PURITY
-            or (
-                float(prototype.get("dom_margin") or 0.0) < CLUSTER_IMPURE_DOM_MARGIN
-                and int(prototype.get("coverage_ms") or 0) > CLUSTER_IMPURE_COVERAGE_MS
-            )
+            and int(prototype.get("coverage_ms") or 0) > CLUSTER_IMPURE_COVERAGE_MS
         )
         split_payload = split_cluster_by_embeddings(label_turns) if impure else None
         if split_payload is not None:
@@ -2401,56 +2547,52 @@ def attach_embeddings_to_turns(turns: list[dict], source_audio_path: Path) -> li
 
 
 def attach_dom_priors_to_turns(turns: list[dict], activity_rows: list[sqlite3.Row]) -> tuple[list[dict], dict[int, float]]:
+    activity_windows = normalize_speaker_activity_events(activity_rows)
     global_totals: dict[int, float] = defaultdict(float)
     enriched_turns: list[dict] = []
     for turn in turns:
         duration_ms = max(int(turn["duration_ms"]), 1)
-        prior_by_participant: dict[int, float] = defaultdict(float)
-        explicit_conflict = False
+        ui_scores_by_participant: dict[int, float] = defaultdict(float)
         simultaneous_claim_count = 0
+        signal_density_by_participant: dict[int, float] = defaultdict(float)
         overlapping_participants: set[int] = set()
-        for row in activity_rows:
-            participant_id = row["participant_id"]
-            if participant_id is None:
-                continue
+        turn_conflicted = False
+        for window in activity_windows:
+            participant_id = int(window["participant_id"])
             overlap_ms = interval_overlap_ms(
                 turn["start_offset_ms"],
                 turn["end_offset_ms"],
-                int(row["start_offset_ms"] or 0),
-                int(row["end_offset_ms"] or 0),
+                int(window["start_offset_ms"] or 0),
+                int(window["end_offset_ms"] or 0),
             )
             if overlap_ms <= 0:
                 continue
-            participant_id = int(participant_id)
             overlapping_participants.add(participant_id)
-            metadata = parse_metadata_json(row["metadata_json"] if "metadata_json" in row.keys() else None)
-            row_confidence = clamp_score(float(row["confidence"] or 0.0))
-            simultaneous_claim_count = max(
-                simultaneous_claim_count,
-                int(metadata.get("simultaneous_claim_count") or 0),
-            )
-            explicit_conflict = explicit_conflict or bool(metadata.get("conflicted_claim"))
-            prior_by_participant[participant_id] += (overlap_ms / duration_ms) * row_confidence
-            global_totals[participant_id] += overlap_ms * row_confidence
+            overlap_ratio = overlap_ms / duration_ms
+            window_confidence = clamp_score(float(window.get("confidence") or 0.0))
+            support_count = max(int(window.get("support_count") or 1), 1)
+            density_bonus = min(0.10, (support_count - 1) * 0.03)
+            event_score = clamp_score((overlap_ratio * window_confidence) + density_bonus)
+            ui_scores_by_participant[participant_id] += event_score
+            signal_density_by_participant[participant_id] += support_count
+            global_totals[participant_id] += overlap_ms * window_confidence
+            simultaneous_claim_count = max(simultaneous_claim_count, len(overlapping_participants))
+            turn_conflicted = turn_conflicted or bool(window.get("conflicted_claim"))
 
         claimant_count = len(overlapping_participants)
-        turn_conflicted = explicit_conflict or claimant_count > 1 or simultaneous_claim_count > 1
         simultaneous_claim_count = max(simultaneous_claim_count, claimant_count)
-        normalized_priors = {
-            participant_id: clamp_score(score)
-            for participant_id, score in prior_by_participant.items()
-        }
-        if turn_conflicted:
-            normalized_priors = {
-                participant_id: min(clamp_score(score * 0.5), 0.35)
-                for participant_id, score in normalized_priors.items()
-            }
+        normalized_priors = {participant_id: clamp_score(score) for participant_id, score in ui_scores_by_participant.items()}
         enriched_turns.append(
             {
                 **turn,
+                "ui_local_evidence_by_participant": dict(normalized_priors),
                 "local_dom_prior_by_participant": dict(normalized_priors),
                 "conflicted_claim": turn_conflicted,
                 "simultaneous_claim_count": simultaneous_claim_count,
+                "ui_signal_density_by_participant": {
+                    participant_id: float(value)
+                    for participant_id, value in signal_density_by_participant.items()
+                },
             }
         )
 
@@ -2855,215 +2997,6 @@ def resolve_turn_assignment(
     return participant_id, float(best_score), float(second_score), []
 
 
-def build_cluster_memory(
-    turn_results: list[dict],
-    previous_memory: dict[str, dict] | None = None,
-    cluster_dom_priors: dict[str, dict[int, float]] | None = None,
-    cluster_prototypes: dict[str, dict] | None = None,
-) -> dict[str, dict]:
-    previous_memory = previous_memory or {}
-    cluster_dom_priors = cluster_dom_priors or {}
-    cluster_prototypes = cluster_prototypes or {}
-    support_by_label: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    turn_count_by_label: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    duration_by_label: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    profile_turn_count_by_label: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-
-    for turn in turn_results:
-        label = turn["speaker_label"]
-        duration_ms = int(turn["duration_ms"])
-        for participant_id, payload in turn["scores_by_participant"].items():
-            support_by_label[label][participant_id] += float(payload["final_score"]) * duration_ms
-        if turn.get("participant_id") is not None:
-            participant_id = int(turn["participant_id"])
-            turn_count_by_label[label][participant_id] += 1
-            duration_by_label[label][participant_id] += duration_ms
-            if turn.get("used_profile"):
-                profile_turn_count_by_label[label][participant_id] += 1
-
-    cluster_memory: dict[str, dict] = {}
-    for label, support in support_by_label.items():
-        normalized_support = normalize_score_map(dict(support))
-        ranked = sorted(normalized_support.items(), key=lambda item: (item[1], -item[0]), reverse=True)
-        best_participant_id = int(ranked[0][0]) if ranked else None
-        best_score = float(ranked[0][1]) if ranked else 0.0
-        second_score = float(ranked[1][1]) if len(ranked) > 1 else 0.0
-        score_margin = best_score - second_score
-        support_turn_count = int(turn_count_by_label[label].get(best_participant_id, 0)) if best_participant_id is not None else 0
-        support_duration_ms = int(duration_by_label[label].get(best_participant_id, 0)) if best_participant_id is not None else 0
-        profile_supported_turn_count = (
-            int(profile_turn_count_by_label[label].get(best_participant_id, 0))
-            if best_participant_id is not None
-            else 0
-        )
-        cluster_prototype = cluster_prototypes.get(label, {})
-        cluster_dom_score = (
-            float(cluster_dom_priors.get(label, {}).get(best_participant_id, 0.0))
-            if best_participant_id is not None
-            else 0.0
-        )
-        confirmed = (
-            best_participant_id is not None
-            and best_score >= CLUSTER_CONFIRM_SCORE
-            and score_margin >= CLUSTER_CONFIRM_MARGIN
-            and not bool(cluster_prototype.get("impure"))
-            and (profile_supported_turn_count > 0 or cluster_dom_score >= 0.45)
-            and (
-                support_turn_count >= CLUSTER_CONFIRM_TURN_COUNT
-                or support_duration_ms >= CLUSTER_CONFIRM_DURATION_MS
-            )
-        )
-
-        previous = previous_memory.get(label) or {}
-        previous_best_participant_id = previous.get("best_participant_id")
-        previous_confirmed = bool(previous.get("confirmed"))
-        if previous_confirmed and previous_best_participant_id is not None and previous_best_participant_id != best_participant_id:
-            remap_support = sum(
-                1
-                for turn in turn_results
-                if turn["speaker_label"] == label
-                and (
-                    turn["scores_by_participant"].get(best_participant_id, {}).get("final_score", 0.0)
-                    - turn["scores_by_participant"].get(previous_best_participant_id, {}).get("final_score", 0.0)
-                ) >= CLUSTER_REMAP_MARGIN
-            )
-            if remap_support < CLUSTER_REMAP_TURN_COUNT:
-                best_participant_id = int(previous_best_participant_id)
-                best_score = float(normalized_support.get(best_participant_id, 0.0))
-                second_score = max(
-                    (score for participant_id, score in normalized_support.items() if participant_id != best_participant_id),
-                    default=0.0,
-                )
-                score_margin = best_score - second_score
-                support_turn_count = int(turn_count_by_label[label].get(best_participant_id, 0))
-                support_duration_ms = int(duration_by_label[label].get(best_participant_id, 0))
-                confirmed = bool(previous_confirmed)
-
-        cluster_memory[label] = {
-            "speaker_label": label,
-            "best_participant_id": best_participant_id,
-            "best_score": clamp_score(best_score),
-            "second_score": clamp_score(second_score),
-            "score_margin": clamp_score(score_margin),
-            "support_duration_ms": support_duration_ms,
-            "support_turn_count": support_turn_count,
-            "profile_supported_turn_count": profile_supported_turn_count,
-            "cluster_dom_score": clamp_score(cluster_dom_score),
-            "prototype_purity": float(cluster_prototype.get("purity") or 0.0),
-            "prototype_impure": bool(cluster_prototype.get("impure")),
-            "confirmed": confirmed,
-            "support_by_participant": normalized_support,
-        }
-    return cluster_memory
-
-
-def apply_confirmed_cluster_remapping(turn_results: list[dict], cluster_memory: dict[str, dict]) -> list[dict]:
-    remapped: list[dict] = []
-    for turn in turn_results:
-        remapped_turn = dict(turn)
-        cluster_state = cluster_memory.get(turn["speaker_label"]) or {}
-        confirmed_participant_id = cluster_state.get("best_participant_id") if cluster_state.get("confirmed") else None
-        if confirmed_participant_id is not None and confirmed_participant_id != turn.get("participant_id"):
-            confirmed_payload = turn["scores_by_participant"].get(int(confirmed_participant_id))
-            current_payload = turn["scores_by_participant"].get(turn.get("participant_id"))
-            confirmed_score = float(confirmed_payload["final_score"]) if confirmed_payload else 0.0
-            current_score = float(current_payload["final_score"]) if current_payload else 0.0
-            if confirmed_score >= max(current_score - 0.08, 0.0) or float(cluster_state.get("score_margin") or 0.0) >= CLUSTER_REMAP_MARGIN:
-                remapped_turn["participant_id"] = int(confirmed_participant_id)
-                remapped_turn["best_score"] = confirmed_score
-                remapped_turn["second_score"] = max(
-                    (
-                        payload["final_score"]
-                        for participant_id, payload in turn["scores_by_participant"].items()
-                        if participant_id != confirmed_participant_id
-                    ),
-                    default=0.0,
-                )
-                remapped_turn["score_margin"] = remapped_turn["best_score"] - remapped_turn["second_score"]
-                remapped_turn["used_profile"] = bool(confirmed_payload and confirmed_payload.get("used_profile"))
-                remapped_turn["remapped_by_cluster"] = True
-        remapped.append(remapped_turn)
-    return remapped
-
-
-def run_iterative_turn_assignment(
-    turns: list[dict],
-    participant_ids: list[int],
-    participant_profiles: dict[int, dict],
-    cluster_prototypes: dict[str, dict],
-    cluster_dom_priors: dict[str, dict[int, float]],
-    global_dom_priors: dict[int, float],
-) -> tuple[list[dict], dict[str, dict], dict[int, dict], list[dict]]:
-    cluster_memory: dict[str, dict] = {}
-    pass_history: list[dict] = []
-    profiles = dict(participant_profiles)
-    assignment_signature: list[tuple[str, int | None]] = []
-
-    for pass_index in range(1, MAX_ASSIGNMENT_PASSES + 1):
-        pass_turns: list[dict] = []
-        for turn in turns:
-            scores_by_participant = score_turn_candidates(
-                turn,
-                participant_ids,
-                profiles,
-                cluster_prototypes,
-                cluster_dom_priors.get(turn["speaker_label"], {}),
-                global_dom_priors,
-            )
-            participant_id, best_score, second_score, unresolved_reasons = resolve_turn_assignment(
-                turn,
-                scores_by_participant,
-                cluster_prototypes,
-            )
-            pass_turns.append(
-                {
-                    **turn,
-                    "scores_by_participant": scores_by_participant,
-                    "participant_id": participant_id,
-                    "best_score": best_score,
-                    "second_score": second_score,
-                    "score_margin": best_score - second_score,
-                    "used_profile": bool(
-                        participant_id is not None
-                        and scores_by_participant.get(participant_id, {}).get("used_profile")
-                    ),
-                    "unresolved_reason_codes": unresolved_reasons,
-                }
-            )
-
-        new_cluster_memory = build_cluster_memory(pass_turns, cluster_memory, cluster_dom_priors, cluster_prototypes)
-        remapped_turns = apply_confirmed_cluster_remapping(pass_turns, new_cluster_memory)
-        new_cluster_memory = build_cluster_memory(remapped_turns, new_cluster_memory, cluster_dom_priors, cluster_prototypes)
-        profiles = expand_missing_participant_profiles(participant_ids, remapped_turns, profiles, cluster_dom_priors)
-        current_signature = [(turn["turn_id"], turn.get("participant_id")) for turn in remapped_turns]
-        pass_history.append(
-            {
-                "pass_index": pass_index,
-                "cluster_memory": new_cluster_memory,
-                "turn_assignments": [
-                    {
-                        "turn_id": turn["turn_id"],
-                        "speaker_label": turn["speaker_label"],
-                        "participant_id": turn.get("participant_id"),
-                        "best_score": turn.get("best_score"),
-                        "second_score": turn.get("second_score"),
-                        "score_margin": turn.get("score_margin"),
-                        "remapped_by_cluster": bool(turn.get("remapped_by_cluster")),
-                        "unresolved_reason_codes": turn.get("unresolved_reason_codes") or [],
-                    }
-                    for turn in remapped_turns
-                ],
-            }
-        )
-        if current_signature == assignment_signature:
-            cluster_memory = new_cluster_memory
-            return remapped_turns, cluster_memory, profiles, pass_history
-        assignment_signature = current_signature
-        cluster_memory = new_cluster_memory
-
-    return remapped_turns if "remapped_turns" in locals() else [], cluster_memory, profiles, pass_history
-
-
 def collect_segment_turn_matches(segment: dict, assigned_turns: list[dict]) -> dict:
     segment_duration_ms = max(segment["end_offset_ms"] - segment["start_offset_ms"], 1)
     matches: list[dict] = []
@@ -3273,97 +3206,420 @@ def split_segment_without_words(segment: dict, matches: list[dict]) -> list[dict
     return fragments
 
 
-def build_aligned_fragment(
-    base_segment: dict,
-    fragment: dict,
-    cluster_memory: dict[str, dict],
+def best_score_details(score_map: dict[int, float]) -> tuple[int | None, float, float, float]:
+    if not score_map:
+        return None, 0.0, 0.0, 0.0
+    ranked = sorted(score_map.items(), key=lambda item: (item[1], -item[0]), reverse=True)
+    best_participant_id, best_score = ranked[0]
+    second_score = float(ranked[1][1]) if len(ranked) > 1 else 0.0
+    return int(best_participant_id), float(best_score), float(best_score - second_score), second_score
+
+
+def build_caption_timeline(canonical_captions: list[dict], meeting_row: sqlite3.Row | None) -> list[dict]:
+    if not canonical_captions:
+        return []
+    anchor_dt = None
+    if meeting_row is not None:
+        anchor_dt = parse_dt(meeting_row["audio_capture_started_at"] if "audio_capture_started_at" in meeting_row.keys() else None)
+        if anchor_dt is None:
+            anchor_dt = parse_dt(meeting_row["joined_at"] if "joined_at" in meeting_row.keys() else None)
+    if anchor_dt is None:
+        return []
+
+    entries: list[dict] = []
+    for row in canonical_captions:
+        started_at = row.get("started_at")
+        finalized_at = row.get("finalized_at")
+        if isinstance(started_at, str):
+            started_at = parse_dt(started_at)
+        if isinstance(finalized_at, str):
+            finalized_at = parse_dt(finalized_at)
+        if started_at is None and finalized_at is None:
+            continue
+        start_dt = started_at or finalized_at
+        end_dt = finalized_at or started_at
+        if start_dt is None or end_dt is None:
+            continue
+        start_offset_ms = max(0, int(round((start_dt - anchor_dt).total_seconds() * 1000)))
+        end_offset_ms = max(start_offset_ms + 1, int(round((end_dt - anchor_dt).total_seconds() * 1000)))
+        entries.append(
+            {
+                "sequence_no": int(row.get("sequence_no") or len(entries) + 1),
+                "speaker": normalize_text(row.get("speaker") or row.get("speaker_name") or "Unknown") or "Unknown",
+                "text": normalize_text(row.get("text") or ""),
+                "start_offset_ms": start_offset_ms,
+                "end_offset_ms": end_offset_ms,
+            }
+        )
+    return entries
+
+
+def select_caption_event_for_segment(segment: dict, caption_entries: list[dict]) -> dict | None:
+    best_entry: dict | None = None
+    best_key = None
+    for entry in caption_entries:
+        overlap_ms = interval_overlap_ms(
+            segment["start_offset_ms"],
+            segment["end_offset_ms"],
+            entry["start_offset_ms"],
+            entry["end_offset_ms"],
+        )
+        distance_ms = 0
+        if overlap_ms <= 0:
+            distance_ms = min(
+                abs(segment["start_offset_ms"] - entry["end_offset_ms"]),
+                abs(segment["end_offset_ms"] - entry["start_offset_ms"]),
+            )
+        text_score = token_sequence_match_ratio(segment.get("text"), entry.get("text"))
+        if overlap_ms <= 0 and distance_ms > 2500 and text_score < 0.45:
+            continue
+        ranking_key = (
+            1 if overlap_ms > 0 else 0,
+            text_score,
+            overlap_ms,
+            -distance_ms,
+            -int(entry.get("sequence_no") or 0),
+        )
+        if best_key is None or ranking_key > best_key:
+            best_key = ranking_key
+            best_entry = entry
+    return best_entry
+
+
+def compute_caption_name_scores(
+    caption_speaker: str | None,
+    participant_rows: list[sqlite3.Row],
+) -> tuple[dict[int, float], int | None, str]:
+    scores: dict[int, float] = {}
+    visible_rows = [
+        row
+        for row in participant_rows
+        if not bool(row["is_bot"]) and not is_roster_heading_name(row["display_name"])
+    ]
+    for row in visible_rows:
+        scores[int(row["id"])] = 0.0
+
+    normalized_caption = normalize_participant_name(caption_speaker)
+    if not normalized_caption or normalized_caption.casefold() == "unknown":
+        return scores, None, "none"
+
+    exact_matches: list[int] = []
+    fuzzy_ranked: list[tuple[float, int]] = []
+    for row in visible_rows:
+        participant_id = int(row["id"])
+        display_name = normalize_participant_name(row["display_name"])
+        if not display_name:
+            continue
+        if display_name.casefold() == normalized_caption.casefold():
+            exact_matches.append(participant_id)
+            scores[participant_id] = 1.0
+            continue
+        ratio = sequence_ratio(display_name, normalized_caption)
+        token_ratio = token_sequence_match_ratio(display_name, normalized_caption)
+        partial_match = (
+            len(display_name) >= 4
+            and len(normalized_caption) >= 4
+            and (
+                display_name.casefold() in normalized_caption.casefold()
+                or normalized_caption.casefold() in display_name.casefold()
+            )
+        )
+        fuzzy_score = max(ratio, token_ratio, 0.60 if partial_match else 0.0)
+        if fuzzy_score > 0.0:
+            scores[participant_id] = clamp_score(fuzzy_score)
+            fuzzy_ranked.append((clamp_score(fuzzy_score), participant_id))
+
+    if len(exact_matches) == 1:
+        return scores, exact_matches[0], "exact"
+    if len(exact_matches) > 1:
+        for participant_id in exact_matches:
+            scores[participant_id] = min(scores[participant_id], 0.35) or 0.35
+        return scores, None, "ambiguous"
+
+    fuzzy_ranked.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    if not fuzzy_ranked:
+        return scores, None, "ambiguous"
+
+    best_score, best_participant_id = fuzzy_ranked[0]
+    second_score = fuzzy_ranked[1][0] if len(fuzzy_ranked) > 1 else 0.0
+    if (
+        best_score >= HYBRID_CAPTION_FUZZY_UNIQUE_FLOOR
+        and (best_score - second_score) >= HYBRID_CAPTION_FUZZY_SEPARATION_MARGIN
+    ):
+        return scores, int(best_participant_id), "fuzzy"
+    return scores, None, "ambiguous"
+
+
+def compute_ui_activity_score(
+    start_offset_ms: int,
+    end_offset_ms: int,
+    participant_id: int,
+    activity_windows: list[dict],
+) -> float:
+    duration_ms = max(end_offset_ms - start_offset_ms, 1)
+    total_score = 0.0
+    proximity_score = 0.0
+    for window in activity_windows:
+        if int(window["participant_id"]) != int(participant_id):
+            continue
+        overlap_ms = interval_overlap_ms(
+            start_offset_ms,
+            end_offset_ms,
+            int(window["start_offset_ms"]),
+            int(window["end_offset_ms"]),
+        )
+        confidence = clamp_score(float(window.get("confidence") or 0.0))
+        support_bonus = min(0.08, max(int(window.get("support_count") or 1) - 1, 0) * 0.02)
+        if overlap_ms > 0:
+            overlap_ratio = overlap_ms / duration_ms
+            recency_bonus = 0.08 if abs(int(window["start_offset_ms"]) - start_offset_ms) <= HYBRID_UI_MERGE_GAP_MS else 0.0
+            score = (overlap_ratio * confidence) + support_bonus + recency_bonus
+            if window.get("conflicted_claim"):
+                score *= 0.8
+            total_score += score
+            continue
+        gap_ms = min(
+            abs(start_offset_ms - int(window["end_offset_ms"])),
+            abs(end_offset_ms - int(window["start_offset_ms"])),
+        )
+        if gap_ms <= HYBRID_UI_MERGE_GAP_MS:
+            proximity_score = max(
+                proximity_score,
+                0.12 * confidence * (1.0 - (gap_ms / HYBRID_UI_MERGE_GAP_MS)),
+            )
+    return clamp_score(total_score + proximity_score)
+
+
+def score_turn_local_evidence(
+    turn: dict,
+    participant_ids: list[int],
+    participant_profiles: dict[int, dict],
     cluster_prototypes: dict[str, dict],
-    source_audio_path: Path,
-) -> tuple[dict, dict]:
-    turn = fragment["turn"]
-    cluster_state = cluster_memory.get(turn["speaker_label"]) or {}
-    cluster_prototype = cluster_prototypes.get(turn["speaker_label"]) or {}
-    unresolved_reasons = list(turn.get("unresolved_reason_codes") or []) + list(fragment.get("unresolved_reasons") or [])
-    if bool(cluster_prototype.get("impure")) and not bool(cluster_state.get("confirmed")):
-        unresolved_reasons.append("impure_cluster_unconfirmed")
-    if bool(fragment.get("low_alignment")) and not bool(cluster_state.get("confirmed")):
-        unresolved_reasons.append("low_alignment_unconfirmed_cluster")
+    ui_local_evidence_by_participant: dict[int, float],
+) -> dict[int, dict]:
+    cluster_prototype = cluster_prototypes.get(turn["speaker_label"], {})
+    cluster_purity = clamp_score(float(cluster_prototype.get("purity") or 0.0))
+    scores: dict[int, dict] = {}
+    for participant_id in participant_ids:
+        profile = participant_profiles.get(int(participant_id))
+        cluster_profile_similarity = cosine_similarity_vectors(
+            cluster_prototype.get("centroid"),
+            profile.get("centroid") if profile else None,
+        )
+        turn_profile_similarity = cosine_similarity_vectors(
+            turn.get("embedding"),
+            profile.get("centroid") if profile else None,
+        )
+        if profile:
+            if bool(cluster_prototype.get("impure")):
+                audio_identity_score = (0.70 * turn_profile_similarity) + (0.30 * cluster_profile_similarity)
+            else:
+                audio_identity_score = (0.55 * cluster_profile_similarity) + (0.45 * turn_profile_similarity)
+            audio_identity_score *= 0.65 + (0.35 * max(cluster_purity, float(turn.get("speech_ratio") or 0.0)))
+        else:
+            audio_identity_score = 0.0
+        if turn.get("overlap_flag"):
+            audio_identity_score *= 0.9
+        scores[int(participant_id)] = {
+            "audio_identity_score": clamp_score(audio_identity_score),
+            "ui_activity_score": clamp_score(ui_local_evidence_by_participant.get(int(participant_id), 0.0)),
+            "turn_profile_similarity": clamp_score(turn_profile_similarity),
+            "cluster_profile_similarity": clamp_score(cluster_profile_similarity),
+            "prototype_purity": cluster_purity,
+        }
+    return scores
 
-    unresolved_assignment = turn.get("participant_id") is None or bool(unresolved_reasons)
-    needs_review = (
-        unresolved_assignment
-        or bool(fragment.get("needs_review"))
-        or float(turn.get("best_score") or 0.0) < CLUSTER_CONFIRM_SCORE
-        or float(turn.get("score_margin") or 0.0) < CLUSTER_CONFIRM_MARGIN
-        or bool(turn.get("overlap_flag"))
-        or bool(fragment.get("low_alignment"))
-        or (not bool(turn.get("used_profile")) and bool(turn.get("local_dom_prior_by_participant")))
-    )
-    assignment_method = "audio_cluster_match"
-    participant_id = turn.get("participant_id")
-    if unresolved_assignment:
-        assignment_method = "audio_cluster_unresolved"
-        participant_id = None
-    elif not turn.get("used_profile"):
-        assignment_method = "audio_cluster_dom_bootstrap"
-    elif needs_review:
-        assignment_method = "audio_cluster_match_review"
 
-    aligned_segment = {
-        **base_segment,
-        "participant_id": participant_id,
-        "participant_audio_asset_id": None,
-        "raw_text": fragment["raw_text"],
-        "text": fragment["text"],
-        "start_offset_ms": fragment["start_offset_ms"],
-        "end_offset_ms": fragment["end_offset_ms"],
-        "assignment_method": assignment_method,
-        "assignment_confidence": clamp_score(turn.get("best_score") or 0.0),
-        "needs_speaker_review": needs_review,
-        "resolution_status": (
-            TRANSCRIPT_STATUS_PENDING_REVIEW if needs_review else TRANSCRIPT_STATUS_ORIGINAL
-        ),
-        "source_audio_path": source_audio_path,
-        "cluster_lineage": turn.get("cluster_lineage") or turn["speaker_label"],
-        "source_turn_ids": [turn["turn_id"]],
-        "words": None,
+def summarize_turn_local_evidence(turn: dict, candidate_scores: dict[int, dict]) -> dict:
+    audio_map = {
+        participant_id: float(payload.get("audio_identity_score") or 0.0)
+        for participant_id, payload in candidate_scores.items()
     }
-    debug_link = {
-        "source_segment_index": base_segment.get("source_segment_index"),
-        "fragment_index": fragment.get("fragment_index"),
+    ui_map = {
+        participant_id: float(payload.get("ui_activity_score") or 0.0)
+        for participant_id, payload in candidate_scores.items()
+    }
+    best_audio_participant_id, _best_audio_score, audio_margin, _audio_second = best_score_details(audio_map)
+    best_ui_participant_id, _best_ui_score, ui_margin, _ui_second = best_score_details(ui_map)
+    summary_scores: dict[str, dict] = {}
+    for participant_id in sorted(candidate_scores):
+        payload = candidate_scores[participant_id]
+        summary_scores[str(participant_id)] = {
+            "audio_identity_score": float(payload.get("audio_identity_score") or 0.0),
+            "ui_activity_score": float(payload.get("ui_activity_score") or 0.0),
+            "audio_margin": float(audio_margin),
+            "ui_margin": float(ui_margin),
+        }
+    return {
         "turn_id": turn["turn_id"],
         "speaker_label": turn["speaker_label"],
-        "participant_id": participant_id,
-        "cluster_lineage": aligned_segment["cluster_lineage"],
-        "split_source": fragment.get("split_source"),
-        "low_alignment": bool(fragment.get("low_alignment")),
-        "unresolved_reason": unresolved_reasons,
-        "start_offset_ms": aligned_segment["start_offset_ms"],
-        "end_offset_ms": aligned_segment["end_offset_ms"],
-        "text": aligned_segment["text"],
+        "start_offset_ms": int(turn["start_offset_ms"]),
+        "end_offset_ms": int(turn["end_offset_ms"]),
+        "best_audio_participant_id": best_audio_participant_id,
+        "best_ui_participant_id": best_ui_participant_id,
+        "candidate_scores": summary_scores,
+        "audio_margin": float(audio_margin),
+        "ui_margin": float(ui_margin),
     }
-    return aligned_segment, debug_link
 
 
-def align_segments_to_turns(
+def build_initial_hybrid_profiles(turns: list[dict], participant_ids: list[int]) -> dict[int, dict]:
+    seed_turns_by_participant: dict[int, list[dict]] = defaultdict(list)
+    for turn in turns:
+        if not turn.get("embedding"):
+            continue
+        if int(turn.get("duration_ms") or 0) < HYBRID_SEED_MIN_DURATION_MS:
+            continue
+        if float(turn.get("speech_ratio") or 0.0) < HYBRID_SEED_MIN_SPEECH_RATIO:
+            continue
+        if turn.get("overlap_flag") or turn.get("conflicted_claim"):
+            continue
+        ui_map = turn.get("ui_local_evidence_by_participant") or {}
+        best_ui_participant_id, best_ui_score, ui_margin, _ = best_score_details(
+            {int(participant_id): float(ui_map.get(int(participant_id), 0.0)) for participant_id in participant_ids}
+        )
+        if best_ui_participant_id is None:
+            continue
+        if best_ui_score < HYBRID_SEED_MIN_UI_ACTIVITY_SCORE or ui_margin < HYBRID_SEED_MIN_UI_MARGIN:
+            continue
+        seed_turns_by_participant[int(best_ui_participant_id)].append(
+            {
+                **turn,
+                "participant_id": int(best_ui_participant_id),
+                "seed_prior_score": float(best_ui_score),
+                "best_score": float(best_ui_score),
+            }
+        )
+
+    profiles: dict[int, dict] = {}
+    for participant_id in participant_ids:
+        profile = build_profile_from_turns(seed_turns_by_participant.get(int(participant_id), []), source_kind="ui_seed")
+        if profile is None:
+            continue
+        profile["participant_id"] = int(participant_id)
+        profiles[int(participant_id)] = profile
+
+    if len(profiles) < len(participant_ids):
+        bootstrap_profiles = build_participant_profiles(turns, participant_ids)
+        for participant_id, profile in bootstrap_profiles.items():
+            if profile is None:
+                continue
+            profile["participant_id"] = int(participant_id)
+            profiles.setdefault(int(participant_id), profile)
+    return profiles
+
+
+def refresh_hybrid_participant_profiles(
+    turns_by_id: dict[str, dict],
+    segment_results: list[dict],
+    participant_profiles: dict[int, dict],
+) -> dict[int, dict]:
+    refreshed = dict(participant_profiles)
+    seed_turns_by_participant: dict[int, list[dict]] = defaultdict(list)
+    for segment in segment_results:
+        participant_id = segment.get("participant_id")
+        if participant_id is None:
+            continue
+        if segment.get("speaker_resolution_status") == HYBRID_SPEAKER_STATUS_CONFIRMED:
+            accepted = True
+        else:
+            accepted = (
+                segment.get("speaker_resolution_status") in {
+                    HYBRID_SPEAKER_STATUS_UI_PROVISIONAL,
+                    HYBRID_SPEAKER_STATUS_AUDIO_PROVISIONAL,
+                }
+                and float(segment.get("assignment_confidence") or 0.0) >= HYBRID_STRONG_PROVISIONAL_REFRESH_FLOOR
+            )
+        if not accepted or bool(segment.get("multi_active_claim")):
+            continue
+        for turn_id in segment.get("source_turn_ids") or []:
+            turn = turns_by_id.get(turn_id)
+            if turn is None or not turn.get("embedding") or turn.get("overlap_flag"):
+                continue
+            candidate_payload = (turn.get("candidate_scores") or {}).get(int(participant_id), {})
+            dominant_channel = "ui" if float(candidate_payload.get("ui_activity_score") or 0.0) >= float(candidate_payload.get("audio_identity_score") or 0.0) else "audio"
+            dominant_margin = float(turn.get("ui_margin") or 0.0) if dominant_channel == "ui" else float(turn.get("audio_margin") or 0.0)
+            dominant_score = float(candidate_payload.get("ui_activity_score") or 0.0) if dominant_channel == "ui" else float(candidate_payload.get("audio_identity_score") or 0.0)
+            if dominant_channel == "ui":
+                if dominant_score < HYBRID_SEED_MIN_UI_ACTIVITY_SCORE or dominant_margin < HYBRID_SEED_MIN_UI_MARGIN:
+                    continue
+            else:
+                if dominant_score < HYBRID_SEED_MIN_AUDIO_IDENTITY_SCORE or dominant_margin < HYBRID_SEED_MIN_AUDIO_MARGIN:
+                    continue
+            seed_turns_by_participant[int(participant_id)].append(
+                {
+                    **turn,
+                    "participant_id": int(participant_id),
+                    "seed_prior_score": float(segment.get("assignment_confidence") or 0.0),
+                    "best_score": float(segment.get("assignment_confidence") or 0.0),
+                }
+            )
+
+    for participant_id, seed_turns in seed_turns_by_participant.items():
+        profile = build_profile_from_turns(seed_turns, source_kind="segment_refresh")
+        if profile is None:
+            continue
+        profile["participant_id"] = int(participant_id)
+        existing = refreshed.get(int(participant_id))
+        if existing is None or (
+            float(profile.get("quality") or 0.0),
+            int(profile.get("coverage_ms") or 0),
+        ) >= (
+            float(existing.get("quality") or 0.0),
+            int(existing.get("coverage_ms") or 0),
+        ):
+            refreshed[int(participant_id)] = profile
+    return refreshed
+
+
+def score_turns_locally(
+    turns: list[dict],
+    participant_ids: list[int],
+    participant_profiles: dict[int, dict],
+    cluster_prototypes: dict[str, dict],
+) -> tuple[list[dict], list[dict]]:
+    scored_turns: list[dict] = []
+    turn_local_summary: list[dict] = []
+    for turn in turns:
+        candidate_scores = score_turn_local_evidence(
+            turn,
+            participant_ids,
+            participant_profiles,
+            cluster_prototypes,
+            turn.get("ui_local_evidence_by_participant") or {},
+        )
+        summary = summarize_turn_local_evidence(turn, candidate_scores)
+        scored_turns.append(
+            {
+                **turn,
+                "candidate_scores": candidate_scores,
+                "best_audio_participant_id": summary["best_audio_participant_id"],
+                "best_ui_participant_id": summary["best_ui_participant_id"],
+                "audio_margin": summary["audio_margin"],
+                "ui_margin": summary["ui_margin"],
+            }
+        )
+        turn_local_summary.append(summary)
+    return scored_turns, turn_local_summary
+
+
+def collect_segment_candidates(
     segments: list[dict],
     assigned_turns: list[dict],
-    cluster_memory: dict[str, dict],
-    cluster_prototypes: dict[str, dict],
-    source_audio_path: Path,
-) -> tuple[list[dict], list[dict]]:
+    participant_ids: list[int],
+    activity_windows: list[dict],
+) -> list[dict]:
     if not assigned_turns:
         raise RuntimeError("Speaker diarization herhangi bir turn üretmediği için segmentler eşlenemedi.")
 
-    aligned_segments: list[dict] = []
-    turn_to_segment_links: list[dict] = []
+    segment_candidates: list[dict] = []
     for segment in segments:
         match_payload = collect_segment_turn_matches(segment, assigned_turns)
         matches = match_payload["matches"]
         significant_matches = match_payload["significant_matches"]
         dominant_match = match_payload["dominant_match"]
         if not matches or dominant_match is None:
-            raise RuntimeError("Bir transcript segmenti için speaker turn bulunamadı.")
+            continue
 
         split_required = len(significant_matches) > 1 and float(dominant_match.get("overlap_ratio") or 0.0) < SEGMENT_SINGLE_TURN_DOMINANCE_RATIO
         if split_required:
@@ -3390,16 +3646,534 @@ def align_segments_to_turns(
         for fragment in fragments:
             if fragment["end_offset_ms"] <= fragment["start_offset_ms"]:
                 continue
-            aligned_segment, debug_link = build_aligned_fragment(
-                segment,
-                fragment,
-                cluster_memory,
-                cluster_prototypes,
-                source_audio_path,
+            relevant_matches = [
+                match
+                for match in (significant_matches or matches)
+                if interval_overlap_ms(
+                    fragment["start_offset_ms"],
+                    fragment["end_offset_ms"],
+                    match["turn"]["start_offset_ms"],
+                    match["turn"]["end_offset_ms"],
+                ) > 0
+            ]
+            if not relevant_matches:
+                relevant_matches = [dominant_match]
+
+            audio_scores_by_participant: dict[int, float] = {}
+            ui_scores_by_participant: dict[int, float] = {}
+            match_weights: dict[str, float] = {}
+            for match in relevant_matches:
+                overlap_ms = interval_overlap_ms(
+                    fragment["start_offset_ms"],
+                    fragment["end_offset_ms"],
+                    match["turn"]["start_offset_ms"],
+                    match["turn"]["end_offset_ms"],
+                )
+                match_weights[match["turn"]["turn_id"]] = float(max(overlap_ms, 1))
+
+            total_weight = sum(match_weights.values()) or 1.0
+            for participant_id in participant_ids:
+                weighted_audio = 0.0
+                for match in relevant_matches:
+                    turn = match["turn"]
+                    weight = match_weights.get(turn["turn_id"], 1.0)
+                    weighted_audio += weight * float(
+                        (turn.get("candidate_scores") or {}).get(int(participant_id), {}).get("audio_identity_score") or 0.0
+                    )
+                audio_scores_by_participant[int(participant_id)] = clamp_score(weighted_audio / total_weight)
+                ui_scores_by_participant[int(participant_id)] = compute_ui_activity_score(
+                    int(fragment["start_offset_ms"]),
+                    int(fragment["end_offset_ms"]),
+                    int(participant_id),
+                    activity_windows,
+                )
+
+            best_audio_participant_id, _best_audio_score, audio_margin, _ = best_score_details(audio_scores_by_participant)
+            best_ui_participant_id, _best_ui_score, ui_margin, _ = best_score_details(ui_scores_by_participant)
+            active_ui_claimants = [
+                participant_id
+                for participant_id, score in ui_scores_by_participant.items()
+                if score >= 0.25
+            ]
+            multi_active_claim = len(active_ui_claimants) > 1 or any(
+                window.get("conflicted_claim")
+                and interval_overlap_ms(
+                    int(fragment["start_offset_ms"]),
+                    int(fragment["end_offset_ms"]),
+                    int(window["start_offset_ms"]),
+                    int(window["end_offset_ms"]),
+                ) > 0
+                for window in activity_windows
             )
-            aligned_segments.append(aligned_segment)
-            turn_to_segment_links.append(debug_link)
-    return aligned_segments, turn_to_segment_links
+
+            candidate_participants: dict[int, dict] = {}
+            for participant_id in participant_ids:
+                candidate_participants[int(participant_id)] = {
+                    "audio_identity_score": float(audio_scores_by_participant.get(int(participant_id), 0.0)),
+                    "ui_activity_score": float(ui_scores_by_participant.get(int(participant_id), 0.0)),
+                    "caption_name_score": 0.0,
+                    "temporal_continuity_score": HYBRID_TEMPORAL_NEUTRAL_BASE,
+                    "evidence_agreement_score": 0.0,
+                    "final_score": 0.0,
+                }
+
+            segment_candidates.append(
+                {
+                    **segment,
+                    "segment_id": f"seg-{int(segment.get('source_segment_index') or 0)}-{int(fragment['fragment_index'])}",
+                    "fragment_index": int(fragment["fragment_index"]),
+                    "text": fragment["text"],
+                    "raw_text": fragment["raw_text"],
+                    "start_offset_ms": int(fragment["start_offset_ms"]),
+                    "end_offset_ms": int(fragment["end_offset_ms"]),
+                    "matched_turn_ids": [match["turn"]["turn_id"] for match in relevant_matches],
+                    "source_turn_ids": [match["turn"]["turn_id"] for match in relevant_matches],
+                    "candidate_participants": candidate_participants,
+                    "best_audio_participant_id": best_audio_participant_id,
+                    "best_ui_participant_id": best_ui_participant_id,
+                    "best_caption_participant_id": None,
+                    "caption_match_type": "none",
+                    "multi_active_claim": multi_active_claim,
+                    "audio_margin": float(audio_margin),
+                    "ui_margin": float(ui_margin),
+                    "reason_codes": [HYBRID_REASON_CODE_MULTI_ACTIVE] if multi_active_claim else [],
+                }
+            )
+    return segment_candidates
+
+
+def attach_segment_caption_scores(
+    segment_candidates: list[dict],
+    caption_entries: list[dict],
+    participant_rows: list[sqlite3.Row],
+) -> list[dict]:
+    for segment in segment_candidates:
+        caption_entry = select_caption_event_for_segment(segment, caption_entries)
+        if caption_entry is None:
+            segment["caption_match_type"] = "none"
+            segment["best_caption_participant_id"] = None
+            continue
+        caption_scores, best_caption_participant_id, caption_match_type = compute_caption_name_scores(
+            caption_entry.get("speaker"),
+            participant_rows,
+        )
+        segment["best_caption_participant_id"] = best_caption_participant_id
+        segment["caption_match_type"] = caption_match_type if caption_match_type in HYBRID_CAPTION_MATCH_TYPES else "none"
+        if caption_match_type == "ambiguous" and HYBRID_REASON_CODE_CAPTION_AMBIGUOUS not in segment["reason_codes"]:
+            segment["reason_codes"].append(HYBRID_REASON_CODE_CAPTION_AMBIGUOUS)
+        for participant_id, candidate_payload in segment["candidate_participants"].items():
+            candidate_payload["caption_name_score"] = float(caption_scores.get(int(participant_id), 0.0))
+    return segment_candidates
+
+
+def attach_segment_temporal_scores(
+    segment_candidates: list[dict],
+    reference_assignments: list[dict] | None,
+) -> list[dict]:
+    reference_assignments = reference_assignments or []
+    index_by_segment_id = {
+        assignment["segment_id"]: assignment
+        for assignment in reference_assignments
+    }
+    for index, segment in enumerate(segment_candidates):
+        prev_assignment = index_by_segment_id.get(segment_candidates[index - 1]["segment_id"]) if index > 0 else None
+        next_assignment = index_by_segment_id.get(segment_candidates[index + 1]["segment_id"]) if index + 1 < len(segment_candidates) else None
+        conflicting_candidate_ids: set[int] = set()
+        for participant_id, candidate_payload in segment["candidate_participants"].items():
+            continuity_score = HYBRID_TEMPORAL_NEUTRAL_BASE
+            for neighbor, gap_ms in (
+                (
+                    prev_assignment,
+                    segment["start_offset_ms"] - segment_candidates[index - 1]["end_offset_ms"],
+                )
+                if index > 0
+                else (None, 999999),
+                (
+                    next_assignment,
+                    segment_candidates[index + 1]["start_offset_ms"] - segment["end_offset_ms"],
+                )
+                if index + 1 < len(segment_candidates)
+                else (None, 999999),
+            ):
+                if not neighbor or gap_ms > HYBRID_TEMPORAL_NEIGHBOR_GAP_MS:
+                    continue
+                neighbor_participant_id = neighbor.get("chosen_participant_id")
+                neighbor_status = neighbor.get("speaker_resolution_status")
+                if neighbor_participant_id is None:
+                    continue
+                if int(neighbor_participant_id) == int(participant_id):
+                    if neighbor_status == HYBRID_SPEAKER_STATUS_CONFIRMED:
+                        continuity_score = max(continuity_score, 0.80)
+                    elif neighbor_status in {HYBRID_SPEAKER_STATUS_UI_PROVISIONAL, HYBRID_SPEAKER_STATUS_AUDIO_PROVISIONAL}:
+                        continuity_score = max(continuity_score, 0.60)
+                elif neighbor_status == HYBRID_SPEAKER_STATUS_CONFIRMED:
+                    continuity_score = 0.0
+                    conflicting_candidate_ids.add(int(participant_id))
+            candidate_payload["temporal_continuity_score"] = float(clamp_score(continuity_score))
+        segment["temporal_conflicting_candidate_ids"] = sorted(conflicting_candidate_ids)
+    return segment_candidates
+
+
+def compute_evidence_agreement_score(segment: dict, participant_id: int) -> float:
+    score = 0.15
+    best_audio_participant_id = segment.get("best_audio_participant_id")
+    best_ui_participant_id = segment.get("best_ui_participant_id")
+    best_caption_participant_id = segment.get("best_caption_participant_id")
+    caption_match_type = segment.get("caption_match_type")
+    if participant_id == best_audio_participant_id and participant_id == best_ui_participant_id and participant_id is not None:
+        score += 0.55
+    elif participant_id in {best_audio_participant_id, best_ui_participant_id}:
+        score += 0.25
+    if participant_id == best_caption_participant_id:
+        if caption_match_type == "exact":
+            score += 0.15
+        elif caption_match_type == "fuzzy":
+            score += 0.10
+    if (
+        best_audio_participant_id is not None
+        and best_ui_participant_id is not None
+        and best_audio_participant_id != best_ui_participant_id
+        and participant_id in {best_audio_participant_id, best_ui_participant_id}
+    ):
+        score -= 0.20
+    if segment.get("multi_active_claim") and participant_id == best_ui_participant_id:
+        score -= 0.10
+    return clamp_score(score)
+
+
+def build_segment_evidence_graph(
+    segments: list[dict],
+    assigned_turns: list[dict],
+    activity_windows: list[dict],
+    canonical_captions: list[dict],
+    participant_rows: list[sqlite3.Row],
+    participant_ids: list[int],
+    reference_assignments: list[dict] | None = None,
+) -> list[dict]:
+    segment_candidates = collect_segment_candidates(
+        segments,
+        assigned_turns,
+        participant_ids,
+        activity_windows,
+    )
+    segment_candidates = attach_segment_caption_scores(segment_candidates, canonical_captions, participant_rows)
+    segment_candidates = attach_segment_temporal_scores(segment_candidates, reference_assignments)
+    for segment in segment_candidates:
+        for participant_id, candidate_payload in segment["candidate_participants"].items():
+            evidence_agreement_score = compute_evidence_agreement_score(segment, int(participant_id))
+            candidate_payload["evidence_agreement_score"] = float(evidence_agreement_score)
+            candidate_payload["final_score"] = float(
+                clamp_score(
+                    (0.40 * float(candidate_payload.get("audio_identity_score") or 0.0))
+                    + (0.35 * float(candidate_payload.get("ui_activity_score") or 0.0))
+                    + (0.15 * float(candidate_payload.get("caption_name_score") or 0.0))
+                    + (0.10 * float(candidate_payload.get("temporal_continuity_score") or 0.0))
+                )
+            )
+    return segment_candidates
+
+
+def build_reason_codes_for_segment(segment: dict) -> list[str]:
+    reason_codes = list(segment.get("reason_codes") or [])
+    best_audio_participant_id = segment.get("best_audio_participant_id")
+    best_ui_participant_id = segment.get("best_ui_participant_id")
+    best_caption_participant_id = segment.get("best_caption_participant_id")
+    candidate_participants = segment.get("candidate_participants") or {}
+    audio_scores = {
+        participant_id: float(payload.get("audio_identity_score") or 0.0)
+        for participant_id, payload in candidate_participants.items()
+    }
+    ui_scores = {
+        participant_id: float(payload.get("ui_activity_score") or 0.0)
+        for participant_id, payload in candidate_participants.items()
+    }
+    _best_audio, best_audio_score, audio_margin, _ = best_score_details(audio_scores)
+    _best_ui, best_ui_score, ui_margin, _ = best_score_details(ui_scores)
+
+    strong_audio_conflict = (
+        best_audio_participant_id is not None
+        and best_ui_participant_id is not None
+        and best_audio_participant_id != best_ui_participant_id
+        and best_audio_score >= HYBRID_STRONG_CONFLICT_PRIMARY_FLOOR
+        and best_ui_score >= HYBRID_STRONG_CONFLICT_PRIMARY_FLOOR
+        and audio_margin >= HYBRID_STRONG_CONFLICT_MARGIN_FLOOR
+        and ui_margin >= HYBRID_STRONG_CONFLICT_MARGIN_FLOOR
+    )
+    if strong_audio_conflict and HYBRID_REASON_CODE_UI_AUDIO_CONFLICT not in reason_codes:
+        reason_codes.append(HYBRID_REASON_CODE_UI_AUDIO_CONFLICT)
+    if (
+        best_caption_participant_id is not None
+        and best_ui_participant_id is not None
+        and best_caption_participant_id != best_ui_participant_id
+        and HYBRID_REASON_CODE_UI_CAPTION_CONFLICT not in reason_codes
+    ):
+        reason_codes.append(HYBRID_REASON_CODE_UI_CAPTION_CONFLICT)
+    if (
+        best_caption_participant_id is not None
+        and best_audio_participant_id is not None
+        and best_caption_participant_id != best_audio_participant_id
+        and HYBRID_REASON_CODE_CAPTION_AUDIO_CONFLICT not in reason_codes
+    ):
+        reason_codes.append(HYBRID_REASON_CODE_CAPTION_AUDIO_CONFLICT)
+    return reason_codes
+
+
+def dominant_review_type(reason_codes: list[str]) -> str | None:
+    if HYBRID_REASON_CODE_MULTI_ACTIVE in reason_codes:
+        return HYBRID_REVIEW_TYPE_MULTI_ACTIVE
+    if HYBRID_REASON_CODE_UI_AUDIO_CONFLICT in reason_codes:
+        return HYBRID_REVIEW_TYPE_UI_AUDIO_CONFLICT
+    if HYBRID_REASON_CODE_UI_CAPTION_CONFLICT in reason_codes:
+        return HYBRID_REVIEW_TYPE_UI_CAPTION_CONFLICT
+    if HYBRID_REASON_CODE_CAPTION_AUDIO_CONFLICT in reason_codes:
+        return HYBRID_REVIEW_TYPE_CAPTION_AUDIO_CONFLICT
+    if HYBRID_REASON_CODE_LOW_EVIDENCE in reason_codes or HYBRID_REASON_CODE_NO_SIGNAL in reason_codes:
+        return HYBRID_REVIEW_TYPE_LOW_EVIDENCE
+    return None
+
+
+def resolve_segment_assignment(segment_evidence: dict) -> dict:
+    candidate_participants = segment_evidence.get("candidate_participants") or {}
+    ranked_candidates = sorted(
+        candidate_participants.items(),
+        key=lambda item: (float(item[1].get("final_score") or 0.0), -int(item[0])),
+        reverse=True,
+    )
+    chosen_participant_id = int(ranked_candidates[0][0]) if ranked_candidates else None
+    chosen_payload = ranked_candidates[0][1] if ranked_candidates else {}
+    final_score = float(chosen_payload.get("final_score") or 0.0)
+    audio_scores = {
+        participant_id: float(payload.get("audio_identity_score") or 0.0)
+        for participant_id, payload in candidate_participants.items()
+    }
+    ui_scores = {
+        participant_id: float(payload.get("ui_activity_score") or 0.0)
+        for participant_id, payload in candidate_participants.items()
+    }
+    best_audio_participant_id = segment_evidence.get("best_audio_participant_id")
+    best_ui_participant_id = segment_evidence.get("best_ui_participant_id")
+    best_audio_participant_id, best_audio_score, audio_margin, _ = best_score_details(audio_scores)
+    best_ui_participant_id, best_ui_score, ui_margin, _ = best_score_details(ui_scores)
+
+    primary_signal_available = any(
+        max(float(payload.get("audio_identity_score") or 0.0), float(payload.get("ui_activity_score") or 0.0)) >= HYBRID_NO_SIGNAL_PRIMARY_FLOOR
+        for payload in candidate_participants.values()
+    )
+    reason_codes = build_reason_codes_for_segment(segment_evidence)
+    if not primary_signal_available and HYBRID_REASON_CODE_NO_SIGNAL not in reason_codes:
+        reason_codes.append(HYBRID_REASON_CODE_NO_SIGNAL)
+
+    strong_conflict = HYBRID_REASON_CODE_UI_AUDIO_CONFLICT in reason_codes
+    if chosen_participant_id is not None and chosen_participant_id in candidate_participants:
+        selected_audio_score = float(candidate_participants[chosen_participant_id].get("audio_identity_score") or 0.0)
+        selected_ui_score = float(candidate_participants[chosen_participant_id].get("ui_activity_score") or 0.0)
+        evidence_agreement_score = float(candidate_participants[chosen_participant_id].get("evidence_agreement_score") or 0.0)
+    else:
+        selected_audio_score = 0.0
+        selected_ui_score = 0.0
+        evidence_agreement_score = 0.0
+
+    primary_channel = "ui" if selected_ui_score >= selected_audio_score else "audio"
+    selected_margin = ui_margin if primary_channel == "ui" else audio_margin
+    primary_conflict_from_other_channel = (
+        (primary_channel == "ui" and best_audio_participant_id is not None and best_audio_participant_id != chosen_participant_id and best_audio_score >= HYBRID_STRONG_CONFLICT_PRIMARY_FLOOR and audio_margin >= HYBRID_STRONG_CONFLICT_MARGIN_FLOOR)
+        or (primary_channel == "audio" and best_ui_participant_id is not None and best_ui_participant_id != chosen_participant_id and best_ui_score >= HYBRID_STRONG_CONFLICT_PRIMARY_FLOOR and ui_margin >= HYBRID_STRONG_CONFLICT_MARGIN_FLOOR)
+    )
+
+    speaker_resolution_status = HYBRID_SPEAKER_STATUS_UNKNOWN
+    assignment_method = HYBRID_ASSIGNMENT_METHOD_UNKNOWN_LOW_EVIDENCE if primary_signal_available else HYBRID_ASSIGNMENT_METHOD_UNKNOWN_NO_SIGNAL
+    needs_speaker_review = True
+    participant_id: int | None = None
+
+    confirmed = False
+    if chosen_participant_id is not None and final_score >= HYBRID_CONFIRMED_FINAL_SCORE_FLOOR:
+        if chosen_participant_id in {best_audio_participant_id, best_ui_participant_id} and not primary_conflict_from_other_channel:
+            if primary_channel == "audio":
+                confirmed = (
+                    selected_audio_score >= HYBRID_CONFIRMED_AUDIO_SCORE_FLOOR
+                    and selected_margin >= HYBRID_CONFIRMED_AUDIO_MARGIN_FLOOR
+                    and evidence_agreement_score >= 0.45
+                )
+                if not confirmed and selected_margin < HYBRID_CONFIRMED_AUDIO_MARGIN_FLOOR and HYBRID_REASON_CODE_WEAK_AUDIO_MARGIN not in reason_codes:
+                    reason_codes.append(HYBRID_REASON_CODE_WEAK_AUDIO_MARGIN)
+            else:
+                confirmed = (
+                    selected_ui_score >= HYBRID_CONFIRMED_UI_SCORE_FLOOR
+                    and selected_margin >= HYBRID_CONFIRMED_UI_MARGIN_FLOOR
+                    and evidence_agreement_score >= 0.45
+                )
+                if not confirmed and selected_margin < HYBRID_CONFIRMED_UI_MARGIN_FLOOR and HYBRID_REASON_CODE_WEAK_UI_MARGIN not in reason_codes:
+                    reason_codes.append(HYBRID_REASON_CODE_WEAK_UI_MARGIN)
+
+    if confirmed and not strong_conflict:
+        speaker_resolution_status = HYBRID_SPEAKER_STATUS_CONFIRMED
+        assignment_method = HYBRID_ASSIGNMENT_METHOD_CONFIRMED
+        needs_speaker_review = False
+        participant_id = chosen_participant_id
+    elif strong_conflict:
+        speaker_resolution_status = HYBRID_SPEAKER_STATUS_CONFLICTED
+        assignment_method = HYBRID_ASSIGNMENT_METHOD_CONFLICTED
+        needs_speaker_review = True
+        participant_id = None
+    elif chosen_participant_id is not None and final_score >= HYBRID_PROVISIONAL_FINAL_SCORE_FLOOR:
+        if (
+            chosen_participant_id == best_ui_participant_id
+            and ui_margin >= HYBRID_PROVISIONAL_UI_MARGIN_FLOOR
+            and not primary_conflict_from_other_channel
+        ):
+            speaker_resolution_status = HYBRID_SPEAKER_STATUS_UI_PROVISIONAL
+            assignment_method = HYBRID_ASSIGNMENT_METHOD_UI_PROVISIONAL
+            participant_id = chosen_participant_id
+            needs_speaker_review = bool(
+                segment_evidence.get("multi_active_claim")
+                or HYBRID_REASON_CODE_UI_CAPTION_CONFLICT in reason_codes
+                or evidence_agreement_score < 0.40
+            )
+        elif (
+            chosen_participant_id == best_audio_participant_id
+            and audio_margin >= HYBRID_PROVISIONAL_AUDIO_MARGIN_FLOOR
+            and not primary_conflict_from_other_channel
+        ):
+            speaker_resolution_status = HYBRID_SPEAKER_STATUS_AUDIO_PROVISIONAL
+            assignment_method = HYBRID_ASSIGNMENT_METHOD_AUDIO_PROVISIONAL
+            participant_id = chosen_participant_id
+            needs_speaker_review = bool(
+                segment_evidence.get("multi_active_claim")
+                or HYBRID_REASON_CODE_CAPTION_AUDIO_CONFLICT in reason_codes
+                or evidence_agreement_score < 0.40
+            )
+        else:
+            if HYBRID_REASON_CODE_LOW_EVIDENCE not in reason_codes:
+                reason_codes.append(HYBRID_REASON_CODE_LOW_EVIDENCE)
+    else:
+        if primary_signal_available and HYBRID_REASON_CODE_LOW_EVIDENCE not in reason_codes:
+            reason_codes.append(HYBRID_REASON_CODE_LOW_EVIDENCE)
+
+    if chosen_participant_id is not None and chosen_participant_id in set(segment_evidence.get("temporal_conflicting_candidate_ids") or []):
+        if HYBRID_REASON_CODE_TEMPORAL_CONFLICT not in reason_codes:
+            reason_codes.append(HYBRID_REASON_CODE_TEMPORAL_CONFLICT)
+
+    if speaker_resolution_status == HYBRID_SPEAKER_STATUS_UNKNOWN and not primary_signal_available:
+        assignment_method = HYBRID_ASSIGNMENT_METHOD_UNKNOWN_NO_SIGNAL
+        participant_id = None
+    elif speaker_resolution_status == HYBRID_SPEAKER_STATUS_UNKNOWN:
+        assignment_method = HYBRID_ASSIGNMENT_METHOD_UNKNOWN_LOW_EVIDENCE
+        participant_id = None
+
+    if any(
+        reason_code in reason_codes
+        for reason_code in (
+            HYBRID_REASON_CODE_MULTI_ACTIVE,
+            HYBRID_REASON_CODE_UI_CAPTION_CONFLICT,
+            HYBRID_REASON_CODE_CAPTION_AUDIO_CONFLICT,
+            HYBRID_REASON_CODE_TEMPORAL_CONFLICT,
+        )
+    ):
+        needs_speaker_review = True
+
+    review_type = dominant_review_type(reason_codes)
+    if needs_speaker_review and review_type is None:
+        review_type = HYBRID_REVIEW_TYPE_LOW_EVIDENCE
+
+    return {
+        "segment_id": segment_evidence["segment_id"],
+        "chosen_participant_id": participant_id,
+        "participant_id": participant_id,
+        "speaker_resolution_status": speaker_resolution_status,
+        "assignment_method": assignment_method,
+        "assignment_confidence": final_score,
+        "needs_speaker_review": needs_speaker_review,
+        "review_type": review_type,
+        "reason_codes": reason_codes,
+        "final_score": final_score,
+        "best_audio_participant_id": best_audio_participant_id,
+        "best_ui_participant_id": best_ui_participant_id,
+        "best_caption_participant_id": segment_evidence.get("best_caption_participant_id"),
+        "multi_active_claim": bool(segment_evidence.get("multi_active_claim")),
+    }
+
+
+def materialize_hybrid_segments(
+    evidence_graph: list[dict],
+    source_audio_path: Path,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    final_segments: list[dict] = []
+    segment_candidate_summary: list[dict] = []
+    final_decision_summary: list[dict] = []
+    for segment in evidence_graph:
+        resolution = resolve_segment_assignment(segment)
+        candidate_ids_sorted = [
+            participant_id
+            for participant_id, _payload in sorted(
+                segment["candidate_participants"].items(),
+                key=lambda item: (float(item[1].get("final_score") or 0.0), -int(item[0])),
+                reverse=True,
+            )
+        ]
+        cluster_lineage = None
+        if segment.get("source_turn_ids"):
+            cluster_lineage = segment["source_turn_ids"][0]
+        final_segments.append(
+            {
+                **segment,
+                "participant_id": resolution["participant_id"],
+                "participant_audio_asset_id": None,
+                "assignment_method": resolution["assignment_method"],
+                "assignment_confidence": resolution["assignment_confidence"],
+                "speaker_resolution_status": resolution["speaker_resolution_status"],
+                "needs_speaker_review": resolution["needs_speaker_review"],
+                "resolution_status": (
+                    TRANSCRIPT_STATUS_PENDING_REVIEW if resolution["needs_speaker_review"] else TRANSCRIPT_STATUS_ORIGINAL
+                ),
+                "source_audio_path": source_audio_path,
+                "cluster_lineage": cluster_lineage,
+                "review_type": resolution["review_type"],
+                "reason_codes": resolution["reason_codes"],
+                "multi_active_claim": resolution["multi_active_claim"],
+            }
+        )
+        segment_candidate_summary.append(
+            {
+                "segment_id": segment["segment_id"],
+                "start_offset_ms": segment["start_offset_ms"],
+                "end_offset_ms": segment["end_offset_ms"],
+                "candidate_participant_ids": candidate_ids_sorted,
+                "candidate_scores": {
+                    str(participant_id): {
+                        "audio_identity_score": float(payload.get("audio_identity_score") or 0.0),
+                        "ui_activity_score": float(payload.get("ui_activity_score") or 0.0),
+                        "caption_name_score": float(payload.get("caption_name_score") or 0.0),
+                        "temporal_continuity_score": float(payload.get("temporal_continuity_score") or 0.0),
+                        "evidence_agreement_score": float(payload.get("evidence_agreement_score") or 0.0),
+                        "final_score": float(payload.get("final_score") or 0.0),
+                    }
+                    for participant_id, payload in sorted(
+                        segment["candidate_participants"].items(),
+                        key=lambda item: int(item[0]),
+                    )
+                },
+                "best_audio_participant_id": segment.get("best_audio_participant_id"),
+                "best_ui_participant_id": segment.get("best_ui_participant_id"),
+                "best_caption_participant_id": segment.get("best_caption_participant_id"),
+                "caption_match_type": segment.get("caption_match_type") if segment.get("caption_match_type") in HYBRID_CAPTION_MATCH_TYPES else "none",
+                "chosen_participant_id": resolution["chosen_participant_id"],
+                "speaker_resolution_status": resolution["speaker_resolution_status"],
+                "assignment_method": resolution["assignment_method"],
+                "reason_codes": resolution["reason_codes"],
+            }
+        )
+        final_decision_summary.append(
+            {
+                "segment_id": segment["segment_id"],
+                "chosen_participant_id": resolution["chosen_participant_id"],
+                "speaker_resolution_status": resolution["speaker_resolution_status"],
+                "assignment_method": resolution["assignment_method"],
+                "needs_speaker_review": resolution["needs_speaker_review"],
+                "review_type": resolution["review_type"],
+                "reason_codes": resolution["reason_codes"],
+            }
+        )
+    return final_segments, segment_candidate_summary, final_decision_summary
 
 
 def build_audio_primary_segments(
@@ -3408,6 +4182,8 @@ def build_audio_primary_segments(
     audio_source_id: int | None,
     participant_rows: list[sqlite3.Row],
     activity_rows: list[sqlite3.Row],
+    meeting_row: sqlite3.Row | None = None,
+    canonical_captions: list[dict] | None = None,
 ) -> tuple[list[dict], dict]:
     whisper_result = load_whisperx_result(source_audio_path, meeting_id)
     master_segments = build_segments_from_whisper_result(
@@ -3416,7 +4192,7 @@ def build_audio_primary_segments(
         participant_audio_asset_id=None,
         audio_source_id=audio_source_id,
         base_offset_ms=0,
-        assignment_method="audio_cluster_match_review",
+        assignment_method=HYBRID_ASSIGNMENT_METHOD_UNKNOWN_LOW_EVIDENCE,
         assignment_confidence=0.0,
         needs_speaker_review=True,
         source_audio_path=source_audio_path,
@@ -3459,45 +4235,112 @@ def build_audio_primary_segments(
     if not participant_ids:
         raise RuntimeError("Toplantıda eşlenecek görünür participant bulunamadı.")
 
-    cluster_dom_priors = build_cluster_dom_priors(diarized_turns)
-    participant_profiles = build_participant_profiles(diarized_turns, participant_ids)
+    activity_windows = normalize_speaker_activity_events(activity_rows)
+    caption_entries = build_caption_timeline(canonical_captions or [], meeting_row)
+    participant_profiles = build_initial_hybrid_profiles(diarized_turns, participant_ids)
     update_meeting_postprocess_status(
         meeting_id,
         POSTPROCESS_STATUS_ASSEMBLING_SEGMENTS,
         None,
         None,
-        "Konuşmacılar audio cluster'larla eşleştiriliyor",
+        "Konuşmacılar hibrit kanıtlarla eşleştiriliyor",
     )
-    assigned_turns, cluster_memory, participant_profiles, pass_history = run_iterative_turn_assignment(
+    pass1_turns, pass1_turn_local_summary = score_turns_locally(
         diarized_turns,
         participant_ids,
         participant_profiles,
         cluster_prototypes,
-        cluster_dom_priors,
-        global_dom_priors,
     )
-    final_segments, turn_to_segment_links = align_segments_to_turns(
+    pass1_graph = build_segment_evidence_graph(
         master_segments,
-        assigned_turns,
-        cluster_memory,
-        cluster_prototypes,
+        pass1_turns,
+        activity_windows,
+        caption_entries,
+        participant_rows,
+        participant_ids,
+    )
+    provisional_segments, pass1_segment_candidate_summary, pass1_final_decision_summary = materialize_hybrid_segments(
+        pass1_graph,
         source_audio_path,
     )
+    turns_by_id = {turn["turn_id"]: turn for turn in pass1_turns}
+    participant_profiles = refresh_hybrid_participant_profiles(
+        turns_by_id,
+        provisional_segments,
+        participant_profiles,
+    )
+    pass2_turns, turn_local_summary = score_turns_locally(
+        diarized_turns,
+        participant_ids,
+        participant_profiles,
+        cluster_prototypes,
+    )
+    pass2_graph = build_segment_evidence_graph(
+        master_segments,
+        pass2_turns,
+        activity_windows,
+        caption_entries,
+        participant_rows,
+        participant_ids,
+        reference_assignments=pass1_final_decision_summary,
+    )
+    final_segments, segment_candidate_summary, final_decision_summary = materialize_hybrid_segments(
+        pass2_graph,
+        source_audio_path,
+    )
+    reason_counts: dict[str, int] = defaultdict(int)
+    for decision in final_decision_summary:
+        for reason_code in decision.get("reason_codes") or []:
+            reason_counts[str(reason_code)] += 1
+
+    def sanitize_turn(turn: dict) -> dict:
+        return {
+            "turn_id": turn["turn_id"],
+            "speaker_label": turn["speaker_label"],
+            "start_offset_ms": turn["start_offset_ms"],
+            "end_offset_ms": turn["end_offset_ms"],
+            "duration_ms": turn.get("duration_ms"),
+            "speech_ratio": turn.get("speech_ratio"),
+            "overlap_flag": bool(turn.get("overlap_flag")),
+            "conflicted_claim": bool(turn.get("conflicted_claim")),
+            "best_audio_participant_id": turn.get("best_audio_participant_id"),
+            "best_ui_participant_id": turn.get("best_ui_participant_id"),
+            "audio_margin": float(turn.get("audio_margin") or 0.0),
+            "ui_margin": float(turn.get("ui_margin") or 0.0),
+        }
+
+    def sanitize_cluster_prototype(prototype: dict) -> dict:
+        return {
+            "speaker_label": prototype.get("speaker_label"),
+            "purity": prototype.get("purity"),
+            "coverage_ms": prototype.get("coverage_ms"),
+            "turn_count": prototype.get("turn_count"),
+            "prototype_turn_ids": prototype.get("prototype_turn_ids"),
+            "base_label": prototype.get("base_label"),
+            "split_applied": prototype.get("split_applied"),
+            "impure": prototype.get("impure"),
+        }
+
     return final_segments, {
         "transcript_segment_count": len(master_segments),
         "diarized_turn_count": len(diarized_turns),
         "profile_count": len(participant_profiles),
-        "pass_count": len(pass_history),
-        "diarized_turns": diarized_turns,
-        "profiles": participant_profiles,
-        "cluster_prototypes": cluster_prototypes,
+        "pass_count": 2,
+        "diarized_turns": [sanitize_turn(turn) for turn in diarized_turns],
+        "cluster_prototypes": {
+            label: sanitize_cluster_prototype(payload)
+            for label, payload in cluster_prototypes.items()
+        },
         "cluster_split_lineage": cluster_split_lineage,
-        "cluster_memory": cluster_memory,
-        "cluster_dom_priors": cluster_dom_priors,
-        "pass_history": pass_history,
+        "normalized_activity_windows": activity_windows,
+        "turn_local_summary": turn_local_summary,
+        "pass1_turn_local_summary": pass1_turn_local_summary,
+        "pass1_segment_candidate_summary": pass1_segment_candidate_summary,
+        "segment_candidate_summary": segment_candidate_summary,
+        "final_decision_summary": final_decision_summary,
+        "reason_counts": dict(reason_counts),
         "global_dom_priors": global_dom_priors,
-        "assigned_turns": assigned_turns,
-        "turn_to_segment_links": turn_to_segment_links,
+        "assigned_turns": [sanitize_turn(turn) for turn in pass2_turns],
     }
 
 
@@ -3585,6 +4428,12 @@ def transcribe_mixed_fallback(
         item["participant_id"] = participant_id
         item["assignment_method"] = assignment_method
         item["assignment_confidence"] = assignment_confidence
+        if participant_id is None:
+            item["speaker_resolution_status"] = HYBRID_SPEAKER_STATUS_UNKNOWN
+        elif needs_review:
+            item["speaker_resolution_status"] = HYBRID_SPEAKER_STATUS_UI_PROVISIONAL
+        else:
+            item["speaker_resolution_status"] = HYBRID_SPEAKER_STATUS_CONFIRMED
         item["needs_speaker_review"] = needs_review
         item["resolution_status"] = (
             TRANSCRIPT_STATUS_PENDING_REVIEW if needs_review else TRANSCRIPT_STATUS_ORIGINAL
@@ -3627,6 +4476,10 @@ def build_transcript_segments(participant_segments: list[dict], mixed_segments: 
             previous["end_offset_ms"] = max(previous["end_offset_ms"], segment["end_offset_ms"])
             previous["needs_speaker_review"] = previous["needs_speaker_review"] or segment["needs_speaker_review"]
             previous["assignment_confidence"] = max(previous["assignment_confidence"], segment["assignment_confidence"])
+            previous["reason_codes"] = sorted(
+                set(previous.get("reason_codes") or []).union(segment.get("reason_codes") or [])
+            )
+            previous["review_type"] = previous.get("review_type") or segment.get("review_type")
             continue
         deduped.append(segment)
     annotate_overlap_groups(deduped)
@@ -3639,6 +4492,7 @@ def create_segment_review_item(
     conn: sqlite3.Connection,
     transcript_id: int,
     transcript_segment_id: int,
+    review_type: str,
     current_text: str,
     suggested_text: str,
     confidence: float,
@@ -3669,7 +4523,7 @@ def create_segment_review_item(
         (
             transcript_id,
             transcript_segment_id,
-            "speaker_assignment",
+            review_type,
             "speaker",
             current_text,
             suggested_text,
@@ -3746,12 +4600,13 @@ def persist_transcript_segments(
                     asr_confidence,
                     assignment_method,
                     assignment_confidence,
+                    speaker_resolution_status,
                     overlap_group_id,
                     needs_speaker_review,
                     resolution_status,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     meeting_id,
@@ -3767,6 +4622,7 @@ def persist_transcript_segments(
                     segment.get("asr_confidence"),
                     segment["assignment_method"],
                     segment["assignment_confidence"],
+                    segment.get("speaker_resolution_status", HYBRID_SPEAKER_STATUS_UNKNOWN),
                     segment.get("overlap_group_id"),
                     1 if segment["needs_speaker_review"] else 0,
                     segment["resolution_status"],
@@ -3783,6 +4639,7 @@ def persist_transcript_segments(
                 conn,
                 transcript_id,
                 transcript_segment_id,
+                segment.get("review_type") or HYBRID_REVIEW_TYPE_LOW_EVIDENCE,
                 segment["text"],
                 speaker,
                 max(0.0, min(1.0, segment["assignment_confidence"])),
@@ -4033,12 +4890,22 @@ def process_meeting(meeting_id: int):
         "Participant registry ve speaker activity baglaniyor",
     )
     participant_rows, activity_rows, audio_source_rows = fetch_participant_context(meeting_id)
+    caption_rows = fetch_caption_events(meeting_id)
+    legacy_transcript_rows = fetch_legacy_transcripts(meeting_id)
+    canonical_caption_rows = canonicalize_caption_events(caption_rows) if caption_rows else []
+    legacy_canonical_rows = (
+        canonicalize_caption_events(build_events_from_legacy_transcripts(legacy_transcript_rows))
+        if legacy_transcript_rows
+        else []
+    )
     persist_json(
         get_teams_canonical_path(meeting_id),
         {
             "participants": [dict(row) for row in participant_rows],
             "speaker_activity": [dict(row) for row in activity_rows],
             "audio_sources": [dict(row) for row in audio_source_rows],
+            "captions": canonical_caption_rows,
+            "legacy_captions": legacy_canonical_rows,
         },
     )
 
@@ -4075,9 +4942,12 @@ def process_meeting(meeting_id: int):
         mixed_source_id,
         participant_rows,
         activity_rows,
+        meeting_row=meeting,
+        canonical_captions=canonical_caption_rows,
     )
     final_segments = build_transcript_segments(final_segments, [])
     clear_previous_outputs(meeting_id)
+    get_meeting_artifact_path(meeting_id, "speaker_profiles.json").unlink(missing_ok=True)
     persist_json(
         get_whisperx_result_path(meeting_id),
         {
@@ -4100,27 +4970,15 @@ def process_meeting(meeting_id: int):
         },
     )
     persist_json(
-        get_meeting_artifact_path(meeting_id, "speaker_profiles.json"),
-        assignment_debug.get("profiles", {}),
-    )
-    persist_json(
         get_meeting_artifact_path(meeting_id, "speaker_assignment_debug.json"),
         {
-            "cluster_memory": assignment_debug.get("cluster_memory", {}),
-            "cluster_dom_priors": assignment_debug.get("cluster_dom_priors", {}),
-            "cluster_prototypes": assignment_debug.get("cluster_prototypes", {}),
-            "cluster_purity": {
-                label: payload.get("purity")
-                for label, payload in assignment_debug.get("cluster_prototypes", {}).items()
-            },
-            "cluster_split_lineage": assignment_debug.get("cluster_split_lineage", {}),
-            "turn_to_segment_links": assignment_debug.get("turn_to_segment_links", []),
-            "pass_history": assignment_debug.get("pass_history", []),
-            "global_dom_priors": assignment_debug.get("global_dom_priors", {}),
-            "profile_source_kind": {
-                participant_id: payload.get("source_kind")
-                for participant_id, payload in assignment_debug.get("profiles", {}).items()
-            },
+            "normalized_activity_windows": assignment_debug.get("normalized_activity_windows", []),
+            "turn_local_summary": assignment_debug.get("turn_local_summary", []),
+            "segment_candidate_summary": assignment_debug.get("segment_candidate_summary", []),
+            "final_decision_summary": assignment_debug.get("final_decision_summary", []),
+            "reason_counts": assignment_debug.get("reason_counts", {}),
+            "pass1_turn_local_summary": assignment_debug.get("pass1_turn_local_summary", []),
+            "pass1_segment_candidate_summary": assignment_debug.get("pass1_segment_candidate_summary", []),
         },
     )
 
