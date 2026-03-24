@@ -7,9 +7,11 @@ import os
 import re
 import shutil
 import sqlite3
+import statistics
 import subprocess
 import sys
 import wave
+from collections import defaultdict
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -46,6 +48,7 @@ from backend.runtime.constants import (  # noqa: E402
 from backend.runtime.participant_names import is_roster_heading_name  # noqa: E402
 from backend.runtime.paths import (  # noqa: E402
     get_alignment_map_path,
+    get_meeting_artifact_path,
     db_path as get_db_path,
     get_participant_audio_asset_path,
     get_meeting_pcm_audio_path,
@@ -79,6 +82,42 @@ LATE_REPLAY_SLOT_RESET_MIN_SEEN = 8
 LATE_REPLAY_LOOKBACK_ROWS = 160
 FINAL_ROW_DEFENSIVE_DUPLICATE_WINDOW_SECONDS = 180.0
 FINAL_ROW_DEFENSIVE_LOOKBACK_ROWS = 96
+PYANNOTE_DIARIZATION_MODEL_DEFAULT = "pyannote/speaker-diarization-3.1"
+PYANNOTE_EMBEDDING_MODEL_DEFAULT = "pyannote/embedding"
+MIN_DIARIZED_TURN_MS = 800
+DIARIZATION_MERGE_GAP_MS = 500
+MIN_SEED_TURN_MS = 1500
+MIN_SEED_SPEECH_RATIO = 0.60
+MIN_SEED_PRIOR = 0.55
+MIN_SEED_MARGIN = 0.15
+RELAXED_SEED_TURN_MS = 1000
+RELAXED_SEED_SPEECH_RATIO = 0.50
+RELAXED_SEED_PRIOR = 0.35
+RELAXED_SEED_MARGIN = 0.05
+CLUSTER_BOOTSTRAP_PRIOR = 0.33
+CLUSTER_BOOTSTRAP_MARGIN = 0.08
+MAX_PROFILE_SEED_TURNS = 20
+PROFILE_OUTLIER_TOLERANCE = 0.12
+CLUSTER_CONFIRM_SCORE = 0.68
+CLUSTER_CONFIRM_MARGIN = 0.12
+CLUSTER_CONFIRM_DURATION_MS = 4000
+CLUSTER_CONFIRM_TURN_COUNT = 2
+CLUSTER_REMAP_MARGIN = 0.18
+CLUSTER_REMAP_TURN_COUNT = 2
+MIN_UNRESOLVED_ASSIGNMENT_SCORE = 0.33
+MIN_UNRESOLVED_DOM_SIGNAL = 0.28
+MAX_ASSIGNMENT_PASSES = 4
+SEGMENT_SINGLE_TURN_DOMINANCE_RATIO = 0.70
+SEGMENT_SPLIT_MIN_OVERLAP_RATIO = 0.15
+SEGMENT_SPLIT_MIN_OVERLAP_MS = 350
+CLUSTER_PROTOTYPE_TURN_MS = 1000
+CLUSTER_PROTOTYPE_SPEECH_RATIO = 0.55
+CLUSTER_IMPURE_PURITY = 0.80
+CLUSTER_IMPURE_DOM_MARGIN = 0.10
+CLUSTER_IMPURE_COVERAGE_MS = 8000
+CLUSTER_SPLIT_CHILD_SIMILARITY = 0.82
+CLUSTER_SPLIT_MIN_COVERAGE_MS = 2500
+CLUSTER_SPLIT_MIN_TURNS = 2
 
 def configure_runtime_environment():
     os.environ.setdefault("MPLCONFIGDIR", str(runtime_cache_dir("matplotlib")))
@@ -161,12 +200,24 @@ def huggingface_model_snapshot_path(repo_id: str) -> Path | None:
     return snapshots[-1]
 
 
-def dependency_error_message(require_whisperx: bool) -> str | None:
+def module_spec_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def dependency_error_message(require_whisperx: bool, require_pyannote: bool = False) -> str | None:
     if require_whisperx and importlib.util.find_spec("whisperx") is None:
         return (
             "WhisperX kurulu değil. "
             "`conda activate teams-bot && python -m pip install -r backend/requirements.txt` "
             "veya `python -m pip install whisperx` çalıştırın."
+        )
+    if require_pyannote and not module_spec_available("pyannote.audio"):
+        return (
+            "pyannote.audio kurulu değil. "
+            "`conda activate teams-bot && python -m pip install -r backend/requirements.txt` çalıştırın."
         )
     if require_whisperx and shutil.which("ffmpeg") is None:
         return "ffmpeg bulunamadı. Sistem PATH içinde ffmpeg kurulu olmalı."
@@ -1822,7 +1873,7 @@ def build_segments_from_whisper_result(
     source_audio_path: Path,
 ) -> list[dict]:
     segments: list[dict] = []
-    for segment in result.get("segments", []):
+    for segment_index, segment in enumerate(result.get("segments", []), start=1):
         text = normalize_text(segment.get("text") or "")
         if not text:
             continue
@@ -1830,6 +1881,25 @@ def build_segments_from_whisper_result(
         end_sec = float(segment.get("end") or start_sec)
         if end_sec <= start_sec:
             end_sec = start_sec + 0.5
+        words: list[dict] = []
+        for word_index, word in enumerate(segment.get("words") or []):
+            word_text = normalize_text(word.get("word") or "")
+            if not word_text:
+                continue
+            word_start = word.get("start")
+            word_end = word.get("end")
+            if word_start is None or word_end is None:
+                continue
+            word_start_ms = max(0, int(round(base_offset_ms + (float(word_start) * 1000))))
+            word_end_ms = max(word_start_ms + 1, int(round(base_offset_ms + (float(word_end) * 1000))))
+            words.append(
+                {
+                    "word_index": word_index,
+                    "text": word_text,
+                    "start_offset_ms": word_start_ms,
+                    "end_offset_ms": word_end_ms,
+                }
+            )
         segments.append(
             {
                 "participant_id": participant_id,
@@ -1849,9 +1919,1586 @@ def build_segments_from_whisper_result(
                 ),
                 "source_audio_path": source_audio_path,
                 "overlap_group_id": None,
+                "source_segment_index": segment_index,
+                "words": words,
+                "cluster_lineage": None,
             }
         )
     return segments
+
+
+def clamp_score(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def interval_overlap_ms(start_a: int, end_a: int, start_b: int, end_b: int) -> int:
+    return max(0, min(end_a, end_b) - max(start_a, start_b))
+
+
+def normalize_score_map(score_map: dict[int, float]) -> dict[int, float]:
+    total = sum(max(0.0, float(score)) for score in score_map.values())
+    if total <= 0:
+        return {participant_id: 0.0 for participant_id in score_map}
+    return {
+        participant_id: clamp_score(max(0.0, float(score)) / total)
+        for participant_id, score in score_map.items()
+    }
+
+
+def flatten_numeric_sequence(value) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().tolist()
+    elif hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        flattened: list[float] = []
+        for item in value:
+            flattened.extend(flatten_numeric_sequence(item))
+        return flattened
+    return []
+
+
+def normalize_embedding_vector(raw_embedding) -> list[float] | None:
+    values = flatten_numeric_sequence(raw_embedding)
+    if not values:
+        return None
+    norm = sum(value * value for value in values) ** 0.5
+    if norm <= 0:
+        return None
+    return [value / norm for value in values]
+
+
+def average_embeddings(embeddings: list[list[float]]) -> list[float] | None:
+    usable = [embedding for embedding in embeddings if embedding]
+    if not usable:
+        return None
+    width = len(usable[0])
+    if width <= 0:
+        return None
+    totals = [0.0] * width
+    for embedding in usable:
+        if len(embedding) != width:
+            continue
+        for index, value in enumerate(embedding):
+            totals[index] += value
+    count = len(usable)
+    if count <= 0:
+        return None
+    averaged = [value / count for value in totals]
+    return normalize_embedding_vector(averaged)
+
+
+def cosine_similarity_vectors(left: list[float] | None, right: list[float] | None) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    return clamp_score((sum(a * b for a, b in zip(left, right)) + 1.0) / 2.0)
+
+
+def score_margin(score_map: dict[int, float]) -> float:
+    ranked = sorted(score_map.values(), reverse=True)
+    best = ranked[0] if ranked else 0.0
+    second = ranked[1] if len(ranked) > 1 else 0.0
+    return float(best - second)
+
+
+def build_cluster_prototypes(turns: list[dict]) -> dict[str, dict]:
+    grouped_turns: dict[str, list[dict]] = defaultdict(list)
+    for turn in turns:
+        grouped_turns[turn["speaker_label"]].append(turn)
+
+    prototypes: dict[str, dict] = {}
+    for label, label_turns in grouped_turns.items():
+        prototype_turns = [
+            turn
+            for turn in label_turns
+            if turn.get("embedding")
+            and int(turn.get("duration_ms") or 0) >= CLUSTER_PROTOTYPE_TURN_MS
+            and float(turn.get("speech_ratio") or 0.0) >= CLUSTER_PROTOTYPE_SPEECH_RATIO
+            and not turn.get("overlap_flag")
+        ]
+        if not prototype_turns:
+            prototype_turns = [turn for turn in label_turns if turn.get("embedding")]
+
+        centroid = average_embeddings([turn.get("embedding") for turn in prototype_turns])
+        similarities = [
+            cosine_similarity_vectors(turn.get("embedding"), centroid)
+            for turn in prototype_turns
+            if turn.get("embedding")
+        ]
+        cluster_dom_support: dict[int, float] = defaultdict(float)
+        for turn in label_turns:
+            duration_ms = max(int(turn.get("duration_ms") or 0), 1)
+            for participant_id, prior in (turn.get("local_dom_prior_by_participant") or {}).items():
+                cluster_dom_support[int(participant_id)] += float(prior) * duration_ms
+        cluster_dom_prior = normalize_score_map(dict(cluster_dom_support))
+        coverage_ms = sum(int(turn.get("duration_ms") or 0) for turn in label_turns)
+        purity = (sum(similarities) / len(similarities)) if similarities else 0.0
+        prototypes[label] = {
+            "speaker_label": label,
+            "centroid": centroid,
+            "purity": purity,
+            "coverage_ms": coverage_ms,
+            "turn_count": len(label_turns),
+            "prototype_turn_ids": [turn["turn_id"] for turn in prototype_turns],
+            "cluster_dom_prior": cluster_dom_prior,
+            "dom_margin": score_margin(cluster_dom_prior),
+            "base_label": label.split("#", 1)[0],
+            "split_applied": "#" in label,
+            "impure": False,
+        }
+    return prototypes
+
+
+def split_cluster_by_embeddings(label_turns: list[dict]) -> dict | None:
+    candidates = [turn for turn in label_turns if turn.get("embedding")]
+    if len(candidates) < CLUSTER_SPLIT_MIN_TURNS * 2:
+        return None
+
+    seed_pair: tuple[dict, dict] | None = None
+    lowest_similarity = 1.0
+    for index, left_turn in enumerate(candidates):
+        for right_turn in candidates[index + 1 :]:
+            similarity = cosine_similarity_vectors(left_turn.get("embedding"), right_turn.get("embedding"))
+            if similarity < lowest_similarity:
+                lowest_similarity = similarity
+                seed_pair = (left_turn, right_turn)
+    if seed_pair is None:
+        return None
+
+    center_a = seed_pair[0].get("embedding")
+    center_b = seed_pair[1].get("embedding")
+    assignments: dict[str, int] = {}
+    for _ in range(6):
+        new_assignments: dict[str, int] = {}
+        for turn in candidates:
+            similarity_a = cosine_similarity_vectors(turn.get("embedding"), center_a)
+            similarity_b = cosine_similarity_vectors(turn.get("embedding"), center_b)
+            new_assignments[turn["turn_id"]] = 0 if similarity_a >= similarity_b else 1
+        if new_assignments == assignments:
+            break
+        assignments = new_assignments
+        bucket_a = [turn.get("embedding") for turn in candidates if assignments.get(turn["turn_id"]) == 0]
+        bucket_b = [turn.get("embedding") for turn in candidates if assignments.get(turn["turn_id"]) == 1]
+        if len(bucket_a) < CLUSTER_SPLIT_MIN_TURNS or len(bucket_b) < CLUSTER_SPLIT_MIN_TURNS:
+            return None
+        center_a = average_embeddings(bucket_a)
+        center_b = average_embeddings(bucket_b)
+
+    child_turns = {
+        0: [turn for turn in candidates if assignments.get(turn["turn_id"]) == 0],
+        1: [turn for turn in candidates if assignments.get(turn["turn_id"]) == 1],
+    }
+    if any(len(turns) < CLUSTER_SPLIT_MIN_TURNS for turns in child_turns.values()):
+        return None
+
+    child_coverages = {
+        child_index: sum(int(turn.get("duration_ms") or 0) for turn in turns)
+        for child_index, turns in child_turns.items()
+    }
+    if any(coverage < CLUSTER_SPLIT_MIN_COVERAGE_MS for coverage in child_coverages.values()):
+        return None
+
+    child_centroids = {
+        0: average_embeddings([turn.get("embedding") for turn in child_turns[0]]),
+        1: average_embeddings([turn.get("embedding") for turn in child_turns[1]]),
+    }
+    if cosine_similarity_vectors(child_centroids[0], child_centroids[1]) >= CLUSTER_SPLIT_CHILD_SIMILARITY:
+        return None
+
+    return {
+        "assignments": assignments,
+        "child_centroids": child_centroids,
+        "child_coverages": child_coverages,
+    }
+
+
+def refine_impure_clusters(turns: list[dict]) -> tuple[list[dict], dict[str, dict], dict[str, dict]]:
+    base_prototypes = build_cluster_prototypes(turns)
+    turns_by_label: dict[str, list[dict]] = defaultdict(list)
+    for turn in turns:
+        turns_by_label[turn["speaker_label"]].append(turn)
+
+    refined_turns: list[dict] = []
+    cluster_split_lineage: dict[str, dict] = {}
+    for label, label_turns in turns_by_label.items():
+        prototype = base_prototypes.get(label, {})
+        impure = (
+            float(prototype.get("purity") or 0.0) < CLUSTER_IMPURE_PURITY
+            or (
+                float(prototype.get("dom_margin") or 0.0) < CLUSTER_IMPURE_DOM_MARGIN
+                and int(prototype.get("coverage_ms") or 0) > CLUSTER_IMPURE_COVERAGE_MS
+            )
+        )
+        split_payload = split_cluster_by_embeddings(label_turns) if impure else None
+        if split_payload is not None:
+            for turn in label_turns:
+                child_index = split_payload["assignments"].get(turn["turn_id"], 0)
+                child_label = f"{label}#{'ab'[child_index]}"
+                refined_turns.append(
+                    {
+                        **turn,
+                        "base_speaker_label": label,
+                        "speaker_label": child_label,
+                        "cluster_lineage": child_label,
+                    }
+                )
+                cluster_split_lineage[child_label] = {
+                    "parent_label": label,
+                    "split_applied": True,
+                    "impure_parent": True,
+                }
+            continue
+
+        for turn in label_turns:
+            refined_turns.append(
+                {
+                    **turn,
+                    "base_speaker_label": label,
+                    "cluster_lineage": label,
+                }
+            )
+        cluster_split_lineage[label] = {
+            "parent_label": label,
+            "split_applied": False,
+            "impure_parent": impure,
+        }
+
+    refined_prototypes = build_cluster_prototypes(refined_turns)
+    for label, prototype in refined_prototypes.items():
+        lineage = cluster_split_lineage.get(label, {})
+        prototype["base_label"] = lineage.get("parent_label", prototype.get("base_label", label))
+        prototype["split_applied"] = bool(lineage.get("split_applied"))
+        prototype["impure"] = bool(lineage.get("impure_parent")) and not bool(lineage.get("split_applied"))
+    return refined_turns, refined_prototypes, cluster_split_lineage
+
+
+def parse_metadata_json(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def resolve_pyannote_model_reference(path_env_name: str, name_env_name: str, default_reference: str) -> str:
+    explicit_path = (os.getenv(path_env_name) or "").strip()
+    if explicit_path:
+        return explicit_path
+    explicit_name = (os.getenv(name_env_name) or "").strip()
+    if explicit_name:
+        return explicit_name
+    return default_reference
+
+
+def pyannote_auth_token() -> str | None:
+    for env_name in ("PYANNOTE_AUTH_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"):
+        value = (os.getenv(env_name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def load_pyannote_diarization_pipeline():
+    configure_runtime_environment()
+    configure_torch_checkpoint_compatibility()
+    try:
+        import torch
+        from pyannote.audio import Pipeline
+    except Exception as exc:
+        raise RuntimeError(
+            "Pyannote diarization import edilemedi. "
+            "`conda activate teams-bot && python -m pip install -r backend/requirements.txt` çalıştırın. "
+            f"Ayrıntı: {exc}"
+        ) from exc
+
+    model_reference = resolve_pyannote_model_reference(
+        "PYANNOTE_DIARIZATION_MODEL_PATH",
+        "PYANNOTE_DIARIZATION_MODEL",
+        PYANNOTE_DIARIZATION_MODEL_DEFAULT,
+    )
+    kwargs = {"cache_dir": str(runtime_cache_dir("pyannote"))}
+    token = pyannote_auth_token()
+    if token:
+        kwargs["use_auth_token"] = token
+    try:
+        pipeline = Pipeline.from_pretrained(model_reference, **kwargs)
+    except Exception as exc:
+        raise RuntimeError(
+            "Pyannote diarization modeli yüklenemedi. "
+            "Local model kullanmak için `PYANNOTE_DIARIZATION_MODEL_PATH`, "
+            "remote model için `PYANNOTE_AUTH_TOKEN`/`HF_TOKEN` sağlayın. "
+            f"Ayrıntı: {exc}"
+        ) from exc
+    if pipeline is None:
+        raise RuntimeError(
+            "Pyannote diarization modeli indirilemedi. "
+            f"`{model_reference}` için Hugging Face erişimi ve model koşullarının kabul edilmiş olması gerekiyor."
+        )
+    try:
+        pipeline.to(torch.device("cpu"))
+    except Exception:
+        pass
+    return pipeline
+
+
+def load_pyannote_embedding_inference():
+    configure_runtime_environment()
+    configure_torch_checkpoint_compatibility()
+    try:
+        import torch
+        from pyannote.audio import Audio, Inference, Model
+    except Exception as exc:
+        raise RuntimeError(
+            "Pyannote embedding import edilemedi. "
+            "`conda activate teams-bot && python -m pip install -r backend/requirements.txt` çalıştırın. "
+            f"Ayrıntı: {exc}"
+        ) from exc
+
+    model_reference = resolve_pyannote_model_reference(
+        "PYANNOTE_EMBEDDING_MODEL_PATH",
+        "PYANNOTE_EMBEDDING_MODEL",
+        PYANNOTE_EMBEDDING_MODEL_DEFAULT,
+    )
+    kwargs = {"cache_dir": str(runtime_cache_dir("pyannote"))}
+    token = pyannote_auth_token()
+    if token:
+        kwargs["use_auth_token"] = token
+    try:
+        model = Model.from_pretrained(model_reference, **kwargs)
+    except Exception as exc:
+        raise RuntimeError(
+            "Pyannote embedding modeli yüklenemedi. "
+            "Local model kullanmak için `PYANNOTE_EMBEDDING_MODEL_PATH`, "
+            "remote model için `PYANNOTE_AUTH_TOKEN`/`HF_TOKEN` sağlayın. "
+            f"Ayrıntı: {exc}"
+        ) from exc
+    if model is None:
+        raise RuntimeError(
+            "Pyannote embedding modeli indirilemedi. "
+            f"`{model_reference}` için Hugging Face erişimi ve model koşullarının kabul edilmiş olması gerekiyor."
+        )
+    try:
+        inference = Inference(model, window="whole", device=torch.device("cpu"))
+    except Exception as exc:
+        raise RuntimeError(f"Pyannote embedding inference başlatılamadı: {exc}") from exc
+    return inference, Audio()
+
+
+def merge_diarized_turns(raw_turns: list[dict]) -> list[dict]:
+    ordered = sorted(raw_turns, key=lambda item: (item["start_offset_ms"], item["end_offset_ms"], item["speaker_label"]))
+    merged: list[dict] = []
+    current: dict | None = None
+    for turn in ordered:
+        if current is None:
+            current = dict(turn)
+            continue
+        same_label = turn["speaker_label"] == current["speaker_label"]
+        small_gap = turn["start_offset_ms"] <= current["end_offset_ms"] + DIARIZATION_MERGE_GAP_MS
+        if same_label and small_gap:
+            current["end_offset_ms"] = max(current["end_offset_ms"], turn["end_offset_ms"])
+            continue
+        if current["end_offset_ms"] - current["start_offset_ms"] >= MIN_DIARIZED_TURN_MS:
+            merged.append(current)
+        current = dict(turn)
+    if current and current["end_offset_ms"] - current["start_offset_ms"] >= MIN_DIARIZED_TURN_MS:
+        merged.append(current)
+
+    for turn in merged:
+        turn["duration_ms"] = turn["end_offset_ms"] - turn["start_offset_ms"]
+        turn["overlap_flag"] = any(
+            other["speaker_label"] != turn["speaker_label"]
+            and interval_overlap_ms(
+                turn["start_offset_ms"],
+                turn["end_offset_ms"],
+                other["start_offset_ms"],
+                other["end_offset_ms"],
+            ) > 0
+            for other in merged
+        )
+    for index, turn in enumerate(merged, start=1):
+        turn["turn_id"] = f"turn-{index:04d}"
+    return merged
+
+
+def compute_waveform_speech_ratio(waveform, sample_rate: int) -> float:
+    if waveform is None or sample_rate <= 0:
+        return 0.0
+    try:
+        import torch
+    except Exception:
+        return 1.0
+    samples = waveform.float()
+    if samples.ndim > 1:
+        samples = samples.mean(dim=0)
+    samples = samples.flatten()
+    frame_size = max(int(sample_rate * 0.03), 1)
+    usable_frames = samples.numel() // frame_size
+    if usable_frames <= 0:
+        return 1.0
+    frames = samples[: usable_frames * frame_size].reshape(usable_frames, frame_size)
+    rms = torch.sqrt(torch.mean(frames * frames, dim=1))
+    if rms.numel() == 0:
+        return 0.0
+    median_rms = float(torch.median(rms).item())
+    threshold = max(0.01, median_rms * 0.75)
+    speech_frames = int(torch.count_nonzero(rms >= threshold).item())
+    return clamp_score(speech_frames / int(rms.numel()))
+
+
+def diarize_speaker_turns(source_audio_path: Path) -> list[dict]:
+    pipeline = load_pyannote_diarization_pipeline()
+    try:
+        diarization = pipeline(str(source_audio_path))
+    except Exception as exc:
+        raise RuntimeError(f"Pyannote diarization çalıştırılamadı: {exc}") from exc
+
+    raw_turns: list[dict] = []
+    for segment, _track, speaker_label in diarization.itertracks(yield_label=True):
+        start_offset_ms = max(0, int(round(float(segment.start) * 1000)))
+        end_offset_ms = max(0, int(round(float(segment.end) * 1000)))
+        if end_offset_ms <= start_offset_ms:
+            continue
+        raw_turns.append(
+            {
+                "speaker_label": normalize_text(str(speaker_label)) or str(speaker_label),
+                "start_offset_ms": start_offset_ms,
+                "end_offset_ms": end_offset_ms,
+            }
+        )
+    return merge_diarized_turns(raw_turns)
+
+
+def attach_embeddings_to_turns(turns: list[dict], source_audio_path: Path) -> list[dict]:
+    if not turns:
+        return []
+    inference, audio_helper = load_pyannote_embedding_inference()
+    try:
+        from pyannote.core import Segment
+    except Exception as exc:
+        raise RuntimeError(f"pyannote Segment import edilemedi: {exc}") from exc
+
+    enriched: list[dict] = []
+    for turn in turns:
+        segment = Segment(turn["start_offset_ms"] / 1000.0, turn["end_offset_ms"] / 1000.0)
+        waveform, sample_rate = audio_helper.crop(str(source_audio_path), segment, mode="pad")
+        embedding = normalize_embedding_vector(
+            inference({"waveform": waveform, "sample_rate": sample_rate})
+        )
+        enriched.append(
+            {
+                **turn,
+                "embedding": embedding,
+                "speech_ratio": compute_waveform_speech_ratio(waveform, sample_rate),
+            }
+        )
+    return enriched
+
+
+def attach_dom_priors_to_turns(turns: list[dict], activity_rows: list[sqlite3.Row]) -> tuple[list[dict], dict[int, float]]:
+    global_totals: dict[int, float] = defaultdict(float)
+    enriched_turns: list[dict] = []
+    for turn in turns:
+        duration_ms = max(int(turn["duration_ms"]), 1)
+        prior_by_participant: dict[int, float] = defaultdict(float)
+        explicit_conflict = False
+        simultaneous_claim_count = 0
+        overlapping_participants: set[int] = set()
+        for row in activity_rows:
+            participant_id = row["participant_id"]
+            if participant_id is None:
+                continue
+            overlap_ms = interval_overlap_ms(
+                turn["start_offset_ms"],
+                turn["end_offset_ms"],
+                int(row["start_offset_ms"] or 0),
+                int(row["end_offset_ms"] or 0),
+            )
+            if overlap_ms <= 0:
+                continue
+            participant_id = int(participant_id)
+            overlapping_participants.add(participant_id)
+            metadata = parse_metadata_json(row["metadata_json"] if "metadata_json" in row.keys() else None)
+            row_confidence = clamp_score(float(row["confidence"] or 0.0))
+            simultaneous_claim_count = max(
+                simultaneous_claim_count,
+                int(metadata.get("simultaneous_claim_count") or 0),
+            )
+            explicit_conflict = explicit_conflict or bool(metadata.get("conflicted_claim"))
+            prior_by_participant[participant_id] += (overlap_ms / duration_ms) * row_confidence
+            global_totals[participant_id] += overlap_ms * row_confidence
+
+        claimant_count = len(overlapping_participants)
+        turn_conflicted = explicit_conflict or claimant_count > 1 or simultaneous_claim_count > 1
+        simultaneous_claim_count = max(simultaneous_claim_count, claimant_count)
+        normalized_priors = {
+            participant_id: clamp_score(score)
+            for participant_id, score in prior_by_participant.items()
+        }
+        if turn_conflicted:
+            normalized_priors = {
+                participant_id: min(clamp_score(score * 0.5), 0.35)
+                for participant_id, score in normalized_priors.items()
+            }
+        enriched_turns.append(
+            {
+                **turn,
+                "local_dom_prior_by_participant": dict(normalized_priors),
+                "conflicted_claim": turn_conflicted,
+                "simultaneous_claim_count": simultaneous_claim_count,
+            }
+        )
+
+    return enriched_turns, normalize_score_map(global_totals)
+
+
+def build_cluster_dom_priors(turns: list[dict]) -> dict[str, dict[int, float]]:
+    cluster_support: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    for turn in turns:
+        duration_ms = max(int(turn.get("duration_ms") or 0), 1)
+        for participant_id, score in turn.get("local_dom_prior_by_participant", {}).items():
+            cluster_support[turn["speaker_label"]][int(participant_id)] += float(score) * duration_ms
+    return {
+        label: normalize_score_map(dict(support))
+        for label, support in cluster_support.items()
+    }
+
+
+def select_clean_seed_turns(turns: list[dict]) -> dict[int, list[dict]]:
+    seeds_by_participant: dict[int, list[dict]] = defaultdict(list)
+    for turn in turns:
+        if turn["duration_ms"] < MIN_SEED_TURN_MS:
+            continue
+        if float(turn.get("speech_ratio") or 0.0) < MIN_SEED_SPEECH_RATIO:
+            continue
+        if turn.get("overlap_flag"):
+            continue
+        if not turn.get("embedding"):
+            continue
+        ranked = sorted(
+            turn.get("local_dom_prior_by_participant", {}).items(),
+            key=lambda item: (item[1], -item[0]),
+            reverse=True,
+        )
+        if not ranked:
+            continue
+        best_participant_id, best_prior = ranked[0]
+        second_prior = ranked[1][1] if len(ranked) > 1 else 0.0
+        if best_prior < MIN_SEED_PRIOR or (best_prior - second_prior) < MIN_SEED_MARGIN:
+            continue
+        seeds_by_participant[int(best_participant_id)].append(
+            {
+                **turn,
+                "seed_prior_score": float(best_prior),
+                "seed_margin": float(best_prior - second_prior),
+            }
+        )
+    return seeds_by_participant
+
+
+def select_cluster_bootstrap_seed_turns(
+    turns: list[dict],
+    cluster_dom_priors: dict[str, dict[int, float]],
+    participant_ids: list[int],
+    existing_profiles: dict[int, dict] | None = None,
+) -> dict[int, list[dict]]:
+    existing_profiles = existing_profiles or {}
+    missing_participants = {int(participant_id) for participant_id in participant_ids if int(participant_id) not in existing_profiles}
+    if not missing_participants:
+        return {}
+
+    cluster_owners: dict[str, tuple[int, float, float]] = {}
+    for label, priors in cluster_dom_priors.items():
+        ranked = sorted(priors.items(), key=lambda item: (item[1], -item[0]), reverse=True)
+        if not ranked:
+            continue
+        best_participant_id, best_prior = ranked[0]
+        second_prior = ranked[1][1] if len(ranked) > 1 else 0.0
+        if int(best_participant_id) not in missing_participants:
+            continue
+        if best_prior < CLUSTER_BOOTSTRAP_PRIOR or (best_prior - second_prior) < CLUSTER_BOOTSTRAP_MARGIN:
+            continue
+        cluster_owners[label] = (int(best_participant_id), float(best_prior), float(best_prior - second_prior))
+
+    seeds_by_participant: dict[int, list[dict]] = defaultdict(list)
+    for turn in turns:
+        owner = cluster_owners.get(turn["speaker_label"])
+        if owner is None:
+            continue
+        participant_id, cluster_prior, cluster_margin = owner
+        if turn["duration_ms"] < RELAXED_SEED_TURN_MS:
+            continue
+        if float(turn.get("speech_ratio") or 0.0) < RELAXED_SEED_SPEECH_RATIO:
+            continue
+        if turn.get("overlap_flag"):
+            continue
+        if not turn.get("embedding"):
+            continue
+        ranked = sorted(
+            turn.get("local_dom_prior_by_participant", {}).items(),
+            key=lambda item: (item[1], -item[0]),
+            reverse=True,
+        )
+        if not ranked:
+            continue
+        best_participant_id, best_prior = ranked[0]
+        second_prior = ranked[1][1] if len(ranked) > 1 else 0.0
+        if int(best_participant_id) != participant_id:
+            continue
+        if best_prior < RELAXED_SEED_PRIOR or (best_prior - second_prior) < RELAXED_SEED_MARGIN:
+            continue
+        seeds_by_participant[participant_id].append(
+            {
+                **turn,
+                "seed_prior_score": float((best_prior * 0.6) + (cluster_prior * 0.4)),
+                "seed_margin": float(max(best_prior - second_prior, cluster_margin)),
+                "cluster_bootstrap_prior": cluster_prior,
+            }
+        )
+    return seeds_by_participant
+
+
+def select_local_bootstrap_seed_turns(
+    turns: list[dict],
+    participant_ids: list[int],
+    existing_profiles: dict[int, dict] | None = None,
+) -> dict[int, list[dict]]:
+    existing_profiles = existing_profiles or {}
+    missing_participants = {int(participant_id) for participant_id in participant_ids if int(participant_id) not in existing_profiles}
+    if not missing_participants:
+        return {}
+
+    seeds_by_participant: dict[int, list[dict]] = defaultdict(list)
+    for turn in turns:
+        if turn["duration_ms"] < RELAXED_SEED_TURN_MS:
+            continue
+        if float(turn.get("speech_ratio") or 0.0) < RELAXED_SEED_SPEECH_RATIO:
+            continue
+        if turn.get("overlap_flag"):
+            continue
+        if not turn.get("embedding"):
+            continue
+        ranked = sorted(
+            turn.get("local_dom_prior_by_participant", {}).items(),
+            key=lambda item: (item[1], -item[0]),
+            reverse=True,
+        )
+        if not ranked:
+            continue
+        best_participant_id, best_prior = ranked[0]
+        second_prior = ranked[1][1] if len(ranked) > 1 else 0.0
+        best_participant_id = int(best_participant_id)
+        if best_participant_id not in missing_participants:
+            continue
+        if best_prior < RELAXED_SEED_PRIOR or (best_prior - second_prior) < CLUSTER_BOOTSTRAP_MARGIN:
+            continue
+        seeds_by_participant[best_participant_id].append(
+            {
+                **turn,
+                "seed_prior_score": float(best_prior),
+                "seed_margin": float(best_prior - second_prior),
+            }
+        )
+    return seeds_by_participant
+
+
+def build_profile_from_turns(turns: list[dict], source_kind: str) -> dict | None:
+    candidates = [turn for turn in turns if turn.get("embedding")]
+    if not candidates:
+        return None
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            float(item.get("seed_prior_score") or item.get("best_score") or 0.0),
+            int(item.get("duration_ms") or 0),
+        ),
+        reverse=True,
+    )[:MAX_PROFILE_SEED_TURNS]
+    centroid = average_embeddings([turn["embedding"] for turn in ordered])
+    if centroid is None:
+        return None
+    similarities = [cosine_similarity_vectors(turn["embedding"], centroid) for turn in ordered]
+    median_similarity = statistics.median(similarities) if similarities else 0.0
+    filtered_turns = [
+        turn
+        for turn, similarity in zip(ordered, similarities)
+        if similarity >= median_similarity - PROFILE_OUTLIER_TOLERANCE
+    ]
+    centroid = average_embeddings([turn["embedding"] for turn in filtered_turns]) or centroid
+    quality_scores = [cosine_similarity_vectors(turn["embedding"], centroid) for turn in filtered_turns]
+    return {
+        "participant_id": int(filtered_turns[0]["participant_id"] if "participant_id" in filtered_turns[0] else 0),
+        "source_kind": source_kind,
+        "seed_turn_ids": [turn["turn_id"] for turn in filtered_turns],
+        "seed_count": len(filtered_turns),
+        "coverage_ms": sum(int(turn["duration_ms"]) for turn in filtered_turns),
+        "quality": (sum(quality_scores) / len(quality_scores)) if quality_scores else 0.0,
+        "centroid": centroid,
+    }
+
+
+def build_participant_profiles(turns: list[dict], participant_ids: list[int] | None = None) -> dict[int, dict]:
+    profiles: dict[int, dict] = {}
+    for participant_id, seed_turns in select_clean_seed_turns(turns).items():
+        profile = build_profile_from_turns(
+            [{**turn, "participant_id": participant_id} for turn in seed_turns],
+            source_kind="clean_seed",
+        )
+        if profile is not None:
+            profiles[int(participant_id)] = profile
+    if participant_ids:
+        cluster_dom_priors = build_cluster_dom_priors(turns)
+        for participant_id, seed_turns in select_cluster_bootstrap_seed_turns(
+            turns,
+            cluster_dom_priors,
+            participant_ids,
+            profiles,
+        ).items():
+            profile = build_profile_from_turns(
+                [{**turn, "participant_id": participant_id} for turn in seed_turns],
+                source_kind="cluster_bootstrap",
+            )
+            if profile is not None:
+                profiles[int(participant_id)] = profile
+        for participant_id, seed_turns in select_local_bootstrap_seed_turns(
+            turns,
+            participant_ids,
+            profiles,
+        ).items():
+            profile = build_profile_from_turns(
+                [{**turn, "participant_id": participant_id} for turn in seed_turns],
+                source_kind="local_dom_bootstrap",
+            )
+            if profile is not None:
+                profiles[int(participant_id)] = profile
+    return profiles
+
+
+def expand_missing_participant_profiles(
+    participant_ids: list[int],
+    turn_results: list[dict],
+    participant_profiles: dict[int, dict],
+    cluster_dom_priors: dict[str, dict[int, float]],
+) -> dict[int, dict]:
+    expanded = dict(participant_profiles)
+    for participant_id, seed_turns in select_cluster_bootstrap_seed_turns(
+        turn_results,
+        cluster_dom_priors,
+        participant_ids,
+        expanded,
+    ).items():
+        profile = build_profile_from_turns(
+            [{**turn, "participant_id": participant_id} for turn in seed_turns],
+            source_kind="cluster_bootstrap",
+        )
+        if profile is not None:
+            expanded[int(participant_id)] = profile
+    for participant_id, seed_turns in select_local_bootstrap_seed_turns(
+        turn_results,
+        participant_ids,
+        expanded,
+    ).items():
+        profile = build_profile_from_turns(
+            [{**turn, "participant_id": participant_id} for turn in seed_turns],
+            source_kind="local_dom_bootstrap",
+        )
+        if profile is not None:
+            expanded[int(participant_id)] = profile
+
+    for participant_id in participant_ids:
+        if participant_id in expanded:
+            continue
+        candidates = [
+            turn
+            for turn in turn_results
+            if turn.get("participant_id") == participant_id
+            and turn.get("embedding")
+            and turn["duration_ms"] >= MIN_SEED_TURN_MS
+            and not turn.get("overlap_flag")
+            and float(turn.get("best_score") or 0.0) >= 0.72
+            and float(turn.get("score_margin") or 0.0) >= 0.15
+        ]
+        profile = build_profile_from_turns(candidates, source_kind="iterative_bootstrap")
+        if profile is not None:
+            profile["participant_id"] = participant_id
+            expanded[participant_id] = profile
+    return expanded
+
+
+def score_turn_candidates(
+    turn: dict,
+    participant_ids: list[int],
+    participant_profiles: dict[int, dict],
+    cluster_prototypes: dict[str, dict],
+    cluster_dom_prior_by_participant: dict[int, float],
+    global_dom_priors: dict[int, float],
+) -> dict[int, dict]:
+    scores: dict[int, dict] = {}
+    local_dom_scores = turn.get("local_dom_prior_by_participant", {})
+    cluster_prototype = cluster_prototypes.get(turn["speaker_label"], {})
+    cluster_is_impure = bool(cluster_prototype.get("impure"))
+    for participant_id in participant_ids:
+        profile = participant_profiles.get(participant_id)
+        cluster_profile_similarity = cosine_similarity_vectors(
+            cluster_prototype.get("centroid"),
+            profile.get("centroid") if profile else None,
+        )
+        turn_profile_similarity = cosine_similarity_vectors(
+            turn.get("embedding"),
+            profile.get("centroid") if profile else None,
+        )
+        cluster_level_prior = clamp_score(cluster_dom_prior_by_participant.get(participant_id, 0.0))
+        local_dom_prior = clamp_score(local_dom_scores.get(participant_id, 0.0))
+        if turn.get("conflicted_claim"):
+            local_dom_prior = min(local_dom_prior, 0.35)
+        dom_score = clamp_score((0.75 * cluster_level_prior) + (0.25 * local_dom_prior))
+        if profile:
+            audio_similarity = turn_profile_similarity if cluster_is_impure else cluster_profile_similarity
+        else:
+            audio_similarity = 0.0
+        if profile and audio_similarity > 0:
+            if cluster_is_impure:
+                final_score = (
+                    (0.60 * audio_similarity)
+                    + (0.15 * cluster_level_prior)
+                    + (0.25 * local_dom_prior)
+                )
+            else:
+                final_score = (
+                    (0.60 * audio_similarity)
+                    + (0.25 * cluster_level_prior)
+                    + (0.15 * local_dom_prior)
+                )
+        elif cluster_is_impure:
+            final_score = (
+                (0.40 * cluster_level_prior)
+                + (0.60 * local_dom_prior)
+            )
+        else:
+            final_score = (0.75 * cluster_level_prior) + (0.25 * local_dom_prior)
+        if turn.get("overlap_flag"):
+            final_score -= 0.10
+        if final_score <= 0 and global_dom_priors:
+            final_score = 0.10 * clamp_score(global_dom_priors.get(participant_id, 0.0))
+        scores[participant_id] = {
+            "cluster_profile_similarity": cluster_profile_similarity,
+            "turn_profile_similarity": turn_profile_similarity,
+            "audio_similarity": audio_similarity,
+            "cluster_level_prior": cluster_level_prior,
+            "local_dom_prior": local_dom_prior,
+            "dom_score": dom_score,
+            "final_score": clamp_score(final_score),
+            "used_profile": bool(profile and audio_similarity > 0),
+            "profile_source_kind": (profile or {}).get("source_kind"),
+        }
+    return scores
+
+
+def pick_best_participant_from_scores(scores_by_participant: dict[int, dict]) -> tuple[int | None, float, float]:
+    if not scores_by_participant:
+        return None, 0.0, 0.0
+    ranked = sorted(
+        scores_by_participant.items(),
+        key=lambda item: (item[1]["final_score"], -item[0]),
+        reverse=True,
+    )
+    best_participant_id, best_payload = ranked[0]
+    second_score = ranked[1][1]["final_score"] if len(ranked) > 1 else 0.0
+    best_final_score = float(best_payload["final_score"])
+    best_dom_signal = max(
+        float(best_payload.get("dom_score") or 0.0),
+        float(best_payload.get("cluster_level_prior") or 0.0),
+        float(best_payload.get("local_dom_prior") or 0.0),
+    )
+    if not bool(best_payload.get("used_profile")):
+        if best_final_score < MIN_UNRESOLVED_ASSIGNMENT_SCORE or best_dom_signal < MIN_UNRESOLVED_DOM_SIGNAL:
+            return None, best_final_score, float(second_score)
+    return int(best_participant_id), float(best_payload["final_score"]), float(second_score)
+
+
+def resolve_turn_assignment(
+    turn: dict,
+    scores_by_participant: dict[int, dict],
+    cluster_prototypes: dict[str, dict],
+) -> tuple[int | None, float, float, list[str]]:
+    participant_id, best_score, second_score = pick_best_participant_from_scores(scores_by_participant)
+    ranked = sorted(
+        scores_by_participant.items(),
+        key=lambda item: (item[1]["final_score"], -item[0]),
+        reverse=True,
+    )
+    best_payload = ranked[0][1] if ranked else {}
+    cluster_prototype = cluster_prototypes.get(turn["speaker_label"], {})
+    best_dom_signal = max(
+        float(best_payload.get("dom_score") or 0.0),
+        float(best_payload.get("cluster_level_prior") or 0.0),
+        float(best_payload.get("local_dom_prior") or 0.0),
+    )
+
+    unresolved_reasons: list[str] = []
+    if best_score < MIN_UNRESOLVED_ASSIGNMENT_SCORE:
+        unresolved_reasons.append("weak_best_score")
+    if not bool(best_payload.get("used_profile")) and best_dom_signal < MIN_UNRESOLVED_DOM_SIGNAL:
+        unresolved_reasons.append("weak_dom_without_profile")
+    if bool(turn.get("conflicted_claim")) and (best_score - second_score) < 0.08:
+        unresolved_reasons.append("conflicted_low_margin")
+    if bool(cluster_prototype.get("impure")) and best_score < CLUSTER_CONFIRM_SCORE:
+        unresolved_reasons.append("impure_cluster_unconfirmed")
+
+    if participant_id is None or unresolved_reasons:
+        return None, float(best_score), float(second_score), unresolved_reasons or ["insufficient_evidence"]
+    return participant_id, float(best_score), float(second_score), []
+
+
+def build_cluster_memory(
+    turn_results: list[dict],
+    previous_memory: dict[str, dict] | None = None,
+    cluster_dom_priors: dict[str, dict[int, float]] | None = None,
+    cluster_prototypes: dict[str, dict] | None = None,
+) -> dict[str, dict]:
+    previous_memory = previous_memory or {}
+    cluster_dom_priors = cluster_dom_priors or {}
+    cluster_prototypes = cluster_prototypes or {}
+    support_by_label: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    turn_count_by_label: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    duration_by_label: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    profile_turn_count_by_label: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+    for turn in turn_results:
+        label = turn["speaker_label"]
+        duration_ms = int(turn["duration_ms"])
+        for participant_id, payload in turn["scores_by_participant"].items():
+            support_by_label[label][participant_id] += float(payload["final_score"]) * duration_ms
+        if turn.get("participant_id") is not None:
+            participant_id = int(turn["participant_id"])
+            turn_count_by_label[label][participant_id] += 1
+            duration_by_label[label][participant_id] += duration_ms
+            if turn.get("used_profile"):
+                profile_turn_count_by_label[label][participant_id] += 1
+
+    cluster_memory: dict[str, dict] = {}
+    for label, support in support_by_label.items():
+        normalized_support = normalize_score_map(dict(support))
+        ranked = sorted(normalized_support.items(), key=lambda item: (item[1], -item[0]), reverse=True)
+        best_participant_id = int(ranked[0][0]) if ranked else None
+        best_score = float(ranked[0][1]) if ranked else 0.0
+        second_score = float(ranked[1][1]) if len(ranked) > 1 else 0.0
+        score_margin = best_score - second_score
+        support_turn_count = int(turn_count_by_label[label].get(best_participant_id, 0)) if best_participant_id is not None else 0
+        support_duration_ms = int(duration_by_label[label].get(best_participant_id, 0)) if best_participant_id is not None else 0
+        profile_supported_turn_count = (
+            int(profile_turn_count_by_label[label].get(best_participant_id, 0))
+            if best_participant_id is not None
+            else 0
+        )
+        cluster_prototype = cluster_prototypes.get(label, {})
+        cluster_dom_score = (
+            float(cluster_dom_priors.get(label, {}).get(best_participant_id, 0.0))
+            if best_participant_id is not None
+            else 0.0
+        )
+        confirmed = (
+            best_participant_id is not None
+            and best_score >= CLUSTER_CONFIRM_SCORE
+            and score_margin >= CLUSTER_CONFIRM_MARGIN
+            and not bool(cluster_prototype.get("impure"))
+            and (profile_supported_turn_count > 0 or cluster_dom_score >= 0.45)
+            and (
+                support_turn_count >= CLUSTER_CONFIRM_TURN_COUNT
+                or support_duration_ms >= CLUSTER_CONFIRM_DURATION_MS
+            )
+        )
+
+        previous = previous_memory.get(label) or {}
+        previous_best_participant_id = previous.get("best_participant_id")
+        previous_confirmed = bool(previous.get("confirmed"))
+        if previous_confirmed and previous_best_participant_id is not None and previous_best_participant_id != best_participant_id:
+            remap_support = sum(
+                1
+                for turn in turn_results
+                if turn["speaker_label"] == label
+                and (
+                    turn["scores_by_participant"].get(best_participant_id, {}).get("final_score", 0.0)
+                    - turn["scores_by_participant"].get(previous_best_participant_id, {}).get("final_score", 0.0)
+                ) >= CLUSTER_REMAP_MARGIN
+            )
+            if remap_support < CLUSTER_REMAP_TURN_COUNT:
+                best_participant_id = int(previous_best_participant_id)
+                best_score = float(normalized_support.get(best_participant_id, 0.0))
+                second_score = max(
+                    (score for participant_id, score in normalized_support.items() if participant_id != best_participant_id),
+                    default=0.0,
+                )
+                score_margin = best_score - second_score
+                support_turn_count = int(turn_count_by_label[label].get(best_participant_id, 0))
+                support_duration_ms = int(duration_by_label[label].get(best_participant_id, 0))
+                confirmed = bool(previous_confirmed)
+
+        cluster_memory[label] = {
+            "speaker_label": label,
+            "best_participant_id": best_participant_id,
+            "best_score": clamp_score(best_score),
+            "second_score": clamp_score(second_score),
+            "score_margin": clamp_score(score_margin),
+            "support_duration_ms": support_duration_ms,
+            "support_turn_count": support_turn_count,
+            "profile_supported_turn_count": profile_supported_turn_count,
+            "cluster_dom_score": clamp_score(cluster_dom_score),
+            "prototype_purity": float(cluster_prototype.get("purity") or 0.0),
+            "prototype_impure": bool(cluster_prototype.get("impure")),
+            "confirmed": confirmed,
+            "support_by_participant": normalized_support,
+        }
+    return cluster_memory
+
+
+def apply_confirmed_cluster_remapping(turn_results: list[dict], cluster_memory: dict[str, dict]) -> list[dict]:
+    remapped: list[dict] = []
+    for turn in turn_results:
+        remapped_turn = dict(turn)
+        cluster_state = cluster_memory.get(turn["speaker_label"]) or {}
+        confirmed_participant_id = cluster_state.get("best_participant_id") if cluster_state.get("confirmed") else None
+        if confirmed_participant_id is not None and confirmed_participant_id != turn.get("participant_id"):
+            confirmed_payload = turn["scores_by_participant"].get(int(confirmed_participant_id))
+            current_payload = turn["scores_by_participant"].get(turn.get("participant_id"))
+            confirmed_score = float(confirmed_payload["final_score"]) if confirmed_payload else 0.0
+            current_score = float(current_payload["final_score"]) if current_payload else 0.0
+            if confirmed_score >= max(current_score - 0.08, 0.0) or float(cluster_state.get("score_margin") or 0.0) >= CLUSTER_REMAP_MARGIN:
+                remapped_turn["participant_id"] = int(confirmed_participant_id)
+                remapped_turn["best_score"] = confirmed_score
+                remapped_turn["second_score"] = max(
+                    (
+                        payload["final_score"]
+                        for participant_id, payload in turn["scores_by_participant"].items()
+                        if participant_id != confirmed_participant_id
+                    ),
+                    default=0.0,
+                )
+                remapped_turn["score_margin"] = remapped_turn["best_score"] - remapped_turn["second_score"]
+                remapped_turn["used_profile"] = bool(confirmed_payload and confirmed_payload.get("used_profile"))
+                remapped_turn["remapped_by_cluster"] = True
+        remapped.append(remapped_turn)
+    return remapped
+
+
+def run_iterative_turn_assignment(
+    turns: list[dict],
+    participant_ids: list[int],
+    participant_profiles: dict[int, dict],
+    cluster_prototypes: dict[str, dict],
+    cluster_dom_priors: dict[str, dict[int, float]],
+    global_dom_priors: dict[int, float],
+) -> tuple[list[dict], dict[str, dict], dict[int, dict], list[dict]]:
+    cluster_memory: dict[str, dict] = {}
+    pass_history: list[dict] = []
+    profiles = dict(participant_profiles)
+    assignment_signature: list[tuple[str, int | None]] = []
+
+    for pass_index in range(1, MAX_ASSIGNMENT_PASSES + 1):
+        pass_turns: list[dict] = []
+        for turn in turns:
+            scores_by_participant = score_turn_candidates(
+                turn,
+                participant_ids,
+                profiles,
+                cluster_prototypes,
+                cluster_dom_priors.get(turn["speaker_label"], {}),
+                global_dom_priors,
+            )
+            participant_id, best_score, second_score, unresolved_reasons = resolve_turn_assignment(
+                turn,
+                scores_by_participant,
+                cluster_prototypes,
+            )
+            pass_turns.append(
+                {
+                    **turn,
+                    "scores_by_participant": scores_by_participant,
+                    "participant_id": participant_id,
+                    "best_score": best_score,
+                    "second_score": second_score,
+                    "score_margin": best_score - second_score,
+                    "used_profile": bool(
+                        participant_id is not None
+                        and scores_by_participant.get(participant_id, {}).get("used_profile")
+                    ),
+                    "unresolved_reason_codes": unresolved_reasons,
+                }
+            )
+
+        new_cluster_memory = build_cluster_memory(pass_turns, cluster_memory, cluster_dom_priors, cluster_prototypes)
+        remapped_turns = apply_confirmed_cluster_remapping(pass_turns, new_cluster_memory)
+        new_cluster_memory = build_cluster_memory(remapped_turns, new_cluster_memory, cluster_dom_priors, cluster_prototypes)
+        profiles = expand_missing_participant_profiles(participant_ids, remapped_turns, profiles, cluster_dom_priors)
+        current_signature = [(turn["turn_id"], turn.get("participant_id")) for turn in remapped_turns]
+        pass_history.append(
+            {
+                "pass_index": pass_index,
+                "cluster_memory": new_cluster_memory,
+                "turn_assignments": [
+                    {
+                        "turn_id": turn["turn_id"],
+                        "speaker_label": turn["speaker_label"],
+                        "participant_id": turn.get("participant_id"),
+                        "best_score": turn.get("best_score"),
+                        "second_score": turn.get("second_score"),
+                        "score_margin": turn.get("score_margin"),
+                        "remapped_by_cluster": bool(turn.get("remapped_by_cluster")),
+                        "unresolved_reason_codes": turn.get("unresolved_reason_codes") or [],
+                    }
+                    for turn in remapped_turns
+                ],
+            }
+        )
+        if current_signature == assignment_signature:
+            cluster_memory = new_cluster_memory
+            return remapped_turns, cluster_memory, profiles, pass_history
+        assignment_signature = current_signature
+        cluster_memory = new_cluster_memory
+
+    return remapped_turns if "remapped_turns" in locals() else [], cluster_memory, profiles, pass_history
+
+
+def collect_segment_turn_matches(segment: dict, assigned_turns: list[dict]) -> dict:
+    segment_duration_ms = max(segment["end_offset_ms"] - segment["start_offset_ms"], 1)
+    matches: list[dict] = []
+    nearest_match: dict | None = None
+    nearest_distance_ms: int | None = None
+    for turn in assigned_turns:
+        overlap_ms = interval_overlap_ms(
+            segment["start_offset_ms"],
+            segment["end_offset_ms"],
+            turn["start_offset_ms"],
+            turn["end_offset_ms"],
+        )
+        distance_ms = 0
+        if overlap_ms <= 0:
+            distance_ms = min(
+                abs(segment["start_offset_ms"] - turn["end_offset_ms"]),
+                abs(segment["end_offset_ms"] - turn["start_offset_ms"]),
+            )
+            if nearest_distance_ms is None or distance_ms < nearest_distance_ms:
+                nearest_distance_ms = distance_ms
+                nearest_match = {
+                    "turn": turn,
+                    "overlap_ms": 0,
+                    "overlap_ratio": 0.0,
+                    "distance_ms": distance_ms,
+                }
+            continue
+        matches.append(
+            {
+                "turn": turn,
+                "overlap_ms": overlap_ms,
+                "overlap_ratio": overlap_ms / segment_duration_ms,
+                "distance_ms": distance_ms,
+            }
+        )
+
+    if not matches and nearest_match is not None:
+        matches = [nearest_match]
+    matches = sorted(
+        matches,
+        key=lambda item: (
+            item["turn"]["start_offset_ms"],
+            item["turn"]["end_offset_ms"],
+            item["turn"]["turn_id"],
+        ),
+    )
+    significant_matches = [
+        item
+        for item in matches
+        if item["overlap_ratio"] >= SEGMENT_SPLIT_MIN_OVERLAP_RATIO
+        or item["overlap_ms"] >= SEGMENT_SPLIT_MIN_OVERLAP_MS
+    ]
+    if not significant_matches and matches:
+        significant_matches = [max(matches, key=lambda item: (item["overlap_ms"], -item["distance_ms"]))]
+    dominant_match = max(matches, key=lambda item: (item["overlap_ratio"], item["overlap_ms"]), default=None)
+    return {
+        "matches": matches,
+        "significant_matches": significant_matches,
+        "dominant_match": dominant_match,
+    }
+
+
+def choose_best_turn_match(window_start_ms: int, window_end_ms: int, matches: list[dict]) -> tuple[dict, bool]:
+    best_match: dict | None = None
+    best_overlap_ms = -1
+    best_distance_ms: int | None = None
+    window_duration_ms = max(window_end_ms - window_start_ms, 1)
+    for match in matches:
+        turn = match["turn"]
+        overlap_ms = interval_overlap_ms(
+            window_start_ms,
+            window_end_ms,
+            turn["start_offset_ms"],
+            turn["end_offset_ms"],
+        )
+        if overlap_ms > best_overlap_ms:
+            best_overlap_ms = overlap_ms
+            best_match = match
+            best_distance_ms = 0
+            continue
+        if overlap_ms <= 0:
+            distance_ms = min(
+                abs(window_start_ms - turn["end_offset_ms"]),
+                abs(window_end_ms - turn["start_offset_ms"]),
+            )
+            if best_distance_ms is None or distance_ms < best_distance_ms:
+                best_match = match
+                best_distance_ms = distance_ms
+    if best_match is None:
+        raise RuntimeError("Segment penceresi için speaker turn bulunamadı.")
+    return best_match, (best_overlap_ms / window_duration_ms) < 0.35
+
+
+def build_fragment_text(words: list[dict]) -> str:
+    return normalize_text(" ".join(word["text"] for word in words))
+
+
+def split_segment_by_words(segment: dict, matches: list[dict]) -> list[dict]:
+    words = [word for word in segment.get("words") or [] if normalize_text(word.get("text"))]
+    if not words:
+        return []
+
+    fragments: list[dict] = []
+    current: dict | None = None
+    for word in words:
+        best_match, low_alignment = choose_best_turn_match(
+            int(word["start_offset_ms"]),
+            int(word["end_offset_ms"]),
+            matches,
+        )
+        turn_id = best_match["turn"]["turn_id"]
+        if current is None or current["turn"]["turn_id"] != turn_id:
+            current = {
+                "turn": best_match["turn"],
+                "words": [word],
+                "low_alignment": low_alignment,
+                "unresolved_reasons": [],
+                "split_source": "word_timestamps",
+            }
+            fragments.append(current)
+            continue
+        current["words"].append(word)
+        current["low_alignment"] = current["low_alignment"] or low_alignment
+
+    normalized_fragments: list[dict] = []
+    for index, fragment in enumerate(fragments, start=1):
+        text = build_fragment_text(fragment["words"])
+        if not text:
+            continue
+        normalized_fragments.append(
+            {
+                "fragment_index": index,
+                "turn": fragment["turn"],
+                "text": text,
+                "raw_text": text,
+                "start_offset_ms": int(fragment["words"][0]["start_offset_ms"]),
+                "end_offset_ms": int(fragment["words"][-1]["end_offset_ms"]),
+                "split_source": fragment["split_source"],
+                "low_alignment": fragment["low_alignment"],
+                "needs_review": len(fragments) > 1,
+                "unresolved_reasons": fragment["unresolved_reasons"],
+            }
+        )
+    return normalized_fragments
+
+
+def allocate_turn_token_counts(token_count: int, matches: list[dict]) -> list[int]:
+    if token_count <= 0:
+        return [0 for _ in matches]
+    if len(matches) == 1:
+        return [token_count]
+    base_counts = [1] * min(token_count, len(matches))
+    if len(base_counts) < len(matches):
+        base_counts.extend([0] * (len(matches) - len(base_counts)))
+    remaining = token_count - sum(base_counts)
+    if remaining <= 0:
+        return base_counts
+
+    weights = [max(int(match["overlap_ms"]), SEGMENT_SPLIT_MIN_OVERLAP_MS) for match in matches]
+    total_weight = sum(weights) or len(matches)
+    fractional: list[tuple[float, int]] = []
+    for index, weight in enumerate(weights):
+        exact = remaining * (weight / total_weight)
+        assigned = int(exact)
+        base_counts[index] += assigned
+        fractional.append((exact - assigned, index))
+    leftover = token_count - sum(base_counts)
+    for _fraction, index in sorted(fractional, reverse=True):
+        if leftover <= 0:
+            break
+        base_counts[index] += 1
+        leftover -= 1
+    return base_counts
+
+
+def split_segment_without_words(segment: dict, matches: list[dict]) -> list[dict]:
+    tokens = normalize_text(segment.get("text") or "").split()
+    if not tokens:
+        return []
+    token_counts = allocate_turn_token_counts(len(tokens), matches)
+    segment_duration_ms = max(segment["end_offset_ms"] - segment["start_offset_ms"], 1)
+    fragments: list[dict] = []
+    token_cursor = 0
+    for index, (match, token_count) in enumerate(zip(matches, token_counts), start=1):
+        if token_count <= 0:
+            continue
+        fragment_tokens = tokens[token_cursor : token_cursor + token_count]
+        token_cursor += token_count
+        if not fragment_tokens:
+            continue
+        time_start = segment["start_offset_ms"] + int(round(segment_duration_ms * ((token_cursor - token_count) / len(tokens))))
+        time_end = segment["start_offset_ms"] + int(round(segment_duration_ms * (token_cursor / len(tokens))))
+        fragments.append(
+            {
+                "fragment_index": index,
+                "turn": match["turn"],
+                "text": normalize_text(" ".join(fragment_tokens)),
+                "raw_text": normalize_text(" ".join(fragment_tokens)),
+                "start_offset_ms": max(segment["start_offset_ms"], time_start),
+                "end_offset_ms": min(segment["end_offset_ms"], max(time_start + 1, time_end)),
+                "split_source": "time_fallback",
+                "low_alignment": True,
+                "needs_review": True,
+                "unresolved_reasons": ["no_word_timestamps_split"],
+            }
+        )
+    return fragments
+
+
+def build_aligned_fragment(
+    base_segment: dict,
+    fragment: dict,
+    cluster_memory: dict[str, dict],
+    cluster_prototypes: dict[str, dict],
+    source_audio_path: Path,
+) -> tuple[dict, dict]:
+    turn = fragment["turn"]
+    cluster_state = cluster_memory.get(turn["speaker_label"]) or {}
+    cluster_prototype = cluster_prototypes.get(turn["speaker_label"]) or {}
+    unresolved_reasons = list(turn.get("unresolved_reason_codes") or []) + list(fragment.get("unresolved_reasons") or [])
+    if bool(cluster_prototype.get("impure")) and not bool(cluster_state.get("confirmed")):
+        unresolved_reasons.append("impure_cluster_unconfirmed")
+    if bool(fragment.get("low_alignment")) and not bool(cluster_state.get("confirmed")):
+        unresolved_reasons.append("low_alignment_unconfirmed_cluster")
+
+    unresolved_assignment = turn.get("participant_id") is None or bool(unresolved_reasons)
+    needs_review = (
+        unresolved_assignment
+        or bool(fragment.get("needs_review"))
+        or float(turn.get("best_score") or 0.0) < CLUSTER_CONFIRM_SCORE
+        or float(turn.get("score_margin") or 0.0) < CLUSTER_CONFIRM_MARGIN
+        or bool(turn.get("overlap_flag"))
+        or bool(fragment.get("low_alignment"))
+        or (not bool(turn.get("used_profile")) and bool(turn.get("local_dom_prior_by_participant")))
+    )
+    assignment_method = "audio_cluster_match"
+    participant_id = turn.get("participant_id")
+    if unresolved_assignment:
+        assignment_method = "audio_cluster_unresolved"
+        participant_id = None
+    elif not turn.get("used_profile"):
+        assignment_method = "audio_cluster_dom_bootstrap"
+    elif needs_review:
+        assignment_method = "audio_cluster_match_review"
+
+    aligned_segment = {
+        **base_segment,
+        "participant_id": participant_id,
+        "participant_audio_asset_id": None,
+        "raw_text": fragment["raw_text"],
+        "text": fragment["text"],
+        "start_offset_ms": fragment["start_offset_ms"],
+        "end_offset_ms": fragment["end_offset_ms"],
+        "assignment_method": assignment_method,
+        "assignment_confidence": clamp_score(turn.get("best_score") or 0.0),
+        "needs_speaker_review": needs_review,
+        "resolution_status": (
+            TRANSCRIPT_STATUS_PENDING_REVIEW if needs_review else TRANSCRIPT_STATUS_ORIGINAL
+        ),
+        "source_audio_path": source_audio_path,
+        "cluster_lineage": turn.get("cluster_lineage") or turn["speaker_label"],
+        "source_turn_ids": [turn["turn_id"]],
+        "words": None,
+    }
+    debug_link = {
+        "source_segment_index": base_segment.get("source_segment_index"),
+        "fragment_index": fragment.get("fragment_index"),
+        "turn_id": turn["turn_id"],
+        "speaker_label": turn["speaker_label"],
+        "participant_id": participant_id,
+        "cluster_lineage": aligned_segment["cluster_lineage"],
+        "split_source": fragment.get("split_source"),
+        "low_alignment": bool(fragment.get("low_alignment")),
+        "unresolved_reason": unresolved_reasons,
+        "start_offset_ms": aligned_segment["start_offset_ms"],
+        "end_offset_ms": aligned_segment["end_offset_ms"],
+        "text": aligned_segment["text"],
+    }
+    return aligned_segment, debug_link
+
+
+def align_segments_to_turns(
+    segments: list[dict],
+    assigned_turns: list[dict],
+    cluster_memory: dict[str, dict],
+    cluster_prototypes: dict[str, dict],
+    source_audio_path: Path,
+) -> tuple[list[dict], list[dict]]:
+    if not assigned_turns:
+        raise RuntimeError("Speaker diarization herhangi bir turn üretmediği için segmentler eşlenemedi.")
+
+    aligned_segments: list[dict] = []
+    turn_to_segment_links: list[dict] = []
+    for segment in segments:
+        match_payload = collect_segment_turn_matches(segment, assigned_turns)
+        matches = match_payload["matches"]
+        significant_matches = match_payload["significant_matches"]
+        dominant_match = match_payload["dominant_match"]
+        if not matches or dominant_match is None:
+            raise RuntimeError("Bir transcript segmenti için speaker turn bulunamadı.")
+
+        split_required = len(significant_matches) > 1 and float(dominant_match.get("overlap_ratio") or 0.0) < SEGMENT_SINGLE_TURN_DOMINANCE_RATIO
+        if split_required:
+            fragments = split_segment_by_words(segment, significant_matches)
+            if not fragments:
+                fragments = split_segment_without_words(segment, significant_matches)
+        else:
+            fragment_text = normalize_text(segment.get("text") or "")
+            fragments = [
+                {
+                    "fragment_index": 1,
+                    "turn": dominant_match["turn"],
+                    "text": fragment_text,
+                    "raw_text": fragment_text,
+                    "start_offset_ms": segment["start_offset_ms"],
+                    "end_offset_ms": segment["end_offset_ms"],
+                    "split_source": "single_turn",
+                    "low_alignment": float(dominant_match.get("overlap_ratio") or 0.0) < 0.35,
+                    "needs_review": False,
+                    "unresolved_reasons": [],
+                }
+            ]
+
+        for fragment in fragments:
+            if fragment["end_offset_ms"] <= fragment["start_offset_ms"]:
+                continue
+            aligned_segment, debug_link = build_aligned_fragment(
+                segment,
+                fragment,
+                cluster_memory,
+                cluster_prototypes,
+                source_audio_path,
+            )
+            aligned_segments.append(aligned_segment)
+            turn_to_segment_links.append(debug_link)
+    return aligned_segments, turn_to_segment_links
+
+
+def build_audio_primary_segments(
+    meeting_id: int,
+    source_audio_path: Path,
+    audio_source_id: int | None,
+    participant_rows: list[sqlite3.Row],
+    activity_rows: list[sqlite3.Row],
+) -> tuple[list[dict], dict]:
+    whisper_result = load_whisperx_result(source_audio_path, meeting_id)
+    master_segments = build_segments_from_whisper_result(
+        whisper_result,
+        participant_id=None,
+        participant_audio_asset_id=None,
+        audio_source_id=audio_source_id,
+        base_offset_ms=0,
+        assignment_method="audio_cluster_match_review",
+        assignment_confidence=0.0,
+        needs_speaker_review=True,
+        source_audio_path=source_audio_path,
+    )
+    if not master_segments:
+        return [], {
+            "transcript_segment_count": 0,
+            "diarized_turn_count": 0,
+            "profile_count": 0,
+            "pass_count": 0,
+        }
+
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_MATERIALIZING_AUDIO,
+        None,
+        None,
+        "Speaker diarization çalışıyor",
+    )
+    diarized_turns = diarize_speaker_turns(source_audio_path)
+    if not diarized_turns:
+        raise RuntimeError("Pyannote diarization hiçbir speaker turn üretmedi.")
+
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_MATERIALIZING_AUDIO,
+        None,
+        None,
+        "Speaker embeddingleri çıkarılıyor",
+    )
+    diarized_turns = attach_embeddings_to_turns(diarized_turns, source_audio_path)
+    diarized_turns, global_dom_priors = attach_dom_priors_to_turns(diarized_turns, activity_rows)
+    diarized_turns, cluster_prototypes, cluster_split_lineage = refine_impure_clusters(diarized_turns)
+
+    participant_ids = [
+        int(row["id"])
+        for row in participant_rows
+        if not bool(row["is_bot"]) and not is_roster_heading_name(row["display_name"])
+    ]
+    if not participant_ids:
+        raise RuntimeError("Toplantıda eşlenecek görünür participant bulunamadı.")
+
+    cluster_dom_priors = build_cluster_dom_priors(diarized_turns)
+    participant_profiles = build_participant_profiles(diarized_turns, participant_ids)
+    update_meeting_postprocess_status(
+        meeting_id,
+        POSTPROCESS_STATUS_ASSEMBLING_SEGMENTS,
+        None,
+        None,
+        "Konuşmacılar audio cluster'larla eşleştiriliyor",
+    )
+    assigned_turns, cluster_memory, participant_profiles, pass_history = run_iterative_turn_assignment(
+        diarized_turns,
+        participant_ids,
+        participant_profiles,
+        cluster_prototypes,
+        cluster_dom_priors,
+        global_dom_priors,
+    )
+    final_segments, turn_to_segment_links = align_segments_to_turns(
+        master_segments,
+        assigned_turns,
+        cluster_memory,
+        cluster_prototypes,
+        source_audio_path,
+    )
+    return final_segments, {
+        "transcript_segment_count": len(master_segments),
+        "diarized_turn_count": len(diarized_turns),
+        "profile_count": len(participant_profiles),
+        "pass_count": len(pass_history),
+        "diarized_turns": diarized_turns,
+        "profiles": participant_profiles,
+        "cluster_prototypes": cluster_prototypes,
+        "cluster_split_lineage": cluster_split_lineage,
+        "cluster_memory": cluster_memory,
+        "cluster_dom_priors": cluster_dom_priors,
+        "pass_history": pass_history,
+        "global_dom_priors": global_dom_priors,
+        "assigned_turns": assigned_turns,
+        "turn_to_segment_links": turn_to_segment_links,
+    }
 
 
 def transcribe_participant_assets(
@@ -1974,6 +3621,8 @@ def build_transcript_segments(participant_segments: list[dict], mixed_segments: 
             previous["participant_id"] == segment["participant_id"]
             and previous["text"].casefold() == segment["text"].casefold()
             and abs(previous["start_offset_ms"] - segment["start_offset_ms"]) <= 800
+            and previous.get("assignment_method") == segment.get("assignment_method")
+            and previous.get("cluster_lineage") == segment.get("cluster_lineage")
         ):
             previous["end_offset_ms"] = max(previous["end_offset_ms"], segment["end_offset_ms"])
             previous["needs_speaker_review"] = previous["needs_speaker_review"] or segment["needs_speaker_review"]
@@ -2369,7 +4018,10 @@ def process_meeting(meeting_id: int):
         and asset["master_audio_path"]
         and Path(asset["master_audio_path"]).exists()
     )
-    dependency_error = dependency_error_message(require_whisperx=audio_ready)
+    if not audio_ready:
+        raise RuntimeError("Audio-primary speaker assignment için hazır mixed master audio bulunamadı.")
+
+    dependency_error = dependency_error_message(require_whisperx=True, require_pyannote=True)
     if dependency_error:
         raise RuntimeError(dependency_error)
 
@@ -2392,7 +4044,7 @@ def process_meeting(meeting_id: int):
 
     source_audio_path: Path | None = None
     mixed_source_id: int | None = None
-    if audio_ready and asset is not None:
+    if asset is not None:
         master_audio_path = Path(asset["master_audio_path"])
         pcm_audio_path = Path(asset["pcm_audio_path"]) if asset["pcm_audio_path"] else None
         if not pcm_audio_path or not pcm_audio_path.exists():
@@ -2405,48 +4057,70 @@ def process_meeting(meeting_id: int):
             bind_audio_sources(meeting_id, audio_source_rows, activity_rows)
             persist_json(get_alignment_map_path(meeting_id), compute_source_vad(source_audio_path, activity_rows))
 
-    update_meeting_postprocess_status(
-        meeting_id,
-        POSTPROCESS_STATUS_MATERIALIZING_AUDIO,
-        None,
-        None,
-        "Participant audio assetleri uretiliyor",
-    )
-    clear_previous_outputs(meeting_id)
-    participant_audio_assets: list[sqlite3.Row] = []
-    if source_audio_path is not None and source_audio_path.exists():
-        participant_audio_assets = materialize_participant_audio_assets(
-            meeting_id,
-            source_audio_path,
-            mixed_source_id,
-            activity_rows,
-        )
+    if source_audio_path is None or not source_audio_path.exists():
+        raise RuntimeError("PCM meeting audio hazırlanamadı.")
 
     update_meeting_postprocess_status(
         meeting_id,
-        POSTPROCESS_STATUS_TRANSCRIBING_PARTICIPANTS,
+        POSTPROCESS_STATUS_TRANSCRIBING,
         None,
         None,
-        "Participant bazli ASR calisiyor" if participant_audio_assets else "Mixed fallback ASR calisiyor",
+        "Mixed master audio transcript ve diarization hazırlanıyor",
     )
     participant_lookup = build_participant_lookup(fetch_meeting_participants(meeting_id))
-    participant_segments = transcribe_participant_assets(meeting_id, participant_audio_assets)
-    mixed_segments: list[dict] = []
-    if not participant_segments and source_audio_path is not None and source_audio_path.exists():
-        mixed_segments = transcribe_mixed_fallback(
-            meeting_id,
-            source_audio_path,
-            mixed_source_id,
-            activity_rows,
-        )
-    final_segments = build_transcript_segments(participant_segments, mixed_segments)
+    participant_audio_assets: list[sqlite3.Row] = []
+    final_segments, assignment_debug = build_audio_primary_segments(
+        meeting_id,
+        source_audio_path,
+        mixed_source_id,
+        participant_rows,
+        activity_rows,
+    )
+    final_segments = build_transcript_segments(final_segments, [])
+    clear_previous_outputs(meeting_id)
     persist_json(
         get_whisperx_result_path(meeting_id),
         {
             "participant_asset_count": len(participant_audio_assets),
-            "participant_segment_count": len(participant_segments),
-            "mixed_segment_count": len(mixed_segments),
+            "participant_segment_count": 0,
+            "mixed_segment_count": assignment_debug.get("transcript_segment_count", len(final_segments)),
+            "diarized_turn_count": assignment_debug.get("diarized_turn_count", 0),
+            "profile_count": assignment_debug.get("profile_count", 0),
+            "assignment_pass_count": assignment_debug.get("pass_count", 0),
             "final_segment_count": len(final_segments),
+        },
+    )
+    persist_json(
+        get_meeting_artifact_path(meeting_id, "speaker_diarization.json"),
+        {
+            "turns": assignment_debug.get("diarized_turns", []),
+            "assigned_turns": assignment_debug.get("assigned_turns", []),
+            "cluster_split_lineage": assignment_debug.get("cluster_split_lineage", {}),
+            "cluster_prototypes": assignment_debug.get("cluster_prototypes", {}),
+        },
+    )
+    persist_json(
+        get_meeting_artifact_path(meeting_id, "speaker_profiles.json"),
+        assignment_debug.get("profiles", {}),
+    )
+    persist_json(
+        get_meeting_artifact_path(meeting_id, "speaker_assignment_debug.json"),
+        {
+            "cluster_memory": assignment_debug.get("cluster_memory", {}),
+            "cluster_dom_priors": assignment_debug.get("cluster_dom_priors", {}),
+            "cluster_prototypes": assignment_debug.get("cluster_prototypes", {}),
+            "cluster_purity": {
+                label: payload.get("purity")
+                for label, payload in assignment_debug.get("cluster_prototypes", {}).items()
+            },
+            "cluster_split_lineage": assignment_debug.get("cluster_split_lineage", {}),
+            "turn_to_segment_links": assignment_debug.get("turn_to_segment_links", []),
+            "pass_history": assignment_debug.get("pass_history", []),
+            "global_dom_priors": assignment_debug.get("global_dom_priors", {}),
+            "profile_source_kind": {
+                participant_id: payload.get("source_kind")
+                for participant_id, payload in assignment_debug.get("profiles", {}).items()
+            },
         },
     )
 
