@@ -1,8 +1,15 @@
 # Notera
 
-Notera, Microsoft Teams toplantılarına bot ile katılıp canlı caption, ses kaydı ve önizleme toplayan; toplantı sonrasında transcript'i işleyip review akışıyla düzenlemeyi sağlayan bir uygulamadır.
+Notera, Microsoft Teams toplantılarına bot ile katılıp toplantı verisini toplayan; toplantı bittiğinde audio-first postprocess çalıştırıp transcript, konuşmacı eşleşmesi ve review akışını tek ekranda sunan bir uygulamadır.
 
-## Mimari
+Bugünkü yapı dört ana parçadan oluşur:
+
+- `frontend/`: React + TypeScript + Vite arayüzü
+- `backend/`: FastAPI API, auth, snapshot, review ve export katmanı
+- `backend/workers/`: Teams botu ve postprocess worker’ları
+- `data/`: SQLite veritabanı ve üretilen meeting artefact’ları
+
+## Sistem Akışı
 
 ```mermaid
 %%{init: { "sequence": { "mirrorActors": false } } }%%
@@ -12,53 +19,142 @@ sequenceDiagram
     participant A as Backend API
     participant S as Meeting Supervisor
     participant B as Bot Worker
-    participant T as Teams Meeting
+    participant T as Teams
     participant X as SQLite + Artifacts
     participant P as Postprocess Worker
 
-    U->>F: Meeting oluştur / transcript ekranını aç
-    F->>A: HTTP request
-    A->>X: Meeting kaydını oku / yaz
-    A->>S: Bot worker başlat
-    S->>B: Process spawn
-    B->>T: Toplantıya katıl ve izle
-    B->>X: Caption, audio, preview ve status yaz
-    B-->>S: Bot süreci biter
-    S->>P: Postprocess worker başlat
-    P->>X: Caption + audio artefact'larını oku
-    P->>X: Final transcript, review ve export verilerini yaz
-    F->>A: Snapshot / review / export istekleri
-    A->>X: Son verileri oku
-    A-->>F: Transcript ve meeting durumu dön
+    U->>F: Register / login
+    U->>F: Meeting oluştur
+    F->>A: POST /api/meetings
+    A->>X: meeting kaydı oluştur
+
+    U->>F: Toplantıyı başlat
+    F->>A: POST /api/meetings/:id/join
+    A->>S: bot worker başlat
+    S->>B: subprocess spawn
+    B->>T: Teams toplantısına katıl
+    B->>X: participant registry, speaker activity, preview, raw audio yaz
+
+    B-->>S: bot süreci tamamlanır
+    S->>P: postprocess başlat
+    P->>X: master audio + canonical Teams artefact'larını oku
+    P->>X: transcript segment, review item, participant asset ve export verisi yaz
+
+    F->>A: GET /api/meetings/:id/snapshot
+    A->>X: meeting + participant + segment + review oku
+    A-->>F: transcript ekranı snapshot'ı dön
+
+    U->>F: merge / reassign / split / export
+    F->>A: review ve export endpoint'leri
+    A->>X: DB ve artefact güncelle
 ```
 
-Kısa akış:
+Özet akış:
 
-1. Frontend kullanıcı aksiyonlarını Backend API'ye gönderir.
-2. Backend meeting kaydını açar ve `MeetingSupervisor` üzerinden bot worker başlatır.
-3. Bot worker Teams toplantısına katılır; canlı caption, ses ve önizleme üretip runtime verisine yazar.
-4. Bot tamamlanınca supervisor postprocess worker başlatır.
-5. Postprocess worker toplanan veriyi işleyip final transcript ve review kayıtlarını üretir.
-6. Frontend dashboard ve transcript ekranları bu son durumu API üzerinden okur.
+1. Dashboard üzerinden bir Teams linki ile meeting kaydı açılır.
+2. `MeetingSupervisor`, bot worker’ı subprocess olarak başlatır.
+3. Bot Teams toplantısına katılır ve runtime verisini `data/` altına yazar.
+4. Bot bittiğinde supervisor postprocess worker’ı tetikler.
+5. Postprocess master audio üzerinden segment üretir, konuşmacı ataması yapar ve review verisi oluşturur.
+6. Transcript ekranı snapshot endpoint’i üzerinden son durumu okur.
 
-## Özellikler
+## Ürün Özeti
 
-- Teams toplantı linki ile yeni toplantı başlatma
-- Toplantı sırasında canlı caption, ses kaydı ve ekran önizlemesi toplama
-- Toplantı sonrasında transcript işleme
-- Transcript ekranında review akışı
-- `TXT` ve `CSV` export
+- Email tabanlı register / login
+- Dashboard’dan Teams linki ile meeting oluşturma
+- Bot ile toplantıya katılma ve toplantıyı durdurma
+- Canlı preview görüntüsü alma
+- Master audio capture ve meeting artefact üretimi
+- Participant registry ve konuşmacı eşleme
+- Transcript ekranında:
+  - audio player
+  - participant registry
+  - merge / split / reassign review akışı
+  - TXT ve CSV export
 
-## Klasörler
+## Repo Haritası
 
-- `frontend/`
-  React + TypeScript + Vite arayüzü
-- `backend/`
-  FastAPI API, auth, meeting lifecycle, review ve export mantığı
-- `backend/workers/`
-  Teams botu ve transcript işleme worker'ları
-- `data/`
-  SQLite veritabanı ve üretilen artefact'lar
+### Backend
+
+- `backend/main.py`
+  FastAPI uygulaması, middleware, route registration, startup bootstrap
+- `backend/__main__.py`
+  Uvicorn giriş noktası
+- `backend/api/routes/`
+  `auth`, `meetings`, `reviews`, `media`, `exports`
+- `backend/orchestration/supervisor.py`
+  Bot ve postprocess worker subprocess yaşam döngüsü
+- `backend/workers/bot.py`
+  Teams katılımı, preview, roster, speaker activity ve audio capture
+- `backend/workers/postprocess_worker.py`
+  Audio materialization, transcription, speaker assignment ve review üretimi
+- `backend/services/`
+  Meeting, auth, export, review ve transcript snapshot mantığı
+- `backend/runtime/`
+  Path, bootstrap, logging, sabitler ve runtime yardımcıları
+
+### Frontend
+
+- `frontend/src/features/auth/`
+  Login / register ekranı
+- `frontend/src/features/dashboard/`
+  Meeting oluşturma, başlatma, durdurma ve silme akışı
+- `frontend/src/features/transcripts/`
+  Snapshot polling, transcript ekranı, participant registry ve review araçları
+- `frontend/src/components/`
+  Status pill, metric card, app shell, audio player
+- `frontend/src/styles/`
+  Token, base, component ve page seviyesinde stil katmanı
+
+### Test ve Araçlar
+
+- `tests/test_participant_keys.py`
+  Participant identity / key stabilitesi
+- `tests/test_participant_names.py`
+  Participant isim normalizasyonu
+- `tests/test_postprocess_audio_windows.py`
+  Audio window mantığı
+- `tests/test_meeting_audio_chunk_writer.py`
+  Audio finalize / chunk writer davranışı
+- `backend/tools/meeting_regression.py`
+  Kayıtlı meeting’ler için replay / summary aracı
+
+## Veri ve Artefact Yapısı
+
+Varsayılan veri kökü `data/` klasörüdür.
+
+```text
+data/
+  notera.db
+  live_previews/
+  meeting_audio/
+    meeting_<id>/
+      master.webm
+      master_16k_mono.wav
+      teams_canonical.json
+      whisperx_result.json
+      alignment_map.json
+      chunks/
+      sources/
+      participants/
+  review_clips/
+  runtime_cache/
+```
+
+Önemli noktalar:
+
+- `notera.db`
+  Uygulamanın ana SQLite veritabanı
+- `meeting_audio/meeting_<id>/`
+  Her meeting için ham ve işlenmiş audio artefact’ları
+- `teams_canonical.json`
+  Bot tarafının normalize ettiği Teams / participant / speaker activity özeti
+- `whisperx_result.json`
+  Postprocess sonucunda üretilen transcript ve eşleme özeti
+- `live_previews/`
+  Kullanıcı bazlı son preview görseli
+- `review_clips/`
+  Review ekranında kullanılan kısa audio clip’ler
 
 ## Gereksinimler
 
@@ -68,13 +164,11 @@ Kısa akış:
 - ffmpeg
 - Playwright Chromium
 
-`environment.yml` Python, Node ve backend bağımlılıklarını hazırlar.
+Python bağımlılıkları `backend/requirements.txt`, Node bağımlılıkları `frontend/package.json` içinde tutulur. Conda ortamı `environment.yml` ile kurulabilir.
 
 ## Kurulum
 
-### 1. Conda ortamını kur
-
-Yeni kurulum:
+### 1. Conda ortamını oluştur
 
 ```bash
 conda env create -f environment.yml
@@ -88,13 +182,13 @@ conda env update -n teams-bot -f environment.yml --prune
 conda activate teams-bot
 ```
 
-### 2. Playwright browser yükle
+### 2. Playwright Chromium yükle
 
 ```bash
 conda run -n teams-bot python -m playwright install chromium
 ```
 
-### 3. Frontend paketlerini yükle
+### 3. Frontend bağımlılıklarını kur
 
 ```bash
 cd frontend
@@ -108,14 +202,18 @@ cd ..
 cp .env.example .env
 ```
 
-Varsayılan ayarlar çoğu lokal kullanım için yeterlidir. Özelleştirme gerekiyorsa `.env.example` dosyasını temel al.
+Lokal geliştirmede çoğu durumda `.env` zorunlu değildir. Varsayılan path’ler repo altındaki `data/` klasörünü kullanır.
 
 ## Ortam Değişkenleri
 
-Backend için sık kullanılan değişkenler:
+Backend `NOTERA_` prefix’i ile çalışır.
+
+### Sık kullanılan backend değişkenleri
 
 - `NOTERA_API_HOST`
 - `NOTERA_API_PORT`
+- `NOTERA_LOG_LEVEL`
+- `NOTERA_LOG_FORMAT`
 - `NOTERA_SESSION_SECRET`
 - `NOTERA_DB_PATH`
 - `NOTERA_MEETING_AUDIO_ROOT`
@@ -124,64 +222,182 @@ Backend için sık kullanılan değişkenler:
 - `NOTERA_RUNTIME_CACHE_ROOT`
 - `NOTERA_BOT_PYTHON_BIN`
 
-Frontend için opsiyonel değişken:
+### Frontend değişkenleri
 
 - `VITE_API_BASE_URL`
+- `VITE_LOG_LEVEL`
 
-Geliştirme modunda Vite `/api` ve `/health` isteklerini otomatik olarak backend'e proxy eder. Bu yüzden çoğu lokal kullanımda `VITE_API_BASE_URL` tanımlamak gerekmez.
+Not:
 
-## Lokal Çalıştırma
+- Vite dev server `/api` ve `/health` isteklerini otomatik olarak `http://127.0.0.1:8000` backend’ine proxy eder.
+- Bu yüzden lokal geliştirmede çoğu zaman `VITE_API_BASE_URL` tanımlamak gerekmez.
 
-Backend:
+## Lokal Geliştirme
+
+### Backend
 
 ```bash
 conda run -n teams-bot python -m backend
 ```
 
-Frontend:
+Backend varsayılan olarak:
+
+- `0.0.0.0:8000` üstünde açılır
+- startup sırasında SQLite schema bootstrap çalıştırır
+- supervisor reconciliation yapar
+- hot reload açmaz
+
+### Frontend
 
 ```bash
 cd frontend
 conda run -n teams-bot npm run dev
 ```
 
-Adresler:
+Varsayılan adresler:
 
-- Frontend: `http://localhost:5173`
+- Frontend dev: `http://localhost:5173`
+- Frontend preview: `http://localhost:4173`
 - Backend health: `http://localhost:8000/health`
 
-## Kullanım Akışı
+## Kullanıcı Akışı
 
-1. Kullanıcı giriş yapar.
-2. Dashboard üzerinden toplantı adı ve Teams toplantı linki girer.
-3. Backend toplantı kaydını oluşturur ve bot sürecini başlatır.
-4. Bot toplantıya katılır, caption, ses ve önizleme üretir.
-5. Toplantı tamamlandıktan sonra transcript işleme aşaması çalışır.
-6. Transcript ekranında review önerileri, önizleme ve export aksiyonları görünür.
+### 1. Giriş
 
-## Doğrulama
+- İlk kullanımda `Register`
+- Sonraki kullanımlarda `Login`
+- Session cookie backend tarafından yazılır
 
-Frontend type-check:
+### 2. Meeting oluştur
+
+Dashboard’da:
+
+- toplantı adı gir
+- gerçek Teams join linki gir
+- istersen audio capture toggle’ını açık bırak
+
+Backend `POST /api/meetings` ile meeting kaydı oluşturur.
+
+### 3. Meeting’i başlat
+
+Dashboard’daki `join` aksiyonu:
+
+- `POST /api/meetings/{id}/join`
+- supervisor bot worker başlatır
+- meeting durumu `joining` / `active` olur
+
+### 4. Toplantı sırasında
+
+Bot şunları üretir:
+
+- participant registry
+- speaker activity
+- live preview
+- raw / master audio artefact’ları
+
+### 5. Toplantı bittikten sonra
+
+Supervisor postprocess worker başlatır.
+
+Postprocess:
+
+- audio’yu materialize eder
+- transcription çalıştırır
+- participant asset üretir
+- segmentleri konuşmacılarla eşlemeye çalışır
+- review ve export verisini hazırlar
+
+### 6. Transcript ekranı
+
+Transcript sayfası `GET /api/meetings/{id}/snapshot` ile tüm durumu tek payload olarak çeker.
+
+Bu ekran üzerinden:
+
+- master audio dinlenir
+- participant registry kontrol edilir
+- duplicate participant merge yapılır
+- segment speaker ataması güncellenir
+- segment split yapılır
+- TXT / CSV export alınır
+
+## Temel API Yüzeyi
+
+### Auth
+
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `GET /api/auth/me`
+
+### Meetings
+
+- `GET /api/meetings`
+- `POST /api/meetings`
+- `GET /api/meetings/{meeting_id}`
+- `POST /api/meetings/{meeting_id}/join`
+- `POST /api/meetings/{meeting_id}/stop`
+- `DELETE /api/meetings/{meeting_id}`
+- `GET /api/meetings/{meeting_id}/snapshot`
+
+### Reviews
+
+- `PATCH /api/transcript-segments/{segment_id}/participant`
+- `POST /api/meetings/{meeting_id}/participants/merge`
+- `POST /api/meetings/{meeting_id}/participants/split`
+
+### Media
+
+- `GET /api/media/meetings/{meeting_id}/audio`
+- `GET /api/media/meetings/{meeting_id}/preview`
+- `GET /api/media/meetings/{meeting_id}/participants/{participant_id}/audio`
+- `GET /api/media/reviews/{review_id}/clip`
+
+### Export
+
+- `GET /api/meetings/{meeting_id}/export.txt`
+- `GET /api/meetings/{meeting_id}/export.csv`
+
+## Doğrulama Komutları
+
+### Frontend type-check
 
 ```bash
 cd frontend
 ./node_modules/.bin/tsc -b
 ```
 
-Frontend production build:
+### Frontend production build
 
 ```bash
 cd frontend
 conda run -n teams-bot npm run build
 ```
 
-Backend syntax doğrulaması:
+### Backend syntax kontrolü
 
 ```bash
 conda run -n teams-bot python -m compileall backend
 ```
 
-Şu an repoda ayrı bir lint veya otomatik test komutu tanımlı değil. Günlük doğrulama akışı build ve syntax kontrolleri üzerinden ilerliyor.
+### Testler
+
+```bash
+conda run -n teams-bot python -m unittest discover -s tests -p 'test_*.py'
+```
+
+### Recorded meeting regression aracı
+
+Sadece summary görmek için:
+
+```bash
+conda run -n teams-bot python -m backend.tools.meeting_regression 1 2
+```
+
+Postprocess’i yeniden koşturup özet almak için:
+
+```bash
+conda run -n teams-bot python -m backend.tools.meeting_regression --rerun 1 2
+```
 
 ## Production
 
@@ -195,8 +411,33 @@ Production compose dosyası:
 docker compose -f docker-compose.prod.yml up --build -d
 ```
 
-Varsayılan davranış:
+Production container yapısı:
 
-- frontend host üzerinde `3000` portunda açılır
+- backend image:
+  - `backend/Dockerfile`
+  - Python 3.11 slim
+  - ffmpeg
+  - Playwright Chromium
+  - veri kökü `/data`
+- frontend image:
+  - `frontend/Dockerfile`
+  - Vite build + nginx
+
+Varsayılan production davranışı:
+
+- frontend host üzerinde `3000` portundan yayınlanır
 - backend container içinde `8000` portunda çalışır
-- kalıcı veri `notera-data` volume'unda tutulur
+- kalıcı veri `notera-data` volume’unda tutulur
+
+Production notları:
+
+- `NOTERA_SESSION_SECRET` mutlaka değiştirilmeli
+- backend data path’leri volume üstünde kalıcı tutulmalı
+- production compose dosyasında backend port mapping yok; frontend nginx backend’e container network üzerinden erişir
+
+## Geliştirme Notları
+
+- Backend startup sırasında schema bootstrap yapar; ayrı migration aracı yoktur.
+- Supervisor, yarım kalmış worker run’ları startup’ta reconcile eder.
+- Meeting artefact’ları ve DB kayıtları birlikte düşünülmelidir; sadece DB temizliği yeterli değildir.
+- Completed bir meeting’i yeniden başlatmak yerine yeni meeting kaydı açmak daha doğru akıştır.
