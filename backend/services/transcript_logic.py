@@ -24,6 +24,7 @@ from backend.schemas.transcript import (
     SnapshotSummaryOut,
 )
 from backend.runtime.paths import get_meeting_pcm_audio_path, preview_path
+from backend.runtime.participant_names import is_roster_heading_name, normalize_participant_name
 
 
 def speaker_initials(name: str) -> str:
@@ -88,12 +89,42 @@ def participant_binding_state(
     participant: MeetingParticipant,
     segments: list[TranscriptSegment],
 ) -> str:
-    participant_segments = [segment for segment in segments if segment.participant_id == participant.id]
+    return participant_binding_state_for_ids({participant.id}, segments)
+
+
+def participant_binding_state_for_ids(
+    participant_ids: set[int],
+    segments: list[TranscriptSegment],
+) -> str:
+    participant_segments = [segment for segment in segments if segment.participant_id in participant_ids]
     if not participant_segments:
         return "unknown"
     if any(segment.needs_speaker_review for segment in participant_segments):
         return "provisional"
     return "confirmed"
+
+
+def participant_binding_rank(binding_state: str) -> int:
+    return {
+        "confirmed": 2,
+        "provisional": 1,
+        "unknown": 0,
+    }.get(binding_state, 0)
+
+
+def participant_key_rank(participant_key: str | None) -> int:
+    normalized = (participant_key or "").strip().lower()
+    if normalized.startswith("teams-platform:"):
+        return 3
+    if normalized.startswith("teams-roster:"):
+        return 2
+    if normalized.startswith("teams-name:"):
+        return 1
+    return 0
+
+
+def should_collapse_duplicate_participants(participants: list[MeetingParticipant]) -> bool:
+    return len(participants) > 1 and any((participant.participant_key or "").startswith("teams-name:") for participant in participants)
 
 
 def build_snapshot(
@@ -111,7 +142,11 @@ def build_snapshot(
     segment_rows = []
     for segment in segments:
         participant = participant_map.get(segment.participant_id) if segment.participant_id is not None else None
-        speaker = participant.display_name if participant is not None else "Unknown"
+        speaker = (
+            participant.display_name
+            if participant is not None and not is_roster_heading_name(participant.display_name)
+            else "Unknown"
+        )
         review_item = review_map.get(segment.id)
         end_ms = segment.end_offset_ms if segment.end_offset_ms is not None else segment.start_offset_ms
         total_seconds = int(round((end_ms or 0) / 1000))
@@ -154,19 +189,70 @@ def build_snapshot(
             )
         )
 
-    participant_rows = [
-        ParticipantOut(
-            id=participant.id,
-            display_name=participant.display_name,
-            binding_state=participant_binding_state(participant, segments),
-            segment_count=sum(1 for segment in segments if segment.participant_id == participant.id),
-            has_audio_asset=participant.id in asset_participant_ids,
-            is_bot=participant.is_bot,
-            join_state=participant.join_state,
-        )
+    segment_count_by_participant_id = {
+        participant.id: sum(1 for segment in segments if segment.participant_id == participant.id)
         for participant in participants
-        if not participant.is_bot and participant.join_state != "merged"
+    }
+    binding_state_by_participant_id = {
+        participant.id: participant_binding_state(participant, segments)
+        for participant in participants
+    }
+    visible_participants = [
+        participant
+        for participant in participants
+        if not participant.is_bot
+        and participant.join_state != "merged"
+        and not is_roster_heading_name(participant.display_name)
     ]
+    participants_by_name: dict[str, list[MeetingParticipant]] = {}
+    for participant in visible_participants:
+        name_key = normalize_participant_name(participant.display_name).casefold()
+        participants_by_name.setdefault(name_key, []).append(participant)
+
+    participant_rows = []
+    emitted_name_keys: set[str] = set()
+    for participant in visible_participants:
+        name_key = normalize_participant_name(participant.display_name).casefold()
+        grouped_participants = participants_by_name[name_key]
+        if should_collapse_duplicate_participants(grouped_participants):
+            if name_key in emitted_name_keys:
+                continue
+            emitted_name_keys.add(name_key)
+            participant_ids = {item.id for item in grouped_participants}
+            representative = max(
+                grouped_participants,
+                key=lambda item: (
+                    int(item.id in asset_participant_ids),
+                    segment_count_by_participant_id.get(item.id, 0),
+                    participant_binding_rank(binding_state_by_participant_id.get(item.id, "unknown")),
+                    participant_key_rank(item.participant_key),
+                    item.id,
+                ),
+            )
+            participant_rows.append(
+                ParticipantOut(
+                    id=representative.id,
+                    display_name=representative.display_name,
+                    binding_state=participant_binding_state_for_ids(participant_ids, segments),
+                    segment_count=sum(1 for segment in segments if segment.participant_id in participant_ids),
+                    has_audio_asset=any(participant_id in asset_participant_ids for participant_id in participant_ids),
+                    is_bot=representative.is_bot,
+                    join_state=representative.join_state,
+                )
+            )
+            continue
+
+        participant_rows.append(
+            ParticipantOut(
+                id=participant.id,
+                display_name=participant.display_name,
+                binding_state=binding_state_by_participant_id.get(participant.id, "unknown"),
+                segment_count=segment_count_by_participant_id.get(participant.id, 0),
+                has_audio_asset=participant.id in asset_participant_ids,
+                is_bot=participant.is_bot,
+                join_state=participant.join_state,
+            )
+        )
     pending_review_count = sum(1 for segment in segments if segment.needs_speaker_review)
     return MeetingSnapshotOut(
         meeting=SnapshotMeetingOut(id=meeting.id, title=meeting.title, status=meeting.status),

@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import wave
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -42,6 +43,7 @@ from backend.runtime.constants import (  # noqa: E402
     TRANSCRIPT_STATUS_ORIGINAL,
     TRANSCRIPT_STATUS_PENDING_REVIEW,
 )
+from backend.runtime.participant_names import is_roster_heading_name  # noqa: E402
 from backend.runtime.paths import (  # noqa: E402
     get_alignment_map_path,
     db_path as get_db_path,
@@ -362,7 +364,7 @@ def upsert_mixed_audio_source(
 def fetch_meeting_participants(meeting_id: int) -> list[sqlite3.Row]:
     conn = db_connection()
     try:
-        return conn.execute(
+        rows = conn.execute(
             """
             SELECT id, meeting_id, participant_key, platform_identity, display_name, normalized_name,
                    role, is_bot, join_state, merged_into_participant_id, first_seen_at, last_seen_at
@@ -372,6 +374,7 @@ def fetch_meeting_participants(meeting_id: int) -> list[sqlite3.Row]:
             """,
             (meeting_id,),
         ).fetchall()
+        return [row for row in rows if not is_roster_heading_name(row["display_name"])]
     finally:
         conn.close()
 
@@ -1721,6 +1724,13 @@ def build_activity_windows(activity_rows: list[sqlite3.Row]) -> list[dict]:
 
 
 def trim_audio_window(source_audio_path: Path, output_path: Path, start_offset_ms: int, end_offset_ms: int) -> bool:
+    source_duration_ms = probe_wav_duration_ms(source_audio_path)
+    if source_duration_ms is not None:
+        if start_offset_ms >= source_duration_ms:
+            return False
+        end_offset_ms = min(end_offset_ms, source_duration_ms)
+    if end_offset_ms <= start_offset_ms:
+        return False
     duration_ms = max(end_offset_ms - start_offset_ms, 1000)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -1739,7 +1749,22 @@ def trim_audio_window(source_audio_path: Path, output_path: Path, start_offset_m
         str(output_path),
     ]
     result = subprocess.run(command, capture_output=True, text=True)
-    return result.returncode == 0 and output_path.exists()
+    if result.returncode != 0 or not output_path.exists():
+        return False
+    trimmed_duration_ms = probe_wav_duration_ms(output_path)
+    return trimmed_duration_ms is not None and trimmed_duration_ms > 0
+
+
+def probe_wav_duration_ms(audio_path: Path) -> int | None:
+    try:
+        with wave.open(str(audio_path), "rb") as handle:
+            frame_count = handle.getnframes()
+            frame_rate = handle.getframerate()
+    except (FileNotFoundError, EOFError, wave.Error):
+        return None
+    if frame_rate <= 0:
+        return None
+    return int(round((frame_count / frame_rate) * 1000))
 
 
 def materialize_participant_audio_assets(
@@ -1837,6 +1862,8 @@ def transcribe_participant_assets(
     for asset in asset_rows:
         file_path = Path(asset["file_path"])
         if not file_path.exists():
+            continue
+        if (probe_wav_duration_ms(file_path) or 0) <= 0:
             continue
         result = load_whisperx_result(file_path, meeting_id)
         segments.extend(

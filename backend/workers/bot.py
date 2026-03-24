@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,10 @@ from backend.runtime.paths import (  # noqa: E402
     get_meeting_master_audio_path,
     get_meeting_pcm_audio_path,
 )
+from backend.runtime.participant_names import (  # noqa: E402
+    is_roster_heading_name,
+    normalize_participant_name,
+)
 from backend.runtime.teams_links import (  # noqa: E402
     TEAMS_JOIN_WITH_ID_PAGE_URL,
     parse_join_with_id_target,
@@ -68,7 +73,7 @@ CAPTION_REPLAY_BURST_MIN_MATCHES = 4
 CAPTION_REPLAY_VISIBLE_WINDOW = 8
 CAPTION_LOG_FALLBACK_LINE_WINDOW = 18
 PARTICIPANT_REGISTRY_CONFIG = {
-    "version": 2,
+    "version": 5,
     "panel_selectors": [
         "[data-tid='roster-panel']",
         "[data-tid*='roster-panel']",
@@ -119,6 +124,14 @@ PARTICIPANT_REGISTRY_CONFIG = {
         ".video-tile",
         "[class*='videoTile']",
     ],
+    "video_surface_selectors": [
+        "[data-tid='only-videos-wrapper']",
+        "[data-tid*='calling-pagination']",
+        "[data-tid*='video-gallery']",
+        "[data-tid*='gallery']",
+        "[data-stream-type='Video']",
+        "[role='menu'][data-acc-id]",
+    ],
     "name_selectors": [
         "[data-tid*='display-name']",
         "[data-tid*='participant-name']",
@@ -141,6 +154,27 @@ PARTICIPANT_REGISTRY_CONFIG = {
         "[class*='active-speaker']",
         "[class*='talking']",
         ".vdi-frame-occlusion",
+    ],
+    "voice_signal_selectors": [
+        "[data-tid='voice-level-stream-outline']",
+    ],
+    "signal_container_selectors": [
+        "[role='menuitem']",
+        "[role='listitem']",
+        "[role='row']",
+        "[role='treeitem']",
+        "[role='option']",
+        "[data-tid*='participant']",
+        "[data-tid*='roster-item']",
+        "[data-tid*='video-tile']",
+        "[data-tid*='videoTile']",
+        "[data-tid*='calling-participant']",
+        ".participant-tile",
+        ".video-tile",
+        ".roster-item",
+    ],
+    "occlusion_class_names": [
+        "vdi-frame-occlusion",
     ],
     "identity_attributes": [
         "data-participant-id",
@@ -509,6 +543,10 @@ async def install_participant_registry_hook(page):
                 if (!candidate || candidate.length > 120) return false;
                 if (/^(participants?|people|meeting chat|chat|search|call controls|more options)$/i.test(candidate)) return false;
                 if (/^(organizer|presenter|attendee|guest|speaker|microphone|muted)$/i.test(candidate)) return false;
+                if (/^(?:in|not in) this meeting(?:\s*\(\d+\))?$/i.test(candidate)) return false;
+                if (/^(?:bu toplantıda|bu toplantida)(?:\s*\(\d+\))?$/i.test(candidate)) return false;
+                if (/^(?:bu toplantıda değil|bu toplantida degil)(?:\s*\(\d+\))?$/i.test(candidate)) return false;
+                if (/^\d+\s+(?:people|participants?)$/i.test(candidate)) return false;
                 return true;
               };
               const queryAllSafe = (root, selectors) => {
@@ -539,6 +577,19 @@ async def install_participant_registry_hook(page):
                 }
                 return '';
               };
+              const extractAttributeWithSource = (row, names) => {
+                for (const name of names || []) {
+                  const direct = row.getAttribute?.(name);
+                  if (direct) return { value: direct, source: name };
+                }
+                for (const child of Array.from(row.querySelectorAll('*')).slice(0, 12)) {
+                  for (const name of names || []) {
+                    const value = child.getAttribute?.(name);
+                    if (value) return { value, source: name };
+                  }
+                }
+                return { value: '', source: '' };
+              };
               const extractDisplayName = (row, lines) => {
                 for (const selector of config.name_selectors || []) {
                   try {
@@ -551,11 +602,54 @@ async def install_participant_registry_hook(page):
                 }
                 return lines.find((line) => isLikelyDisplayName(line)) || '';
               };
-              const detectSpeaking = (row, text) => {
-                if (queryAllSafe(row, config.speaking_selectors).length > 0) {
-                  return true;
+              const matchesAnySelector = (node, selectors) => {
+                for (const selector of selectors || []) {
+                  try {
+                    if (node?.matches?.(selector)) return true;
+                  } catch (_err) {
+                    continue;
+                  }
+                }
+                return false;
+              };
+              const closestMatchingAncestor = (node, selectors) => {
+                let current = node instanceof Element ? node : node?.parentElement;
+                while (current) {
+                  if (matchesAnySelector(current, selectors)) {
+                    return current;
+                  }
+                  current = current.parentElement;
+                }
+                return null;
+              };
+              const detectSpeakingFromVoiceSignal = (row) => {
+                const voiceOutline = queryAllSafe(row, config.voice_signal_selectors || []).find((node) => node instanceof HTMLElement);
+                if (!voiceOutline) {
+                  return { isSpeaking: false, hasSignal: false };
+                }
+                let current = voiceOutline;
+                while (current) {
+                  for (const className of config.occlusion_class_names || []) {
+                    if (current.classList?.contains?.(className)) {
+                      return { isSpeaking: true, hasSignal: true };
+                    }
+                  }
+                  current = current.parentElement;
+                }
+                return { isSpeaking: false, hasSignal: true };
+              };
+              const detectSpeaking = (row, text, sourceKind) => {
+                const voiceDetection = detectSpeakingFromVoiceSignal(row);
+                if (voiceDetection.hasSignal) {
+                  return voiceDetection.isSpeaking;
+                }
+                if (sourceKind !== 'participant_panel') {
+                  return false;
                 }
                 return /(currently speaking|is speaking|konusuyor|konuşuyor|speaking|talking)/.test(lower(text));
+              };
+              const hasVoiceSignal = (row) => {
+                return detectSpeakingFromVoiceSignal(row).hasSignal;
               };
               const buildEntry = (row, sourceKind) => {
                 if (!isVisible(row)) return null;
@@ -564,13 +658,14 @@ async def install_participant_registry_hook(page):
                 const lines = text.split('\\n').map((line) => normalize(line)).filter(Boolean);
                 const displayName = extractDisplayName(row, lines);
                 if (!isLikelyDisplayName(displayName)) return null;
+                const stableKeyMatch = extractAttributeWithSource(row, ['data-key', 'data-item-key']);
+                const platformIdentityMatch = extractAttributeWithSource(row, config.identity_attributes);
                 const stableKey =
-                  extractAttribute(row, ['data-key', 'data-item-key', 'data-id', 'data-person-id'])
+                  stableKeyMatch.value
                   || row.id
-                  || row.getAttribute('aria-posinset')
                   || '';
                 const platformIdentity =
-                  extractAttribute(row, config.identity_attributes)
+                  platformIdentityMatch.value
                   || row.dataset?.participantId
                   || row.dataset?.personId
                   || '';
@@ -579,10 +674,12 @@ async def install_participant_registry_hook(page):
                 return {
                   display_name: displayName,
                   stable_key: stableKey,
+                  stable_key_source: stableKeyMatch.source || (row.id ? 'id' : ''),
                   platform_identity: platformIdentity,
+                  source_kind: sourceKind,
                   role: roleLine || null,
                   join_state: /(left|not in this meeting|ayrildi|ayrıldı)/.test(lowered) ? 'left' : 'present',
-                  is_speaking: detectSpeaking(row, text),
+                  is_speaking: detectSpeaking(row, text, sourceKind),
                   is_muted: /(muted|mic off|microphone off|mikrofon kapali|mikrofon kapalı|sesi kapali|sesi kapalı)/.test(lowered),
                   is_bot: /transcription bot|notera bot| bot$/i.test(displayName),
                   dom_key: [
@@ -624,6 +721,34 @@ async def install_participant_registry_hook(page):
                 }
                 return roots;
               };
+              const findVideoRoots = () => {
+                const roots = [];
+                for (const selector of config.video_surface_selectors || []) {
+                  try {
+                    for (const node of Array.from(document.querySelectorAll(selector))) {
+                      pushUnique(roots, node);
+                    }
+                  } catch (_err) {
+                    continue;
+                  }
+                }
+                return roots;
+              };
+              const collectVoiceSignalEntries = (results, seen) => {
+                const voiceSignals = queryAllSafe(document, config.voice_signal_selectors || []);
+                for (const signalNode of voiceSignals) {
+                  const container = closestMatchingAncestor(signalNode, config.signal_container_selectors || config.row_selectors || []);
+                  if (!container || !isVisible(container) || !hasVoiceSignal(container)) {
+                    continue;
+                  }
+                  const entry = buildEntry(container, 'voice_signal');
+                  if (!entry) continue;
+                  const dedupeKey = `${entry.stable_key}|${entry.platform_identity}|${entry.display_name}|voice_signal`;
+                  if (seen.has(dedupeKey)) continue;
+                  seen.add(dedupeKey);
+                  results.push(entry);
+                }
+              };
               const collectFromRoots = (roots, sourceKind, results, seen) => {
                 for (const root of roots) {
                   const rows = queryAllSafe(root, config.row_selectors);
@@ -653,6 +778,10 @@ async def install_participant_registry_hook(page):
                 const seen = new Set();
                 const roots = findPanelRoots();
                 collectFromRoots(roots, 'participant_panel', results, seen);
+                collectVoiceSignalEntries(results, seen);
+                if (!roots.length) {
+                  collectFromRoots(findVideoRoots(), 'video_surface', results, seen);
+                }
                 if (!results.length) {
                   collectVideoTileFallback(results, seen);
                 }
@@ -836,11 +965,13 @@ async def collect_participant_registry_snapshot(page, observed_at):
             item.get("display_name") or "",
             item.get("role"),
         )
-        if not display_name:
+        if not display_name or is_roster_heading_name(display_name):
             continue
         stable_key = normalize_caption_text(item.get("stable_key"))
         platform_identity = normalize_caption_text(item.get("platform_identity"))
         if is_generic_participant_identity(stable_key):
+            stable_key = ""
+        if is_unstable_stable_key(stable_key):
             stable_key = ""
         if is_generic_participant_identity(platform_identity):
             platform_identity = ""
@@ -848,7 +979,9 @@ async def collect_participant_registry_snapshot(page, observed_at):
             {
                 "display_name": display_name,
                 "stable_key": stable_key,
+                "stable_key_source": normalize_caption_text(item.get("stable_key_source")),
                 "platform_identity": platform_identity,
+                "source_kind": normalize_caption_text(item.get("source_kind")) or "participant_panel",
                 "role": role_value,
                 "join_state": normalize_caption_text(item.get("join_state")) or "present",
                 "is_speaking": bool(item.get("is_speaking")),
@@ -869,10 +1002,12 @@ async def collect_participant_registry_snapshot(page, observed_at):
         if current is None:
             deduped_items[dedupe_key] = item
             continue
-        current_score = int(bool(current.get("platform_identity"))) * 4 + int(bool(current.get("stable_key"))) * 2 + int(bool(current.get("role")))
-        next_score = int(bool(item.get("platform_identity"))) * 4 + int(bool(item.get("stable_key"))) * 2 + int(bool(item.get("role")))
-        if next_score > current_score:
-            deduped_items[dedupe_key] = item
+        preferred, other = (
+            (item, current)
+            if participant_snapshot_item_score(item) > participant_snapshot_item_score(current)
+            else (current, item)
+        )
+        deduped_items[dedupe_key] = merge_participant_snapshot_items(preferred, other)
 
     final_items = list(deduped_items.values())
     by_display_name = {}
@@ -882,10 +1017,12 @@ async def collect_participant_registry_snapshot(page, observed_at):
         if current is None:
             by_display_name[display_key] = item
             continue
-        current_score = int(bool(current.get("platform_identity"))) * 4 + int(bool(current.get("stable_key"))) * 2 + int(bool(current.get("role")))
-        next_score = int(bool(item.get("platform_identity"))) * 4 + int(bool(item.get("stable_key"))) * 2 + int(bool(item.get("role")))
-        if next_score > current_score:
-            by_display_name[display_key] = item
+        preferred, other = (
+            (item, current)
+            if participant_snapshot_item_score(item) > participant_snapshot_item_score(current)
+            else (current, item)
+        )
+        by_display_name[display_key] = merge_participant_snapshot_items(preferred, other)
 
     return list(by_display_name.values())
 
@@ -937,6 +1074,22 @@ async def collect_participant_debug_state(page):
                   continue;
                 }
               }
+              let videoSurfaceCount = 0;
+              for (const selector of config?.video_surface_selectors || []) {
+                try {
+                  videoSurfaceCount += document.querySelectorAll(selector).length;
+                } catch (_err) {
+                  continue;
+                }
+              }
+              let voiceSignalCount = 0;
+              for (const selector of config?.voice_signal_selectors || []) {
+                try {
+                  voiceSignalCount += document.querySelectorAll(selector).length;
+                } catch (_err) {
+                  continue;
+                }
+              }
               return {
                 observer_installed: Boolean(window.__noteraParticipantRegistry?.observer),
                 snapshot_count: (window.__noteraParticipantRegistry?.lastSnapshot || []).length,
@@ -944,6 +1097,8 @@ async def collect_participant_debug_state(page):
                 visible_panels: visiblePanels,
                 row_selector_match_count: rowCount,
                 tile_selector_match_count: tileCount,
+                video_surface_match_count: videoSurfaceCount,
+                voice_signal_match_count: voiceSignalCount,
               };
             }""",
             PARTICIPANT_REGISTRY_CONFIG,
@@ -956,10 +1111,12 @@ def sync_speaker_activity(meeting_id, participant_items, active_speaker_state, c
     seen_keys = set()
     for item in participant_items:
         participant_key = extract_participant_key(item)
+        display_name = item.get("display_name") or "Unknown"
+        normalized_name = normalize_participant_name(display_name).casefold()
         participant_id = upsert_meeting_participant(
             meeting_id,
             participant_key,
-            item.get("display_name") or "Unknown",
+            display_name,
             platform_identity=item.get("platform_identity") or None,
             role=item.get("role") or None,
             is_bot=bool(item.get("is_bot")),
@@ -988,16 +1145,37 @@ def sync_speaker_activity(meeting_id, participant_items, active_speaker_state, c
             )
 
         active_entry = active_speaker_state.get(participant_key)
+        if active_entry and active_entry.get("normalized_name") not in {"", normalized_name}:
+            append_speaker_activity_interval(
+                meeting_id,
+                active_entry["participant_id"],
+                active_entry["start_offset_ms"],
+                current_offset_ms,
+                source="roster_speaking_indicator",
+                confidence=0.75,
+                metadata={
+                    "participant_key": participant_key,
+                    "closed_reason": "identity_shift",
+                    "previous_display_name": active_entry.get("display_name"),
+                    "current_display_name": display_name,
+                },
+            )
+            del active_speaker_state[participant_key]
+            active_entry = None
         if item.get("is_speaking"):
             if active_entry is None:
                 active_speaker_state[participant_key] = {
                     "participant_id": participant_id,
                     "start_offset_ms": current_offset_ms,
                     "last_seen_offset_ms": current_offset_ms,
+                    "display_name": display_name,
+                    "normalized_name": normalized_name,
                 }
             else:
                 active_entry["participant_id"] = participant_id
                 active_entry["last_seen_offset_ms"] = current_offset_ms
+                active_entry["display_name"] = display_name
+                active_entry["normalized_name"] = normalized_name
         elif active_entry is not None:
             append_speaker_activity_interval(
                 meeting_id,
@@ -1312,10 +1490,6 @@ def register_audio_asset(
         conn.close()
 
 
-def normalize_participant_name(value):
-    return normalize_caption_text(value)
-
-
 def is_bot_participant_name(value):
     normalized = normalize_participant_name(value).casefold()
     return normalized in {"transcription bot", "notera bot", "bot"} or normalized.endswith(" bot")
@@ -1335,6 +1509,39 @@ def is_generic_participant_identity(value):
         "outline",
     )
     return any(fragment in normalized for fragment in generic_fragments)
+
+
+def is_unstable_stable_key(value):
+    normalized = normalize_caption_text(value).casefold()
+    if not normalized:
+        return False
+    if normalized.isdigit():
+        return True
+    if re.fullmatch(r"r\d+", normalized):
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:row|item|persona|participant|member|entry|tile|video)[-_:\s]?\d+",
+            normalized,
+        )
+    )
+
+
+def participant_identity_conflicts(existing_normalized_name, existing_platform_identity, new_normalized_name, new_platform_identity):
+    existing_name = normalize_participant_name(existing_normalized_name).casefold()
+    new_name = normalize_participant_name(new_normalized_name).casefold()
+    if not existing_name or not new_name or existing_name == new_name:
+        return False
+    existing_platform = normalize_caption_text(existing_platform_identity)
+    new_platform = normalize_caption_text(new_platform_identity)
+    if existing_platform and new_platform and existing_platform == new_platform:
+        return False
+    return True
+
+
+def disambiguated_participant_key(participant_key, normalized_name):
+    digest = hashlib.sha1((normalized_name or "unknown").encode("utf-8")).hexdigest()[:10]
+    return f"{participant_key}|name:{digest}"[:255]
 
 
 def split_participant_display_name(display_name, role_hint=None):
@@ -1368,20 +1575,72 @@ def split_participant_display_name(display_name, role_hint=None):
     return cleaned_name, cleaned_role or None
 
 
+def participant_snapshot_source_rank(source_kind):
+    normalized = normalize_caption_text(source_kind).casefold()
+    if normalized == "voice_signal":
+        return 5
+    if normalized == "participant_panel":
+        return 4
+    if normalized == "video_surface":
+        return 3
+    if normalized == "video_tile":
+        return 2
+    return 1
+
+
+def participant_snapshot_item_score(item):
+    return (
+        int(bool(item.get("platform_identity"))) * 40
+        + int(bool(item.get("stable_key"))) * 20
+        + int(bool(item.get("role"))) * 10
+        + int(bool(item.get("is_speaking"))) * 12
+        + participant_snapshot_source_rank(item.get("source_kind"))
+    )
+
+
+def merge_participant_snapshot_items(preferred, other):
+    merged = dict(preferred)
+    for field in ("stable_key", "stable_key_source", "platform_identity", "role", "dom_key"):
+        if not merged.get(field) and other.get(field):
+            merged[field] = other[field]
+    merged["join_state"] = "left" if merged.get("join_state") == "left" and other.get("join_state") == "left" else "present"
+    merged["is_speaking"] = bool(preferred.get("is_speaking")) or bool(other.get("is_speaking"))
+    merged["is_muted"] = bool(preferred.get("is_muted")) or bool(other.get("is_muted"))
+    merged["is_bot"] = bool(preferred.get("is_bot")) or bool(other.get("is_bot"))
+    if bool(other.get("is_speaking")) and not bool(preferred.get("is_speaking")):
+        merged["source_kind"] = other.get("source_kind") or merged.get("source_kind")
+    elif participant_snapshot_source_rank(other.get("source_kind")) > participant_snapshot_source_rank(merged.get("source_kind")):
+        merged["source_kind"] = other.get("source_kind") or merged.get("source_kind")
+    return merged
+
+
 def extract_participant_key(item):
     stable_key = normalize_caption_text(item.get("stable_key"))
     platform_identity = normalize_caption_text(item.get("platform_identity"))
     if is_generic_participant_identity(stable_key):
         stable_key = ""
+    if is_unstable_stable_key(stable_key):
+        stable_key = ""
     if is_generic_participant_identity(platform_identity):
         platform_identity = ""
     display_name = normalize_participant_name(item.get("display_name") or item.get("name") or "Unknown")
-    if stable_key:
-        return f"teams-roster:{stable_key}"
     if platform_identity:
         return f"teams-platform:{platform_identity}"
+    if stable_key:
+        return f"teams-roster:{stable_key}"
     bucket = int(datetime.utcnow().timestamp() // 900)
     return f"teams-name:{display_name.casefold()}:{bucket}"
+
+
+def participant_key_rank(participant_key):
+    normalized = normalize_caption_text(participant_key).casefold()
+    if normalized.startswith("teams-platform:"):
+        return 3
+    if normalized.startswith("teams-roster:"):
+        return 2
+    if normalized.startswith("teams-name:"):
+        return 1
+    return 0
 
 
 def upsert_meeting_participant(
@@ -1402,18 +1661,65 @@ def upsert_meeting_participant(
     try:
         existing = cursor.execute(
             """
-            SELECT id
+            SELECT id, participant_key, normalized_name, platform_identity
             FROM meetingparticipant
             WHERE meeting_id = ? AND participant_key = ?
             LIMIT 1
             """,
             (meeting_id, participant_key),
         ).fetchone()
+        if existing and participant_identity_conflicts(existing[2], existing[3], normalized_name, platform_identity):
+            participant_key = disambiguated_participant_key(participant_key, normalized_name)
+            existing = cursor.execute(
+                """
+                SELECT id, participant_key, normalized_name, platform_identity
+                FROM meetingparticipant
+                WHERE meeting_id = ? AND participant_key = ?
+                LIMIT 1
+                """,
+                (meeting_id, participant_key),
+            ).fetchone()
+        if existing is None and platform_identity:
+            platform_matches = cursor.execute(
+                """
+                SELECT id, participant_key, normalized_name, platform_identity
+                FROM meetingparticipant
+                WHERE meeting_id = ?
+                  AND platform_identity = ?
+                  AND is_bot = ?
+                  AND join_state != 'merged'
+                  AND merged_into_participant_id IS NULL
+                ORDER BY id
+                """,
+                (meeting_id, platform_identity, 1 if is_bot else 0),
+            ).fetchall()
+            if len(platform_matches) == 1:
+                existing = platform_matches[0]
+        if existing is None:
+            name_matches = cursor.execute(
+                """
+                SELECT id, participant_key, normalized_name, platform_identity
+                FROM meetingparticipant
+                WHERE meeting_id = ?
+                  AND normalized_name = ?
+                  AND is_bot = ?
+                  AND join_state != 'merged'
+                  AND merged_into_participant_id IS NULL
+                ORDER BY id
+                """,
+                (meeting_id, normalized_name, 1 if is_bot else 0),
+            ).fetchall()
+            if len(name_matches) == 1:
+                existing = name_matches[0]
         if existing:
+            resolved_participant_key = existing[1]
+            if participant_key_rank(participant_key) > participant_key_rank(existing[1]):
+                resolved_participant_key = participant_key
             cursor.execute(
                 """
                 UPDATE meetingparticipant
-                SET platform_identity = COALESCE(?, platform_identity),
+                SET participant_key = ?,
+                    platform_identity = COALESCE(?, platform_identity),
                     display_name = ?,
                     normalized_name = ?,
                     role = COALESCE(?, role),
@@ -1424,6 +1730,7 @@ def upsert_meeting_participant(
                 WHERE id = ?
                 """,
                 (
+                    resolved_participant_key,
                     platform_identity,
                     cleaned_display_name,
                     normalized_name,
@@ -1875,9 +2182,13 @@ class MeetingAudioChunkWriter:
         master_path = get_meeting_master_audio_path(self.meeting_id, self.format)
         pcm_path = get_meeting_pcm_audio_path(self.meeting_id)
         finalized = False
+        used_aggregate_stream = False
         if self._should_prefer_aggregate_stream() and self.aggregate_path.exists() and self.aggregate_path.stat().st_size > 0:
-            shutil.copy2(self.aggregate_path, master_path)
-            finalized = True
+            finalized = self._finalize_from_aggregate_stream(master_path)
+            if not finalized:
+                shutil.copy2(self.aggregate_path, master_path)
+                finalized = True
+            used_aggregate_stream = finalized
         elif self.chunk_paths:
             finalized = self._finalize_from_chunk_concat(master_path)
         elif self.aggregate_path.exists() and self.aggregate_path.stat().st_size > 0:
@@ -1888,16 +2199,15 @@ class MeetingAudioChunkWriter:
             raise RuntimeError("no audio chunks were captured")
 
         pcm_result = self._build_pcm_copy(master_path, pcm_path)
-        if pcm_result.returncode != 0 and self.chunk_paths and not self._should_prefer_aggregate_stream():
-            if self._finalize_from_chunk_concat(master_path):
-                pcm_result = self._build_pcm_copy(master_path, pcm_path)
-
-        if pcm_result.returncode != 0 and self.chunk_paths and self._should_prefer_aggregate_stream():
+        if pcm_result.returncode != 0 and used_aggregate_stream and self.aggregate_path.exists():
             logger.warning(
-                "Could not decode aggregate audio stream for meeting %s (ffmpeg_return_code=%s)",
+                "Could not decode remuxed aggregate audio stream for meeting %s (ffmpeg_return_code=%s). Retrying from aggregate stream.",
                 self.meeting_id,
                 pcm_result.returncode,
             )
+            pcm_result = self._build_pcm_copy(self.aggregate_path, pcm_path)
+
+        if pcm_result.returncode != 0 and self.chunk_paths and not used_aggregate_stream:
             if self._finalize_from_chunk_concat(master_path):
                 pcm_result = self._build_pcm_copy(master_path, pcm_path)
 
@@ -1983,6 +2293,48 @@ class MeetingAudioChunkWriter:
                     concat_transcode_result.stderr.strip() or "audio chunk concat failed",
                 )
                 return False
+        return True
+
+    def _finalize_from_aggregate_stream(self, master_path):
+        remux_result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(self.aggregate_path),
+                "-c",
+                "copy",
+                str(master_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if remux_result.returncode == 0:
+            return True
+        logger.warning(
+            "Could not remux aggregate audio stream for meeting %s: %s",
+            self.meeting_id,
+            remux_result.stderr.strip() or "aggregate audio remux failed",
+        )
+        transcode_result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(self.aggregate_path),
+                *self._master_transcode_args(),
+                str(master_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if transcode_result.returncode != 0:
+            logger.warning(
+                "Could not transcode aggregate audio stream for meeting %s: %s",
+                self.meeting_id,
+                transcode_result.stderr.strip() or "aggregate audio transcode failed",
+            )
+            return False
         return True
 
     @staticmethod
@@ -2942,6 +3294,7 @@ async def run_bot(meeting_url, meeting_id):
     meeting_screenshot_path = get_live_meeting_screenshot_path(meeting_id)
     audio_recording_enabled = is_audio_recording_enabled(meeting_id)
     audio_capture_started = False
+    audio_capture_started_monotonic = None
     audio_capture_error = None
     audio_failure_notified = False
     chunk_writer = MeetingAudioChunkWriter(meeting_id) if audio_recording_enabled else None
@@ -3141,6 +3494,7 @@ async def run_bot(meeting_url, meeting_id):
                 started, audio_result, audio_error = await start_browser_audio_capture(page, chunk_writer, meeting_id)
                 if started:
                     audio_capture_started = True
+                    audio_capture_started_monotonic = asyncio.get_running_loop().time()
                     capture_started_at = datetime.utcnow().isoformat()
                     update_audio_status(meeting_id, AUDIO_STATUS_RECORDING, None)
                     update_meeting_fields(meeting_id, audio_capture_started_at=capture_started_at)
@@ -3193,8 +3547,13 @@ async def run_bot(meeting_url, meeting_id):
                         break
 
                     poll_count += 1
+                    activity_origin_monotonic = (
+                        audio_capture_started_monotonic
+                        or meeting_started_monotonic
+                        or asyncio.get_running_loop().time()
+                    )
                     current_offset_ms = int(
-                        max(0.0, asyncio.get_running_loop().time() - (meeting_started_monotonic or asyncio.get_running_loop().time()))
+                        max(0.0, asyncio.get_running_loop().time() - activity_origin_monotonic)
                         * 1000
                     )
 
@@ -3279,9 +3638,10 @@ async def run_bot(meeting_url, meeting_id):
         except Exception as e:
             logger.error("An error occurred during bot execution: %s", e, exc_info=True)
         finally:
-            if meeting_started_monotonic is not None:
+            activity_origin_monotonic = audio_capture_started_monotonic or meeting_started_monotonic
+            if activity_origin_monotonic is not None:
                 current_offset_ms = int(
-                    max(0.0, asyncio.get_running_loop().time() - meeting_started_monotonic) * 1000
+                    max(0.0, asyncio.get_running_loop().time() - activity_origin_monotonic) * 1000
                 )
                 flush_speaker_activity(meeting_id, active_speaker_state, current_offset_ms)
             if "stop_screenshots" in locals():
