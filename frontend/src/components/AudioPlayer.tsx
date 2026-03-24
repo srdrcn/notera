@@ -42,7 +42,7 @@ function formatPlaybackRate(rate: number) {
 
 function PlayIcon() {
   return (
-    <svg aria-hidden="true" viewBox="0 0 24 24">
+    <svg aria-hidden="true" className="nt-audio-player-icon nt-audio-player-icon-play" viewBox="0 0 24 24">
       <path d="M8 6.5v11l9-5.5z" fill="currentColor" />
     </svg>
   );
@@ -51,7 +51,7 @@ function PlayIcon() {
 
 function PauseIcon() {
   return (
-    <svg aria-hidden="true" viewBox="0 0 24 24">
+    <svg aria-hidden="true" className="nt-audio-player-icon" viewBox="0 0 24 24">
       <path d="M8 6h3v12H8zM13 6h3v12h-3z" fill="currentColor" />
     </svg>
   );
@@ -198,6 +198,7 @@ export const AudioPlayer = forwardRef<HTMLAudioElement, AudioPlayerProps>(functi
   const progressPercent = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
   const playerStateLabel = isPlaying ? "Şimdi çalıyor" : currentTime > 0 ? "Duraklatıldı" : "Dinlemeye hazır";
   const playerClassName = ["nt-audio-player-shell", compact ? "is-compact" : "", className ?? ""].filter(Boolean).join(" ");
+  const mainClassName = ["nt-audio-player-main", compact ? "is-compact" : ""].filter(Boolean).join(" ");
 
   return (
     <div
@@ -254,16 +255,27 @@ export const AudioPlayer = forwardRef<HTMLAudioElement, AudioPlayerProps>(functi
           </div>
         </div>
 
-        <button
-          className="nt-audio-player-rate"
-          onClick={cyclePlaybackRate}
-          type="button"
-        >
-          {formatPlaybackRate(playbackRate)}
-        </button>
+        <div className="nt-audio-player-top-actions">
+          <button
+            className="nt-audio-player-rate"
+            onClick={cyclePlaybackRate}
+            type="button"
+          >
+            {formatPlaybackRate(playbackRate)}
+          </button>
+
+          <button
+            className="nt-audio-player-chip nt-audio-player-chip-replay"
+            onClick={() => seekTo(0)}
+            type="button"
+          >
+            <ReplayIcon />
+            <span>Başa dön</span>
+          </button>
+        </div>
       </div>
 
-      <div className="nt-audio-player-main">
+      <div className={mainClassName}>
         {!compact ? (
           <button
             aria-label="10 saniye geri sar"
@@ -297,44 +309,56 @@ export const AudioPlayer = forwardRef<HTMLAudioElement, AudioPlayerProps>(functi
           </button>
         ) : null}
 
-        <div className="nt-audio-player-progress-block">
-          <input
-            aria-label="Oynatma konumu"
-            className="nt-audio-player-scrubber"
-            max={duration || 0}
-            min={0}
-            onChange={handleScrub}
-            step={0.1}
-            type="range"
-            value={duration > 0 ? Math.min(currentTime, duration) : 0}
-          />
-          <div className="nt-audio-player-times">
-            <span>{formatTime(currentTime)}</span>
-            <span>{formatTime(duration)}</span>
+        {compact ? (
+          <>
+            <input
+              aria-label="Oynatma konumu"
+              className="nt-audio-player-scrubber"
+              max={duration || 0}
+              min={0}
+              onChange={handleScrub}
+              step={0.1}
+              type="range"
+              value={duration > 0 ? Math.min(currentTime, duration) : 0}
+            />
+            <div className="nt-audio-player-times">
+              <span>{formatTime(currentTime)}</span>
+              <span>{formatTime(duration)}</span>
+            </div>
+          </>
+        ) : (
+          <div className="nt-audio-player-progress-block">
+            <input
+              aria-label="Oynatma konumu"
+              className="nt-audio-player-scrubber"
+              max={duration || 0}
+              min={0}
+              onChange={handleScrub}
+              step={0.1}
+              type="range"
+              value={duration > 0 ? Math.min(currentTime, duration) : 0}
+            />
+            <div className="nt-audio-player-times">
+              <span>{formatTime(currentTime)}</span>
+              <span>{formatTime(duration)}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {!compact ? (
+        <div className="nt-audio-player-bottom">
+          <div className="nt-audio-player-bars" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
           </div>
         </div>
-      </div>
-
-      <div className="nt-audio-player-bottom">
-        <div className="nt-audio-player-bars" aria-hidden="true">
-          <span />
-          <span />
-          <span />
-          <span />
-          <span />
-          <span />
-          <span />
-        </div>
-
-        <button
-          className="nt-audio-player-chip"
-          onClick={() => seekTo(0)}
-          type="button"
-        >
-          <ReplayIcon />
-          <span>Başa dön</span>
-        </button>
-      </div>
+      ) : null}
     </div>
   );
 });

@@ -44,6 +44,40 @@ function toneForBindingState(bindingState: string): "default" | "success" | "war
   return "default";
 }
 
+function labelForBindingState(bindingState: string) {
+  if (bindingState === "confirmed") {
+    return "Hazır";
+  }
+  if (bindingState === "provisional") {
+    return "Kontrol et";
+  }
+  return "Henüz net değil";
+}
+
+function helperTextForParticipant(participant: ParticipantEntry) {
+  if (participant.join_state === "left") {
+    return "Toplantıdan ayrıldı.";
+  }
+  if (participant.binding_state === "confirmed") {
+    return "Konuşmaları bu kişiyle eşleşti.";
+  }
+  if (participant.binding_state === "provisional") {
+    return "Bazı konuşmalar için kısa bir kontrol gerekebilir.";
+  }
+  return "Bu kişi için henüz net bir konuşma eşleşmesi yok.";
+}
+
+function initialsForParticipant(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    return "?";
+  }
+  if (parts.length === 1) {
+    return parts[0].slice(0, 2).toUpperCase();
+  }
+  return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+}
+
 const BackIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M15 18l-6-6 6-6" />
@@ -625,6 +659,34 @@ export function TranscriptPage() {
                 <p className="nt-card-hint">{`${participants.length} registry kaydı`}</p>
               </div>
             </div>
+
+            <details className="nt-preview-disclosure nt-preview-disclosure-inline">
+              <summary className="nt-preview-disclosure-summary">
+                <div>
+                  <p className="nt-card-label">Canlı önizleme</p>
+                  <strong className="nt-preview-disclosure-title">
+                    {data.preview.label || "Son görüntü"}
+                  </strong>
+                </div>
+              </summary>
+
+              <div className="nt-preview-disclosure-body">
+                {data.preview.has_preview && data.preview.image_url ? (
+                  <div className="nt-preview-frame">
+                    <img
+                      alt="Canlı meeting önizlemesi"
+                      className="nt-preview-image"
+                      src={buildApiUrl(data.preview.image_url)}
+                    />
+                  </div>
+                ) : (
+                  <div className="nt-preview-empty">
+                    <strong>Henüz önizleme yok</strong>
+                    <span>{data.preview.label || "Canlı önizleme toplantı sırasında görünür."}</span>
+                  </div>
+                )}
+              </div>
+            </details>
           </article>
 
           <article className="nt-card nt-card-padded nt-audio-card">
@@ -635,11 +697,10 @@ export function TranscriptPage() {
               </div>
             </div>
             {data.audio.has_audio && data.audio.audio_url ? (
-              <div className="nt-audio-section">
-                <div className="nt-audio-meta">
-                  <span className="nt-audio-kicker">Notera player</span>
-                </div>
+              <div className="nt-audio-section nt-audio-section-plain">
                 <AudioPlayer
+                  className="nt-audio-player-flat"
+                  compact
                   ref={audioRef}
                   preload="metadata"
                   src={buildApiUrl(data.audio.audio_url)}
@@ -679,109 +740,96 @@ export function TranscriptPage() {
               </div>
             )}
           </article>
+        </div>
 
-          <article className="nt-card nt-card-padded">
+        <aside className="nt-top-side-stack">
+          <article className="nt-card nt-card-padded nt-participants-card">
             <div className="nt-card-head">
               <div>
-                <p className="nt-card-label">Participant registry</p>
+                <p className="nt-card-label">Katılımcılar</p>
                 <h2 className="nt-section-title">Konuşmacılar</h2>
-                <p className="nt-card-hint">Binding durumu ve participant audio asset erişimi burada görünür.</p>
+                <p className="nt-card-hint">Toplantıda gördüğümüz kişiler burada listelenir.</p>
               </div>
             </div>
-            {manageableParticipants.length === 0 ? (
-              <div className="nt-empty-state">
-                <strong>Henüz participant yok</strong>
-                <span>Bot roster panelinden participant registry toplamaya başladığında burada listelenecek.</span>
-              </div>
-            ) : (
-              <div className="nt-stream-track">
-                {manageableParticipants.map((participant) => (
-                  <div className="nt-stream-item" key={participant.id}>
-                    <div className="nt-stream-row-layout">
-                      <div className="nt-timeline-col">
-                        <span className="nt-avatar nt-speaker-badge nt-avatar-blue">
-                          {participant.display_name.slice(0, 2).toUpperCase()}
-                        </span>
-                        <span className="nt-timeline-line" />
-                      </div>
-                      <div className="nt-stream-content">
-                        <div className="nt-stream-meta-row">
-                          <div className="nt-stream-meta-stack">
-                            <strong className="nt-stream-speaker">{participant.display_name}</strong>
-                            <span className="nt-stream-time">{participant.join_state}</span>
-                          </div>
-                          <div className="nt-transcript-pills">
-                            <StatusPill tone={toneForBindingState(participant.binding_state)}>{participant.binding_state}</StatusPill>
-                            <StatusPill tone="teal">{`${participant.segment_count} segment`}</StatusPill>
-                            {participant.has_audio_asset ? (
-                              <a
-                                className="nt-btn nt-btn-secondary nt-btn-sm"
-                                href={buildApiUrl(`/api/media/meetings/${meetingId}/participants/${participant.id}/audio`)}
-                              >
-                                Audio
-                              </a>
-                            ) : null}
+            <div className="nt-participants-card-body">
+              {manageableParticipants.length === 0 ? (
+                <div className="nt-empty-state">
+                  <strong>Henüz konuşmacı görünmüyor</strong>
+                  <span>Toplantı başladıktan sonra kişiler burada belirecek.</span>
+                </div>
+              ) : (
+                <div className="nt-stream-track">
+                  {manageableParticipants.map((participant) => (
+                    <div className="nt-stream-item" key={participant.id}>
+                      <div className="nt-stream-row-layout">
+                        <div className="nt-timeline-col">
+                          <span className="nt-avatar nt-speaker-badge nt-avatar-blue">
+                            {initialsForParticipant(participant.display_name)}
+                          </span>
+                        </div>
+                        <div className="nt-stream-content">
+                          <div className="nt-stream-meta-row">
+                            <div className="nt-stream-meta-stack">
+                              <strong className="nt-stream-speaker">{participant.display_name}</strong>
+                              <span className="nt-stream-time">{helperTextForParticipant(participant)}</span>
+                            </div>
+                            <div className="nt-transcript-pills">
+                              <StatusPill tone={toneForBindingState(participant.binding_state)}>
+                                {labelForBindingState(participant.binding_state)}
+                              </StatusPill>
+                            </div>
                           </div>
                         </div>
                       </div>
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
+                  ))}
+                </div>
+              )}
+            </div>
             {data.actions.can_manage_speakers && manageableParticipants.length > 1 ? (
-              <div className="nt-inline-actions nt-transcript-summary-actions">
-                <select className="nt-input" value={mergeSourceId} onChange={(event) => setMergeSourceId(event.target.value)}>
-                  {manageableParticipants.map((participant) => (
-                    <option key={`source-${participant.id}`} value={participant.id}>
-                      {participant.display_name}
-                    </option>
-                  ))}
-                </select>
-                <select className="nt-input" value={mergeTargetId} onChange={(event) => setMergeTargetId(event.target.value)}>
-                  {manageableParticipants.map((participant) => (
-                    <option key={`target-${participant.id}`} value={participant.id}>
-                      {participant.display_name}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  className="nt-btn nt-btn-secondary nt-btn-sm"
-                  disabled={mergeBusy || !mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId}
-                  onClick={requestMergeParticipants}
-                  type="button"
-                >
-                  {mergeBusy ? "Birleştiriliyor" : "Participant merge"}
-                </button>
-              </div>
+              <details className="nt-transcript-advanced-tools nt-transcript-advanced-tools-side">
+                <summary className="nt-transcript-advanced-summary">Konuşmacı listesinde bir hata mı var?</summary>
+                <p className="nt-card-hint">Aynı kişi iki kez görünüyorsa aşağıdan birleştirebilirsin.</p>
+                <div className="nt-merge-form">
+                  <div className="nt-merge-grid">
+                    <label className="nt-merge-field">
+                      <span className="nt-merge-field-label">Birleştir</span>
+                      <span className="nt-merge-select-shell">
+                        <select className="nt-input nt-merge-select" value={mergeSourceId} onChange={(event) => setMergeSourceId(event.target.value)}>
+                          {manageableParticipants.map((participant) => (
+                            <option key={`source-${participant.id}`} value={participant.id}>
+                              {participant.display_name}
+                            </option>
+                          ))}
+                        </select>
+                      </span>
+                    </label>
+                    <label className="nt-merge-field">
+                      <span className="nt-merge-field-label">Buna</span>
+                      <span className="nt-merge-select-shell">
+                        <select className="nt-input nt-merge-select" value={mergeTargetId} onChange={(event) => setMergeTargetId(event.target.value)}>
+                          {manageableParticipants.map((participant) => (
+                            <option key={`target-${participant.id}`} value={participant.id}>
+                              {participant.display_name}
+                            </option>
+                          ))}
+                        </select>
+                      </span>
+                    </label>
+                  </div>
+                  <button
+                    className="nt-btn nt-btn-secondary nt-btn-sm nt-merge-submit"
+                    disabled={mergeBusy || !mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId}
+                    onClick={requestMergeParticipants}
+                    type="button"
+                  >
+                    {mergeBusy ? "Birleştiriliyor" : "İki kişiyi birleştir"}
+                  </button>
+                </div>
+              </details>
             ) : null}
           </article>
-        </div>
-
-        <div className="nt-top-preview-col">
-          <article className="nt-card nt-card-padded nt-preview-card">
-            <div className="nt-card-head">
-              <div>
-                <p className="nt-card-label">Canlı önizleme</p>
-                <h2 className="nt-section-title">{data.preview.label}</h2>
-              </div>
-            </div>
-            {data.preview.has_preview && data.preview.image_url ? (
-              <div className="nt-preview-frame">
-                <img
-                  alt="Canlı meeting önizlemesi"
-                  className="nt-preview-image"
-                  src={buildApiUrl(data.preview.image_url)}
-                />
-              </div>
-            ) : (
-              <div className="nt-preview-empty">
-                <strong>Henüz önizleme yok</strong>
-                <span>{data.preview.label || "Canlı önizleme toplantı sırasında görünür."}</span>
-              </div>
-            )}
-          </article>
-        </div>
+        </aside>
       </section>
 
       <section className="nt-stream-shell nt-transcript-panel">
